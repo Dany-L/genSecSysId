@@ -1,0 +1,154 @@
+%% System
+% lets use a simple example with two states, one input, one output and the
+% same size of the nonlinear channel as the states
+% [x^k+1, e, z] = [A, B, B2; C, D, D12; C2, D21, 0] [x^k, d, w], w =
+% Delta(z)
+
+A = [0 1; -0.5 -0.8]; % State matrix
+B = [0; 1];      % Input matrix
+C = [1 0];      % Output matrix
+D = 0;          % Feedthrough matrix
+dt = 0.1;
+
+nx=2;nz=2;nw=nz;nd=1;ne=1;
+
+scale= 0.5;
+% B2 = scale*ones(nx,nw);
+B2 = scale*eye(nx);
+% C2 = scale*ones(nz,nx);
+C2 = scale*eye(nz);
+D12 = scale*ones(nd,nw);
+D21 = scale*ones(nz,nd);
+D22 = zeros(nz,nw); % at this point must be zero
+
+eig(A)
+sys = ss(A, [B, B2], [C;C2], [D, D12;D21, D22]);
+dsys = c2d(sys, dt);
+Ad = dsys.A; Bd =dsys.B(1:nx,1:nd); B2d = dsys.B(1:nx,nd+1:end);
+Cd = C; Dd = D; D12d=D12;
+C2d = C2; D21d = D21; D22d = D22;
+abs(eig(Ad))
+
+
+%% nonlinearity
+% Define the deadzone nonlinear function with variable bound g
+g = 1; % Set the bound for the deadzone
+sat = @(x) max(min(x, g), -g);
+dzn = @(x) x-sat(x);
+% x = -5:0.1:5;
+% figure(),plot(x, dzn(x), x, tanh(x), x, sat(x));
+% legend('dzn', 'tanh', 'sat');
+% xlabel('x');
+% ylabel('Function values');
+% title('Comparison of dzn, tanh, and sat functions');
+% grid on;
+
+%% simulation
+N = 1000;
+d = zeros(nd,N); % no input
+e = zeros(ne, N);
+x = zeros(nx, N+1);
+x(:,1) = [1;1]; % initial condition
+for k= 1:N
+    d_k = d(:,k);x_k = x(:,k);
+    z_k = C2d*x_k + D21d*d_k; % needs to be changed if D22 is not zero
+    w_k = dzn(z_k);
+    e(:,k) = Cd*x_k + Dd*d_k + D12d*w_k;
+    x(:,k+1 ) = Ad*x_k+ Bd*d_k + B2d*w_k;
+end
+
+t = linspace(0,(N-1)*dt, N);
+plot(t,e)
+
+%% Analysis
+% standard sector
+eps = 1e-4;
+disp('--- STANDARD SECTOR CONDITIONS ---')
+a = 0; b = 1; %lower and upper bound of sector condition
+P_r = [-eye(nw) b*eye(nw); eye(nw) -a*eye(nw)];
+
+% make the multiplier variable
+Pm =@(L) P_r' * [zeros(nw,nw), L'; L, zeros(nw,nw)] * P_r;
+
+lambda = sdpvar(nz,1);
+for i=1:nw
+    multiplier_constraint=[multiplier_constraint;lambda(i,1)>=eps];
+end
+Lambda = diag(lambda);
+X = sdpvar(nx,nx);
+
+L1 = [eye(nx), zeros(nx,nw);
+    Ad, B2d];
+L3 = [zeros(nz,nx), eye(nw);
+    C2d, D22d]; 
+lmis = [];
+% lmi = L1' * [-X, zeros(nx,nx); zeros(nx,nx), X] * L1 + ...
+%     L3' * Pm(Lambda) * L3;
+lmi = [-X C2d'*Lambda Ad'*X;
+    Lambda*C2d -2*Lambda B2d'*X;
+    X*Ad X*B2d -X];
+lmis = lmis + (lmi <= -eye(3*nx)*eps);
+lmis = lmis + multiplier_constraint;
+
+% no objective, just looking for a feasible solution
+sol = optimize(lmis, [], sdpsettings('solver','mosek','verbose', 0))
+disp('Maximum eigenvalue of lmi:'); max(real(eig(double(lmi))))
+disp('Value of X:'); double(X)
+disp('Value of Lambda:'); double(Lambda)
+
+
+% generalized sector
+disp('--- GENERALIZED SECTOR CONDITIONS ---')
+
+L = sdpvar(nz,nx);
+P = sdpvar(nx,nx);
+m = sdpvar(nz,1);
+for i=1:nw
+    multiplier_constraint=[multiplier_constraint;m(i,1)>=eps];
+end
+M = diag(m);
+
+lmis = [];
+F = [-P P*C2d' + L' P*Ad';
+    C2d*P+L -2*M M*B2d';
+    Ad*P B2d*M -P];
+lmis = lmis + (F <= -eye(3*nx)*eps);
+for i = 1:nz
+    li = L(i,:);
+    lmis = lmis + ([1, li;li', P] >= eps*(eye(nx+1)));
+end
+lmis = lmis + multiplier_constraint;
+lmis = lmis + (P>=eps*eye(nx));
+
+sol = optimize(lmis, [], sdpsettings('solver','mosek','verbose', 0))
+max(real(eig(double(F))))
+
+% verify solution
+Pinv = inv(double(P));
+X = Pinv;
+disp('X:'); X
+H = double(L)*Pinv;
+disp('H:'); H
+Lambda = diag(1./diag(double(M)));
+disp('Lambda:');Lambda
+
+max_eigenvalue = max(eig( ...
+    [-X (C2d'+H')*Lambda Ad'*X; ...
+    Lambda*(C2d+H) -2*Lambda B2d'*X; ...
+    X*Ad X*B2d -X] ...
+));
+disp('Maximum eigenvalue:');
+disp(max_eigenvalue);
+
+L1 = [eye(nx), zeros(nx,nw);
+    Ad, B2d];
+L3 = [zeros(nz,nx), eye(nw);
+    C2d + H, D22d]; % here we add our new degree of freedom
+
+lmi = L1' * [-X, zeros(nx,nx); zeros(nx,nx), X] * L1 + ...
+    L3' * Pm(Lambda) * L3;
+max_eigenvalue_lmi = max(real(eig(lmi)));
+disp('Maximum eigenvalue of LMI:');
+disp(max_eigenvalue_lmi);
+
+
