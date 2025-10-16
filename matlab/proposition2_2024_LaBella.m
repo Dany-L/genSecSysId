@@ -5,6 +5,7 @@
 % Delta(z)
 
 A = [0 1; -0.5 -0.8]; % State matrix
+% A = rand(2,2);
 B = [0; 1];      % Input matrix
 C = [1 0];      % Output matrix
 D = 0;          % Feedthrough matrix
@@ -12,22 +13,22 @@ dt = 0.1;
 
 nx=2;nz=2;nw=nz;nd=1;ne=1;
 
-scale= 0.5;
-B2 = scale*ones(nx,nw);
-% B2 = scale*eye(nx);
-C2 = scale*ones(nz,nx);
-% C2 = scale*eye(nz);
+scale= 2;
+% B2 = scale*ones(nx,nw);
+B2 = scale*eye(nx);
+% C2 = scale*ones(nz,nx);
+C2 = scale*eye(nz);
 D12 = scale*ones(nd,nw);
 D21 = scale*ones(nz,nd);
 D22 = zeros(nz,nw); % at this point must be zero
 
-eig(A)
+disp('eig A:'); eig(A)
 sys = ss(A, [B, B2], [C;C2], [D, D12;D21, D22]);
 dsys = c2d(sys, dt);
 Ad = dsys.A; Bd =dsys.B(1:nx,1:nd); B2d = dsys.B(1:nx,nd+1:end);
 Cd = C; Dd = D; D12d=D12;
 C2d = C2; D21d = D21; D22d = D22;
-abs(eig(Ad))
+disp('| eig Ad |'); abs(eig(Ad))
 
 
 %% nonlinearity
@@ -43,19 +44,16 @@ dzn = @(x) x-sat(x);
 % title('Comparison of dzn, tanh, and sat functions');
 % grid on;
 
+dsys_ = struct('Ad', Ad, 'Bd', Bd, 'B2d', B2d, ...
+    'Cd', Cd, 'Dd', Dd, 'D12d', D12d, ...
+    'C2d', C2d, 'D21d', D21d, 'D22d', D22d, 'ne', ne, 'nl', dzn, 'dt', dt);
+
 %% simulation
 N = 1000;
 d = zeros(nd,N); % no input
-e = zeros(ne, N);
-x = zeros(nx, N+1);
-x(:,1) = [1;1]; % initial condition
-for k= 1:N
-    d_k = d(:,k);x_k = x(:,k);
-    z_k = C2d*x_k + D21d*d_k; % needs to be changed if D22 is not zero
-    w_k = dzn(z_k);
-    e(:,k) = Cd*x_k + Dd*d_k + D12d*w_k;
-    x(:,k+1 ) = Ad*x_k+ Bd*d_k + B2d*w_k;
-end
+
+% Call the simulation function
+[e, x] = simulate_system(dsys_, [0;0], d);
 
 t = linspace(0,(N-1)*dt, N);
 plot(t,e)
@@ -70,6 +68,7 @@ P_r = [-eye(nw) b*eye(nw); eye(nw) -a*eye(nw)];
 % make the multiplier variable
 Pm =@(L) P_r' * [zeros(nw,nw), L'; L, zeros(nw,nw)] * P_r;
 
+multiplier_constraint = [];
 lambda = sdpvar(nz,1);
 for i=1:nw
     multiplier_constraint=[multiplier_constraint;lambda(i,1)>=eps];
@@ -139,5 +138,68 @@ for i =1:nz
     hi = H(i,:);
     assert(max(real(eig([1 hi;hi' X])))>=0)
 end
+
+
+%% plot the ellipsoid, any initial condition in this ellipsoid is guaranteed to be exponentially stable
+% thus this is the invariant set under the system dynamics
+% starting from this initial condition the state will never leave the set
+min_ = -1; max_ = -min_; num_samples = 200;
+
+theta = linspace(0, 2*pi, num_samples); % angle values
+unit_circle = [cos(theta); sin(theta)]; % points on unit circle
+
+% compute X^(-1/2)
+[V, D] = eig(X);
+X_half_inv = V * diag(1 ./ sqrt(diag(D))) * V';
+
+ellipse = X_half_inv * unit_circle; % transform the circle
+figure; hold on; axis equal;
+plot(ellipse(1,:), ellipse(2,:), 'b-', 'LineWidth', 2);
+xlabel('x_1'); ylabel('x_2'); grid on, hold on
+legend('$x^T P x < 0$', 'Interpreter', 'latex', 'Location', 'Best');
+
+% Generate all sign combinations for s ∈ {-1,1}^2
+S = [-1 -1; -1 1; 1 1; 1 -1];
+
+% Compute vertices
+X_ = (H \ S')';  % equivalent to inv(H)*s'
+
+% Close the polygon by repeating the first vertex
+X_ = [X_; X_(1,:)];
+
+% Plot the edges
+plot(X_(:,1), X_(:,2), 'r-', 'LineWidth', 2);
+% scatter(X(:,1), X(:,2), 60, 'r', 'filled');
+xlabel('x_1'); ylabel('x_2');
+
+
+counter  = 0; M = 500;
+% lets plot some trajectories
+for i=1:M
+    % Generate a random initial condition within the range [-5, 5]
+    x0 = -max_ + (max_ - min_) * rand(nx, 1);
+
+    N = 1000;
+    d = zeros(nd,N); % no input
+    
+    % Call the simulation function
+    [e, x] = simulate_system(dsys_, x0, d);
+    
+    if x0' * X * x0 > 1
+        plot(x0(1,1), x0(2,1), 'x')
+        plot(x(1,1:5), x(2,1:5))
+        counter = counter +1;
+        continue
+    end
+    plot(x(1,:), x(2,:))
+
+end
+fprintf('from %i samples %i where not feasible\n', M, counter)
+legend({'$x^T P x < 0$', '$\|H x\|_\infty < 1$'}, 'Interpreter', 'latex', 'Location', 'northeast');
+
+
+% Export the figure to a PDF
+print(gcf, './matlab/plots/invariance.pdf', '-dpdf');
+
 
 
