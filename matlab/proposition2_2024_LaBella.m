@@ -1,52 +1,6 @@
-%% System
-% lets use a simple example with two states, one input, one output and the
-% same size of the nonlinear channel as the states
-% [x^k+1, e, z] = [A, B, B2; C, D, D12; C2, D21, 0] [x^k, d, w], w =
-% Delta(z)
-
-A = [0 1; -0.5 -0.8]; % State matrix
-% A = rand(2,2);
-B = [0; 1];      % Input matrix
-C = [1 0];      % Output matrix
-D = 0;          % Feedthrough matrix
-dt = 0.1;
-
-nx=2;nz=2;nw=nz;nd=1;ne=1;
-
-scale= 2;
-% B2 = scale*ones(nx,nw);
-B2 = scale*eye(nx);
-% C2 = scale*ones(nz,nx);
-C2 = scale*eye(nz);
-D12 = scale*ones(nd,nw);
-D21 = scale*ones(nz,nd);
-D22 = zeros(nz,nw); % at this point must be zero
-
-disp('eig A:'); eig(A)
-sys = ss(A, [B, B2], [C;C2], [D, D12;D21, D22]);
-dsys = c2d(sys, dt);
-Ad = dsys.A; Bd =dsys.B(1:nx,1:nd); B2d = dsys.B(1:nx,nd+1:end);
-Cd = C; Dd = D; D12d=D12;
-C2d = C2; D21d = D21; D22d = D22;
-disp('| eig Ad |'); abs(eig(Ad))
-
-
-%% nonlinearity
-% Define the deadzone nonlinear function with variable bound g
-g = 1; % Set the bound for the deadzone
-sat = @(x) max(min(x, g), -g);
-dzn = @(x) x-sat(x);
-% x = -5:0.1:5;
-% figure(),plot(x, dzn(x), x, tanh(x), x, sat(x));
-% legend('dzn', 'tanh', 'sat');
-% xlabel('x');
-% ylabel('Function values');
-% title('Comparison of dzn, tanh, and sat functions');
-% grid on;
-
-dsys_ = struct('Ad', Ad, 'Bd', Bd, 'B2d', B2d, ...
-    'Cd', Cd, 'Dd', Dd, 'D12d', D12d, ...
-    'C2d', C2d, 'D21d', D21d, 'D22d', D22d, 'ne', ne, 'nl', dzn, 'dt', dt);
+clear all, close all
+% load system
+run('shared.m')
 
 %% simulation
 N = 1000;
@@ -56,7 +10,7 @@ d = zeros(nd,N); % no input
 [e, x] = simulate_system(dsys_, [0;0], d);
 
 t = linspace(0,(N-1)*dt, N);
-plot(t,e)
+% plot(t,e)
 
 %% Analysis
 % standard sector
@@ -81,12 +35,12 @@ L1 = [eye(nx), zeros(nx,nw);
 L3 = [zeros(nz,nx), eye(nw);
     C2d, D22d]; 
 lmis = [];
-% lmi = L1' * [-X, zeros(nx,nx); zeros(nx,nx), X] * L1 + ...
-%     L3' * Pm(Lambda) * L3;
-lmi = [-X C2d'*Lambda Ad'*X;
-    Lambda*C2d -2*Lambda B2d'*X;
-    X*Ad X*B2d -X];
-lmis = lmis + (lmi <= -eye(3*nx)*eps);
+lmi = L1' * [-X, zeros(nx,nx); zeros(nx,nx), X] * L1 + ...
+    L3' * Pm(Lambda) * L3;
+% lmi = [-X C2d'*Lambda Ad'*X;
+%     Lambda*C2d -2*Lambda B2d'*X;
+%     X*Ad X*B2d -X];
+lmis = lmis + (lmi <= -eye(2*nx)*eps);
 lmis = lmis + multiplier_constraint;
 
 % no objective, just looking for a feasible solution
@@ -119,7 +73,7 @@ end
 lmis = lmis + multiplier_constraint;
 lmis = lmis + (P>=eps*eye(nx));
 
-sol = optimize(lmis, [], sdpsettings('solver','mosek','verbose', 0))
+sol = optimize(lmis, -trace(P), sdpsettings('solver','mosek','verbose', 0))
 max(real(eig(double(F))))
 
 % verify solution
@@ -169,17 +123,16 @@ X_ = [X_; X_(1,:)];
 
 % Plot the edges
 plot(X_(:,1), X_(:,2), 'r-', 'LineWidth', 2);
-% scatter(X(:,1), X(:,2), 60, 'r', 'filled');
 xlabel('x_1'); ylabel('x_2');
 
-
-counter  = 0; M = 500;
+feasible_ic_and_inputs = {};
+infeasible_ic_and_input = {};
+counter  = 0; M = 1000;N = 1000;
 % lets plot some trajectories
 for i=1:M
     % Generate a random initial condition within the range [-5, 5]
     x0 = -max_ + (max_ - min_) * rand(nx, 1);
 
-    N = 1000;
     d = zeros(nd,N); % no input
     
     % Call the simulation function
@@ -189,8 +142,13 @@ for i=1:M
         plot(x0(1,1), x0(2,1), 'x')
         plot(x(1,1:5), x(2,1:5))
         counter = counter +1;
+        infeasible_ic_and_input{end+1} = struct('d', d, 'x0', x0, 'e', e, 'x', x);
         continue
+    else
+        feasible_ic_and_inputs{end+1} = struct('d', d, 'x0', x0, 'e', e, 'x', x);
     end
+    % plot(x0(1,1), x0(2,1), 'x')
+    % plot(x(1,1:5), x(2,1:5))
     plot(x(1,:), x(2,:))
 
 end
@@ -199,7 +157,29 @@ legend({'$x^T P x < 0$', '$\|H x\|_\infty < 1$'}, 'Interpreter', 'latex', 'Locat
 
 
 % Export the figure to a PDF
-print(gcf, './matlab/plots/invariance.pdf', '-dpdf');
+print(gcf, './matlab/plots/no external inputs/invariance.png', '-dpng');
+save('./matlab/data/no external inputs/invarinace.mat', "feasible_ic_and_inputs","infeasible_ic_and_input")
 
 
+%% lets look at some simulations in the time domain
+% first the stable ones
+K = 10;
+t = linspace(0,(N-1)*dt, N);
+figure; hold on; grid on% Create a new figure for plotting
+for i = 1:K
+    plot(t, feasible_ic_and_inputs{i}.e)
+end
+xlabel('Time (s)');
+ylabel('Output e');
+title('Outputs from feasible input and initial condition')
+print(gcf, './matlab/plots/no external inputs/outputs-for-feasible-inputs.png', '-dpng');
 
+% then the unstable ones
+figure; hold on; grid on % Create a new figure for plotting
+for i = 1:K
+    plot(t, infeasible_ic_and_input{i}.e)
+end
+xlabel('Time (s)');
+ylabel('Output e');
+title('Outputs from infeasible input or initial condition')
+print(gcf, './matlab/plots/no external inputs/outputs-for-infeasible-inputs.png', '-dpng');
