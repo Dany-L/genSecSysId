@@ -1,4 +1,4 @@
-function [d] = decaying_sinus(N)
+function [d] = decaying_sinus(N, max_range)
 %DECAYING_SINUS Summary of this function goes here
 %   Detailed explanation goes here
 % Parameters
@@ -6,8 +6,10 @@ function [d] = decaying_sinus(N)
 % s = 10.0;        % L2 budget
 r = 0.99;        % exponential decay rate (0 < r < 1)
 omega = 2*pi*5/100;  % angular frequency, e.g. 5 cycles per 100 samples
+max_=max_range;min_=-max_;
+phi = -max_ + (max_ - min_) * rand(1, 1);
 
-phi = -0.5 + rand() * 1.0;  % Generate a random number between -0.5 and 0.5
+% phi = -2 + rand() * 1.0;  % Generate a random number between -0.5 and 0.5
 % phi = 0.3;       % phase offset [radians]
 
 % Compute envelope scaling constant
@@ -19,7 +21,7 @@ phi = -0.5 + rand() * 1.0;  % Generate a random number between -0.5 and 0.5
 k = 0:(N-1);
 
 % Exponential envelope
-c = -0.5 + rand() * 1.0;  % Generate a random number between -.5 and .5
+c = -max_ + (max_ - min_) * rand(1, 1);  % Generate a random number between -.5 and .5
 a = c * (r.^k);
 
 % Sine signal with exponential decay

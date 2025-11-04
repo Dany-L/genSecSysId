@@ -123,7 +123,7 @@ X_ = [X_; X_(1,:)];
 
 % Plot the edges
 plot(X_(:,1), X_(:,2), 'r-', 'LineWidth', 2);
-xlabel('x_1'); ylabel('x_2');
+xlabel('$x_1$', 'Interpreter', 'latex', 'FontSize', 18); ylabel('$x_2$', 'Interpreter', 'latex', 'FontSize', 18);
 
 feasible_ic_and_inputs = {};
 infeasible_ic_and_input = {};
@@ -140,7 +140,7 @@ for i=1:M
     
     if x0' * X * x0 > 1
         plot(x0(1,1), x0(2,1), 'x')
-        plot(x(1,1:5), x(2,1:5))
+        plot(x(1,1:5), x(2,1:5), 'LineWidth', 1.5)
         counter = counter +1;
         infeasible_ic_and_input{end+1} = struct('d', d, 'x0', x0, 'e', e, 'x', x);
         continue
@@ -149,15 +149,16 @@ for i=1:M
     end
     % plot(x0(1,1), x0(2,1), 'x')
     % plot(x(1,1:5), x(2,1:5))
-    plot(x(1,:), x(2,:))
+    plot(x(1,:), x(2,:), 'LineWidth', 1.5)
 
 end
 fprintf('from %i samples %i where not feasible\n', M, counter)
-legend({'$x^T P x < 0$', '$\|H x\|_\infty < 1$'}, 'Interpreter', 'latex', 'Location', 'northeast');
+legend({'$x^T P x < 0$', '$\|H x\|_\infty < 1$'}, 'Interpreter', 'latex', 'Location', 'northeast', 'FontSize', 18);
 
 
 % Export the figure to a PDF
-print(gcf, './matlab/plots/no external inputs/invariance.png', '-dpng');
+% print(gcf, './matlab/plots/no external inputs/invariance.png', '-dpng');
+exportgraphics(gca, './matlab/plots/no external inputs/invariance.pdf');
 save('./matlab/data/no external inputs/invarinace.mat', "feasible_ic_and_inputs","infeasible_ic_and_input")
 
 
@@ -167,19 +168,21 @@ K = 10;
 t = linspace(0,(N-1)*dt, N);
 figure; hold on; grid on% Create a new figure for plotting
 for i = 1:K
-    plot(t, feasible_ic_and_inputs{i}.e)
+    plot(t, feasible_ic_and_inputs{i}.e, 'LineWidth', 1.5)
 end
-xlabel('Time (s)');
-ylabel('Output e');
+xlabel('Time (s)', 'Interpreter', 'latex', 'FontSize', 18);
+ylabel('Output $e$', 'Interpreter', 'latex', 'FontSize', 18);
 title('Outputs from feasible input and initial condition')
-print(gcf, './matlab/plots/no external inputs/outputs-for-feasible-inputs.png', '-dpng');
+% print(gcf, './matlab/plots/no external inputs/outputs-for-feasible-inputs.png', '-dpng');
+exportgraphics(gca, './matlab/plots/no external inputs/outputs-for-feasible-inputs.pdf');
 
 % then the unstable ones
 figure; hold on; grid on % Create a new figure for plotting
 for i = 1:K
-    plot(t, infeasible_ic_and_input{i}.e)
+    plot(t, infeasible_ic_and_input{i}.e, 'LineWidth', 1.5)
 end
-xlabel('Time (s)');
-ylabel('Output e');
+xlabel('Time (s)', 'Interpreter', 'latex', 'FontSize', 18);
+ylabel('Output e', 'Interpreter', 'latex', 'FontSize', 18);
 title('Outputs from infeasible input or initial condition')
-print(gcf, './matlab/plots/no external inputs/outputs-for-infeasible-inputs.png', '-dpng');
+% print(gcf, './matlab/plots/no external inputs/outputs-for-infeasible-inputs.png', '-dpng');
+exportgraphics(gca, './matlab/plots/no external inputs/outputs-for-infeasible-inputs.pdf');

@@ -11,14 +11,21 @@ C = [1 0];      % Output matrix
 D = 0;          % Feedthrough matrix
 dt = 0.1;
 
-nx=2;nz=2;nw=nz;nd=1;ne=1;
+nx=2;nz=10;nw=nz;nd=1;ne=1;
 
 scale= 2;
-% B2 = scale*ones(nx,nw);
-B2 = scale*eye(nx);
-% C2 = scale*ones(nz,nx);
-C2 = scale*eye(nz);
-D12 = scale*ones(nd,nw);
+B2 = scale*ones(nx,nw);
+B2(1,:) = zeros(1,nw);
+% B2 = scale*eye(nx);
+C2 = zeros(nz,nx);
+
+% C2(:,1) = linspace(0,1,nz)';
+
+C2(:,2) = -linspace(1,2,nz)';
+% C2 = scale*eye(nz);
+
+% D12 = scale*ones(nd,nw);
+D12 = zeros(nd,nw);
 D21 = scale*ones(nz,nd);
 D22 = zeros(nz,nw); % at this point must be zero
 
@@ -36,13 +43,15 @@ disp('| eig Ad |'); abs(eig(Ad))
 g = 1; % Set the bound for the deadzone
 sat = @(x) max(min(x, g), -g);
 dzn = @(x) x-sat(x);
-% x = -5:0.1:5;
-% figure(),plot(x, dzn(x), x, tanh(x), x, sat(x));
-% legend('dzn', 'tanh', 'sat');
-% xlabel('x');
-% ylabel('Function values');
-% title('Comparison of dzn, tanh, and sat functions');
-% grid on;
+x = -5:0.1:5;
+figure(),plot(x, dzn(x), 'LineWidth',2.0);
+    % , x, tanh(x), x, sat(x)
+legend('dzn', 'tanh', 'sat', 'Interpreter', 'latex', 'Location', 'northeast', 'FontSize', 18);
+xlabel('x');
+ylabel('Function values');
+title('Comparison of dzn, tanh, and sat functions');
+grid on;
+exportgraphics(gca, './matlab/plots/nonlinearities.png');
 
 dsys_ = struct('Ad', Ad, 'Bd', Bd, 'B2d', B2d, ...
     'Cd', Cd, 'Dd', Dd, 'D12d', D12d, ...
