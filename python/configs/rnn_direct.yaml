@@ -1,0 +1,62 @@
+# RNN Baseline Configuration - Direct CSV Loading (Recommended!)
+# No preprocessing needed - loads directly from original CSV files
+
+# Data configuration - Point to folder with train/test/validation subfolders
+data:
+  train_path: "data/prepared"  # Base folder containing train/, test/, validation/
+  input_col: "d"               # Column name for system input
+  output_col: "e"              # Column name for system output
+  pattern: "*.csv"             # File pattern to match
+  normalize: true              # Normalize during training
+  normalization_method: "minmax"  # Options: "minmax", "standard", "none"
+  batch_size: 32
+  sequence_length: null        # null = use full sequences
+  shuffle: true
+  num_workers: 0               # For DataLoader
+
+# Model architecture
+model:
+  model_type: "rnn"           # Options: "rnn", "lstm", "gru"
+  input_size: 1               # Number of input features
+  hidden_size: 32             # Size of hidden state
+  output_size: 1              # Number of output features
+  num_layers: 3               # Number of RNN layers
+  dropout: 0.0                # Dropout probability (0.0 = no dropout)
+  activation: "tanh"          # Activation function: "tanh", "relu"
+
+# Optimizer configuration
+optimizer:
+  optimizer_type: "adam"      # Options: "adam", "sgd", "rmsprop"
+  learning_rate: 0.001
+  weight_decay: 0.00001       # L2 regularization
+  use_scheduler: true
+  scheduler_type: "reduce_on_plateau"  # Options: "reduce_on_plateau", "step", "exponential"
+  scheduler_patience: 10      # Epochs to wait before reducing LR
+  scheduler_factor: 0.5       # Factor to reduce LR by
+
+# Training configuration
+training:
+  max_epochs: 500
+  early_stopping_patience: 30  # Stop if no improvement for N epochs
+  checkpoint_frequency: 100     # Save checkpoint every N epochs
+  gradient_clip_value: 1.0
+  loss_type: "mse"
+  use_custom_regularization: false
+  device: "cpu"
+  log_interval: 10
+
+# MLflow tracking
+mlflow:
+  tracking_uri: null  # Use local file-based tracking (./mlruns)
+  experiment_name: "rnn_direct_loading"
+  run_name: null                # Auto-generate if null
+  log_models: true
+  log_artifacts: true
+
+# Output directories
+output_dir: "outputs/rnn_direct"
+model_dir: "models/rnn_direct"
+log_dir: "logs/rnn_direct"
+
+# Random seed for reproducibility
+seed: 42

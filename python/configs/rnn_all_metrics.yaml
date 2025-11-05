@@ -1,0 +1,86 @@
+# RNN Configuration with ALL evaluation metrics enabled
+# This is an example showing all available evaluation metrics
+
+# Data configuration - Direct folder loading
+data:
+  train_path: "data/prepared"  # Base folder containing train/, test/, validation/
+  input_col: "d"               # Column name for system input
+  output_col: "e"              # Column name for system output
+  pattern: "*.csv"             # File pattern to match
+  normalize: true
+  normalization_method: "standard"  # "minmax" or "standard"
+  batch_size: 32
+  sequence_length: null        # null = use full sequences
+  shuffle: true
+  num_workers: 0
+
+# Model configuration - Simple RNN baseline
+model:
+  model_type: "rnn"  # "rnn", "lstm", "gru"
+  input_size: 1  # Column d
+  hidden_size: 32
+  output_size: 1  # Column e
+  num_layers: 3
+  dropout: 0.0
+  activation: "tanh"
+
+# Optimizer configuration
+optimizer:
+  optimizer_type: "adam"
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  use_scheduler: true
+  scheduler_type: "reduce_on_plateau"
+  scheduler_patience: 10
+  scheduler_factor: 0.5
+
+# Training configuration
+training:
+  max_epochs: 50
+  early_stopping_patience: 30
+  checkpoint_frequency: 100
+  gradient_clip_value: 1.0
+  loss_type: "mse"
+  use_custom_regularization: false
+  device: "cpu"  # Change to "cpu" if no GPU
+  log_interval: 10
+
+# MLflow configuration
+mlflow:
+  tracking_uri: null  # Use local file-based tracking (no server needed)
+  experiment_name: "rnn_all_metrics"
+  run_name: null
+  log_models: true
+  log_artifacts: true
+
+# Evaluation configuration
+evaluation:
+  # ALL available metrics (this is also the default if evaluation section is omitted)
+  # Base metrics:
+  # - mse: Mean Squared Error
+  # - rmse: Root Mean Squared Error
+  # - mae: Mean Absolute Error
+  # - r2: R-squared score (coefficient of determination)
+  # - nrmse: Normalized RMSE (normalized by range)
+  # - max_error: Maximum absolute error
+  #
+  # For sequence predictions, each base metric also has:
+  # - <metric>_avg: Average over all time steps
+  # - <metric>_final: Metric at the final time step only
+  #
+  # Set to null or omit the evaluation section to use all metrics
+  metrics:
+    - mse
+    - rmse
+    - mae
+    - r2
+    - nrmse
+    - max_error
+
+# Paths
+output_dir: "outputs/rnn_all_metrics"
+model_dir: "models/rnn_all_metrics"
+log_dir: "logs/rnn_all_metrics"
+
+# Reproducibility
+seed: 42

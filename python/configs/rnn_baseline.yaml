@@ -1,0 +1,75 @@
+# RNN Baseline Configuration - Direct CSV Loading
+# Loads directly from original CSV files in train/test/validation folders
+
+# Data configuration - Direct folder loading
+data:
+  train_path: "data/prepared"  # Base folder containing train/, test/, validation/
+  input_col: "d"               # Column name for system input
+  output_col: "e"              # Column name for system output
+  pattern: "*.csv"             # File pattern to match
+  normalize: true
+  normalization_method: "standard"  # "minmax" or "standard"
+  batch_size: 32
+  sequence_length: null        # null = use full sequences
+  shuffle: true
+  num_workers: 0
+
+# Model configuration - Simple RNN baseline
+model:
+  model_type: "rnn"  # "rnn", "lstm", "gru"
+  input_size: 1  # Column d
+  hidden_size: 32
+  output_size: 1  # Column e
+  num_layers: 3
+  dropout: 0.0
+  activation: "tanh"
+
+# Optimizer configuration
+optimizer:
+  optimizer_type: "adam"
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  use_scheduler: true
+  scheduler_type: "reduce_on_plateau"
+  scheduler_patience: 10
+  scheduler_factor: 0.5
+
+# Training configuration
+training:
+  max_epochs: 50
+  early_stopping_patience: 30
+  checkpoint_frequency: 100
+  gradient_clip_value: 1.0
+  loss_type: "mse"
+  use_custom_regularization: false
+  device: "cpu"  # Change to "cpu" if no GPU
+  log_interval: 10
+
+# MLflow configuration
+mlflow:
+  tracking_uri: null  # Use local file-based tracking (no server needed)
+  experiment_name: "rnn_baseline"
+  run_name: null
+  log_models: true
+  log_artifacts: true
+
+# Evaluation configuration
+evaluation:
+  # List of metrics to compute and log during evaluation
+  # Available base metrics: mse, rmse, mae, r2, nrmse, max_error
+  # For sequence predictions, also available: <metric>_avg, <metric>_final
+  # Set to null or omit to use all metrics (default)
+  metrics:
+    - rmse      # Root Mean Squared Error
+    - mae       # Mean Absolute Error
+    - r2        # R-squared score
+    - nrmse     # Normalized RMSE
+    - max_error # Maximum absolute error
+
+# Paths
+output_dir: "outputs/rnn_baseline"
+model_dir: "models/rnn_baseline"
+log_dir: "logs/rnn_baseline"
+
+# Reproducibility
+seed: 42

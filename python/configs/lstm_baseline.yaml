@@ -1,0 +1,61 @@
+# LSTM Baseline Configuration - Direct CSV Loading
+# Loads directly from original CSV files in train/test/validation folders
+
+# Data configuration - Direct folder loading
+data:
+  train_path: "data/prepared"  # Base folder containing train/, test/, validation/
+  input_col: "d"               # Column name for system input
+  output_col: "e"              # Column name for system output
+  pattern: "*.csv"             # File pattern to match
+  normalize: true
+  normalization_method: "minmax"
+  batch_size: 32
+  sequence_length: null  # null = use full sequences
+  shuffle: true
+  num_workers: 0
+
+# Model configuration - LSTM baseline
+model:
+  model_type: "lstm"
+  input_size: 1  # Column d
+  hidden_size: 64
+  output_size: 1  # Column e
+  num_layers: 2
+  dropout: 0.1
+
+# Optimizer configuration
+optimizer:
+  optimizer_type: "adam"
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  use_scheduler: true
+  scheduler_type: "reduce_on_plateau"
+  scheduler_patience: 10
+  scheduler_factor: 0.5
+
+# Training configuration
+training:
+  max_epochs: 500
+  early_stopping_patience: 30
+  checkpoint_frequency: 10
+  gradient_clip_value: 1.0
+  loss_type: "mse"
+  use_custom_regularization: false
+  device: "cpu"
+  log_interval: 10
+
+# MLflow configuration
+mlflow:
+  tracking_uri: null  # Use local file-based tracking (./mlruns)
+  experiment_name: "lstm_baseline"
+  run_name: null
+  log_models: true
+  log_artifacts: true
+
+# Paths
+output_dir: "outputs/lstm_baseline"
+model_dir: "models/lstm_baseline"
+log_dir: "logs/lstm_baseline"
+
+# Reproducibility
+seed: 42

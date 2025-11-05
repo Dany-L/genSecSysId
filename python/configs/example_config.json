@@ -1,0 +1,57 @@
+{
+  "data": {
+    "train_path": "data/train.csv",
+    "val_path": "data/val.csv",
+    "test_path": "data/test.csv",
+    "normalize": true,
+    "normalization_method": "minmax",
+    "batch_size": 32,
+    "sequence_length": 100,
+    "shuffle": true,
+    "num_workers": 4
+  },
+  "model": {
+    "model_type": "lstm",
+    "input_size": 2,
+    "hidden_size": 64,
+    "output_size": 1,
+    "num_layers": 2,
+    "dropout": 0.1,
+    "activation": "tanh",
+    "custom_params": null
+  },
+  "optimizer": {
+    "optimizer_type": "adam",
+    "learning_rate": 0.001,
+    "weight_decay": 1e-05,
+    "momentum": 0.9,
+    "betas": [0.9, 0.999],
+    "use_scheduler": true,
+    "scheduler_type": "reduce_on_plateau",
+    "scheduler_patience": 10,
+    "scheduler_factor": 0.5
+  },
+  "training": {
+    "max_epochs": 1000,
+    "early_stopping_patience": 50,
+    "checkpoint_frequency": 10,
+    "gradient_clip_value": 1.0,
+    "loss_type": "mse",
+    "use_custom_regularization": false,
+    "regularization_weight": 0.01,
+    "device": "cuda",
+    "log_interval": 10,
+    "use_tensorboard": true
+  },
+  "mlflow": {
+    "tracking_uri": "http://localhost:5000",
+    "experiment_name": "sysid_training",
+    "run_name": null,
+    "log_models": true,
+    "log_artifacts": true
+  },
+  "output_dir": "outputs",
+  "model_dir": "models",
+  "log_dir": "logs",
+  "seed": 42
+}

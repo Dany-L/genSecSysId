@@ -1,0 +1,34 @@
+# Smaller model for debugging
+data:
+  train_path: "data/train.csv"
+  val_path: "data/val.csv"
+  test_path: "data/test.csv"
+  normalize: true
+  batch_size: 8
+  sequence_length: 20
+
+model:
+  model_type: "rnn"
+  input_size: 1
+  hidden_size: 16
+  output_size: 1
+  num_layers: 1
+  dropout: 0.0
+
+optimizer:
+  learning_rate: 0.01
+  use_scheduler: false
+
+training:
+  max_epochs: 50
+  early_stopping_patience: 10
+  checkpoint_frequency: 5
+  device: "cpu"
+
+mlflow:
+  tracking_uri: null
+  experiment_name: "debug"
+
+output_dir: "debug_outputs"
+model_dir: "debug_models"
+log_dir: "debug_logs"
