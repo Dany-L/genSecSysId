@@ -5,7 +5,7 @@ run('shared.m')
 % Same setup as proposition 2 LaBella, but with an input
 % analysis
 % standard sector
-eps = 1e-4;
+eps = 1e-5;
 disp('--- STANDARD SECTOR CONDITIONS ---')
 a = 0; b = 1; %lower and upper bound of sector condition
 P_r = [-eye(nw) b*eye(nw); eye(nw) -a*eye(nw)];
@@ -59,7 +59,7 @@ end
 M = diag(m);
 
 lmis = [];
-alpha = 0.93;
+alpha = 0.925;
 F = [-alpha*P zeros(nx,nd) P*C2d' + L' P*Ad';
     zeros(nd,nx) -eye(nd) D21d' Bd';
     C2d*P+L D21d -2*M M*B2d';
@@ -99,9 +99,9 @@ end
 %% plot the ellipsoid, any initial condition in this ellipsoid is guaranteed to be exponentially stable
 % thus this is the invariant set under the system dynamics
 % starting from this initial condition the state will never leave the set
-min_ = -10; max_ = -min_; num_samples = 200;
+min_ = -7; max_ = -min_;
 
-theta = linspace(0, 2*pi, num_samples); % angle values
+theta = linspace(0, 2*pi, 200); % angle values
 unit_circle = [cos(theta); sin(theta)]; % points on unit circle
 
 % compute X^(-1/2)
@@ -129,16 +129,16 @@ xlabel('x_1'); ylabel('x_2'); grid on, hold on
 feasible_ic_and_inputs = {};
 infeasible_ic_and_input = {};
 gs = {}; ws = {}; zs={};xs={};
-counter  = 0; M = 100; N = 1000; b_nonlinear = false;
+counter  = 0; M = 1000; N = 100; b_nonlinear = false;
 t = linspace(0,(N-1)*dt, N);
 % lets plot some trajectories
 for i=1:M
     % Generate a random initial condition within the range [-5, 5]
     x0 = -max_ + (max_ - min_) * rand(nx, 1);
 
-    % d = sqrt(s^2*(1-alpha))*sin(linspace(0,(N-1)*dt,N));
-    d = sqrt(s^2*(1-alpha))*2*(rand(nd,N) - 0.5);
-    % d = sqrt(s^2*(1-alpha-1e-3))*ones(nd,N);
+    d = sqrt(s^2*(1-alpha))*sin(linspace(0,(N-1)*dt,N));
+    % d = sqrt(s^2*(1-alpha))*2*(rand(nd,N) - 0.5);
+    % d = sqrt(s^2*(1-alpha))*ones(nd,N);
    
     % Call the simulation function
     [e, x, z, w] = simulate_system(dsys_, x0, d);
@@ -165,7 +165,7 @@ legend({'$x^T P x < s^2$', '$\|H x\|_\infty < 1$'}, 'Interpreter', 'latex', 'Loc
 
 % print(gcf, './matlab/plots/with external inputs/invariance.png', '-dpng');
 % exportgraphics(gcf, './matlab/plots/with external inputs/three-differnt-init-cond-x-w-z.png');
-% save('./matlab/data/with external inputs/init_rand-input_noise.mat', "feasible_ic_and_inputs","s","dsys_", 'Lambda', 'X', 'H', 't', 'dt')
+save('./matlab/data/init_rand-input_sin.mat', "feasible_ic_and_inputs","s","dsys_", 'Lambda', 'X', 'H', 't', 'dt')
 
 count2 = 0;
 for i = 1:length(feasible_ic_and_inputs)
@@ -211,45 +211,45 @@ fprintf("Found %i trajectories with |z|>1 from %i\n", count2, length(feasible_ic
 
 %% lets look at some simulations in the time domain
 % first the stable ones
-% figure; hold on; grid on% Create a new figure for plotting
-% for i = 1:length(feasible_ic_and_inputs)
-%     plot(t, feasible_ic_and_inputs{i}.d, 'LineWidth', 1.5)
-% end
-% xlabel('Time (s)', 'Interpreter', 'latex', 'FontSize', 18);
-% ylabel('Output $d$', 'Interpreter', 'latex', 'FontSize', 18);
-% title('Feasible inputs')
-% % print(gcf, './matlab/plots/with external inputs/feasible-inputs.png', '-dpng');
-% % exportgraphics(gca, './matlab/plots/with external inputs/feasible-inputs.pdf');
-% 
-% figure; hold on; grid on% Create a new figure for plotting
-% for i = 1:length(feasible_ic_and_inputs)
-%     plot(t, feasible_ic_and_inputs{i}.e, 'LineWidth', 1.5)
-% end
-% xlabel('Time (s)','Interpreter', 'latex', 'FontSize', 18);
-% ylabel('Output $e$', 'Interpreter', 'latex', 'FontSize', 18);
-% title('Outputs from feasible input and initial condition')
-% % print(gca, './matlab/plots/with external inputs/outputs-for-feasible-inputs.png', '-dpng');
-% % exportgraphics(gca, './matlab/plots/with external inputs/outputs-for-feasible-inputs.pdf');
-% 
-% % then the unstable ones
-% K = 10;
-% figure; hold on; grid on% Create a new figure for plotting
-% for i = 1:K
-%     plot(t, infeasible_ic_and_input{i}.d, 'LineWidth', 1.5)
-% end
-% xlabel('Time (s)', 'Interpreter', 'latex', 'FontSize', 18);
-% ylabel('Output $d$', 'Interpreter', 'latex', 'FontSize', 18);
-% title('Infeasible inputs')
-% % exportgraphics(gca, './matlab/plots/with external inputs/infeasible-inputs.pdf');
-% 
-% figure; hold on; grid on % Create a new figure for plotting
-% for i = 1:K
-%     plot(t, infeasible_ic_and_input{i}.e, 'LineWidth', 1.5)
-% end
-% xlabel('Time (s)', 'Interpreter', 'latex', 'FontSize', 18);
-% ylabel('Output $e$', 'Interpreter', 'latex', 'FontSize', 18);
-% title('Outputs from infeasible input or initial condition')
-% print(gcf, './matlab/plots/with external inputs/outputs-for-infeasible-inputs.png', '-dpng');
-% exportgraphics(gca, './matlab/plots/with external inputs/outputs-for-infeasible-inputs.pdf');
+figure; hold on; grid on% Create a new figure for plotting
+for i = 1:length(feasible_ic_and_inputs)
+    plot(t, feasible_ic_and_inputs{i}.d, 'LineWidth', 1.5)
+end
+xlabel('Time (s)', 'Interpreter', 'latex', 'FontSize', 18);
+ylabel('Output $d$', 'Interpreter', 'latex', 'FontSize', 18);
+title('Feasible inputs')
+% print(gcf, './matlab/plots/with external inputs/feasible-inputs.png', '-dpng');
+% exportgraphics(gca, './matlab/plots/with external inputs/feasible-inputs.pdf');
+
+figure; hold on; grid on% Create a new figure for plotting
+for i = 1:length(feasible_ic_and_inputs)
+    plot(t, feasible_ic_and_inputs{i}.e, 'LineWidth', 1.5)
+end
+xlabel('Time (s)','Interpreter', 'latex', 'FontSize', 18);
+ylabel('Output $e$', 'Interpreter', 'latex', 'FontSize', 18);
+title('Outputs from feasible input and initial condition')
+% print(gca, './matlab/plots/with external inputs/outputs-for-feasible-inputs.png', '-dpng');
+% exportgraphics(gca, './matlab/plots/with external inputs/outputs-for-feasible-inputs.pdf');
+
+% then the unstable ones
+K = 10;
+figure; hold on; grid on% Create a new figure for plotting
+for i = 1:K
+    plot(t, infeasible_ic_and_input{i}.d, 'LineWidth', 1.5)
+end
+xlabel('Time (s)', 'Interpreter', 'latex', 'FontSize', 18);
+ylabel('Output $d$', 'Interpreter', 'latex', 'FontSize', 18);
+title('Infeasible inputs')
+% exportgraphics(gca, './matlab/plots/with external inputs/infeasible-inputs.pdf');
+
+figure; hold on; grid on % Create a new figure for plotting
+for i = 1:K
+    plot(t, infeasible_ic_and_input{i}.e, 'LineWidth', 1.5)
+end
+xlabel('Time (s)', 'Interpreter', 'latex', 'FontSize', 18);
+ylabel('Output $e$', 'Interpreter', 'latex', 'FontSize', 18);
+title('Outputs from infeasible input or initial condition')
+print(gcf, './matlab/plots/with external inputs/outputs-for-infeasible-inputs.png', '-dpng');
+exportgraphics(gca, './matlab/plots/with external inputs/outputs-for-infeasible-inputs.pdf');
 
 

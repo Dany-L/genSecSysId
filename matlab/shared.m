@@ -11,16 +11,16 @@ D = 0;          % Feedthrough matrix
 dt = 0.1;
 % A = -10; B=1; C=1;D = 0;
 
-nx=2;nz=10;nw=nz;nd=1;ne=1;
+nx=2;nz=2;nw=nz;nd=1;ne=1;
 
 scale= 1;
-B2 = 2*ones(nx,nw); % state channel
+B2 = 4*ones(nx,nw); % state channel
 
 D12 = ones(nd,nw); % output channel
 
 % C2 = 0.1*eye(nz); % nonlinearity channel
 C2 = 0* ones(nz,nx);
-C2(1:nx,:) = 0.1*eye(nx);
+C2(1:nx,:) = 0.15*eye(nx);
 D21 = ones(nz,nd); 
 D22 = zeros(nz,nw); % at this point must be zero
 

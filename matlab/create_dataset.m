@@ -1,8 +1,12 @@
 clear all, close all;
-generation_type = {'noise', 'sine'};
+generation_type = {'noise', 'sin'};
 filename = 'init_rand';
 local_folder_path = './matlab/data/'; % needs to run from root folder
 raw_folder_name = 'raw';
+raw_folder_path = fullfile(local_folder_path,raw_folder_name);
+if ~exist(raw_folder_path, 'dir')
+    mkdir(raw_folder_path);
+end
 
 for i = 1:length(generation_type)
     gen_type = generation_type{i};
@@ -21,10 +25,9 @@ for i = 1:length(generation_type)
             'VariableNames', {'time', 'd', 'e', 'x'});
             % Save the table to a CSV file
         csv_filename = sprintf('%s-output_%s_%i.csv', filename, gen_type, ii);
-        writetable(tab, fullfile(local_folder_path,raw_folder_name, csv_filename));
+        fullfilename = fullfile(raw_folder_path, csv_filename);
+        writetable(tab, fullfilename);
+        fprintf('%i/%i: write %s to %s\n', ii, length(feasible_ic_and_inputs), gen_type, fullfilename)
     end
     
-
-
-
 end
