@@ -215,7 +215,7 @@ __marimo__/
 # ============================================================================
 # Project-specific: Data Files
 # ============================================================================
-**/data/
+python/data/**/
 # Optionally keep directory structure with .gitkeep files
 !**/data/.gitkeep
 !**/data/prepared/.gitkeep
