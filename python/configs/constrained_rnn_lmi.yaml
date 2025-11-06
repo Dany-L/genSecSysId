@@ -1,0 +1,73 @@
+# Example configuration for training constrained RNN with LMI regularization
+# This uses Interior Point Method to enforce Linear Matrix Inequality (LMI) constraints
+
+data:
+  train_path: "data/prepared"
+  input_col: ["d"]
+  output_col: ["e"]
+  state_col: []  # Empty = no state columns
+  pattern: "*.csv"
+  normalize: true
+  normalization_method: "minmax"
+  batch_size: 32
+  sequence_length: null
+  shuffle: true
+  num_workers: 0
+
+model:
+  model_type: "simple_lure"  # Custom constrained model
+  nd: 1
+  ne: 1
+  nx: 10
+  nw: 10
+  num_layers: 1
+  activation: "sat"  # saturation nonlinearity
+  dropout: 0.0
+
+optimizer:
+  optimizer_type: "adam"
+  learning_rate: 1e-3
+  weight_decay: 1e-5
+  
+  # Learning rate scheduler
+  use_scheduler: true
+  scheduler_type: "reduce_on_plateau"
+  scheduler_patience: 10
+  scheduler_factor: 0.5  # Reduce LR by 50% when plateau
+
+training:
+  max_epochs: 1000
+  early_stopping_patience: 50
+  checkpoint_frequency: 10
+  gradient_clip_value: 1.0
+  
+  loss_type: "mse"
+  
+  # Interior Point Method for LMI constraints
+  use_custom_regularization: true
+  regularization_weight: 1.0  # Start with high barrier weight
+  decay_regularization_weight: true  # Decay like interior point method
+  regularization_decay_factor: 0.5  # Match LR decay factor
+  
+  device: "cpu"
+  log_interval: 10
+
+mlflow:
+  experiment_name: "constrained_rnn_lmi"
+  run_name: null
+  log_models: true
+  log_artifacts: true
+
+# Additional settings
+seed: 42
+output_dir: "outputs"
+model_dir: "models"
+log_dir: "logs"
+
+# Evaluation metrics to track
+evaluation:
+  metrics_to_log:
+    - "mse"
+    - "rmse"
+    - "mae"
+    - "r2"
