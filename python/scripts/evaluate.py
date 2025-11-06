@@ -12,7 +12,7 @@ import mlflow
 
 from sysid.config import Config
 from sysid.data import create_dataloaders, DataLoader, DataNormalizer
-from sysid.data.direct_loader import load_csv_folder
+from sysid.data.direct_loader import load_csv_folder, load_split_data
 from sysid.models import SimpleRNN, LSTM, GRU
 from sysid.evaluation import Evaluator
 
@@ -195,22 +195,57 @@ def main():
         test_path = Path(args.test_data)
         
         if test_path.is_dir():
-            # Primary method: Load directly from CSV folder
-            logger.info("Loading directly from CSV folder...")
-            logger.info(f"Test data directory: {args.test_data}")
-            
-            test_inputs, test_outputs, filenames = load_csv_folder(
-                folder_path=str(test_path),
-                input_col=getattr(config.data, 'input_col', 'd'),
-                output_col=getattr(config.data, 'output_col', 'e'),
-                pattern=getattr(config.data, 'pattern', '*.csv')
-            )
-            logger.info(f"Loaded {len(filenames)} files from test set")
+            # Check if it's a structured data directory (with train/test/validation subfolders)
+            if (test_path / "test").exists():
+                # Use load_split_data to load only test data from prepared structure
+                logger.info("Loading from prepared data structure (test split only)...")
+                logger.info(f"Data directory: {args.test_data}")
+                
+                # Get state column if provided
+                state_col = getattr(config.data, 'state_col', None)
+                if state_col and len(state_col) == 0:  # Empty list means no state
+                    state_col = None
+                
+                # Load only test data
+                _, _, _, _, test_inputs, test_outputs, _, _, test_states = load_split_data(
+                    data_dir=str(test_path),
+                    input_col=getattr(config.data, 'input_col', ['d']),
+                    output_col=getattr(config.data, 'output_col', ['e']),
+                    state_col=state_col,
+                    pattern=getattr(config.data, 'pattern', '*.csv'),
+                    load_train=False,  # Don't load training data
+                    load_val=False,    # Don't load validation data
+                    load_test=True     # Only load test data
+                )
+                logger.info(f"Loaded test data: {test_inputs.shape[0]} sequences")
+                if test_states is not None:
+                    logger.info(f"State information loaded: {test_states.shape}")
+            else:
+                # Single folder with CSV files (backward compatibility)
+                logger.info("Loading directly from CSV folder...")
+                logger.info(f"Test data directory: {args.test_data}")
+                
+                # Get state column if provided
+                state_col = getattr(config.data, 'state_col', None)
+                if state_col and len(state_col) == 0:  # Empty list means no state
+                    state_col = None
+                
+                test_inputs, test_outputs, test_states, filenames = load_csv_folder(
+                    folder_path=str(test_path),
+                    input_col=getattr(config.data, 'input_col', ['d']),
+                    output_col=getattr(config.data, 'output_col', ['e']),
+                    state_col=state_col,
+                    pattern=getattr(config.data, 'pattern', '*.csv')
+                )
+                logger.info(f"Loaded {len(filenames)} files from test set")
+                if test_states is not None:
+                    logger.info(f"State information loaded: {test_states.shape}")
             
         elif test_path.suffix == '.csv':
             # Fallback: Load from single CSV file
             logger.info("Loading from single CSV file...")
             test_inputs, test_outputs = DataLoader.load_from_csv(args.test_data, delimiter=",")
+            test_states = None
             
         elif test_path.suffix == '.npy':
             # Legacy: Load from NPY files
@@ -219,13 +254,15 @@ def main():
                 args.test_data,
                 args.test_data.replace('_inputs.npy', '_outputs.npy')
             )
+            test_states = None
         else:
             raise ValueError(
                 f"Unsupported data format: {args.test_data}\n"
                 f"Use either:\n"
-                f"  1. Folder path (recommended): 'data/prepared/test' with CSV files\n"
-                f"  2. Single CSV file: 'data/test.csv'\n"
-                f"  3. NPY file: 'data/test_inputs.npy'"
+                f"  1. Prepared data folder: 'data/prepared' with test/ subfolder\n"
+                f"  2. Test folder: 'data/prepared/test' with CSV files\n"
+                f"  3. Single CSV file: 'data/test.csv'\n"
+                f"  4. NPY file: 'data/test_inputs.npy'"
             )
         
         logger.info(f"Test data loaded: inputs={test_inputs.shape}, outputs={test_outputs.shape}")
@@ -332,16 +369,17 @@ def main():
                 logger.info("Generating plots and analysis...")
                 print("\nGenerating plots...")
                 
-                # Load predictions and targets from saved files
+                # Load predictions, targets, and inputs from saved files
                 try:
-                    predictions = np.load(output_dir / "predictions.npy")
-                    targets = np.load(output_dir / "targets.npy")
+                    e_hat = np.load(output_dir / "predictions.npy")  # predicted output
+                    e = np.load(output_dir / "targets.npy")  # output (target)
+                    d = np.load(output_dir / "inputs.npy")  # input
                     
-                    evaluator.plot_predictions(predictions, targets, num_samples=5)
-                    evaluator.analyze_errors(predictions, targets)
+                    evaluator.plot_predictions(e_hat, e, d, num_samples=5)
+                    evaluator.analyze_errors(e_hat, e)
                     logger.info("Plots generated successfully")
-                except Exception as e:
-                    logger.warning(f"Failed to generate plots: {e}")
+                except Exception as e_err:
+                    logger.warning(f"Failed to generate plots: {e_err}")
                 
                 # Log evaluation artifacts to MLflow
                 mlflow.log_artifacts(str(output_dir), "evaluation")
@@ -369,16 +407,17 @@ def main():
             logger.info("Generating plots and analysis...")
             print("\nGenerating plots...")
             
-            # Load predictions and targets from saved files
+            # Load predictions, targets, and inputs from saved files
             try:
-                predictions = np.load(output_dir / "predictions.npy")
-                targets = np.load(output_dir / "targets.npy")
+                e_hat = np.load(output_dir / "predictions.npy")  # predicted output
+                e = np.load(output_dir / "targets.npy")  # output (target)
+                d = np.load(output_dir / "inputs.npy")  # input
                 
-                evaluator.plot_predictions(predictions, targets, num_samples=5)
-                evaluator.analyze_errors(predictions, targets)
+                evaluator.plot_predictions(e_hat, e, d, num_samples=5)
+                evaluator.analyze_errors(e_hat, e)
                 logger.info("Plots generated successfully")
-            except Exception as e:
-                logger.warning(f"Failed to generate plots: {e}")
+            except Exception as e_err:
+                logger.warning(f"Failed to generate plots: {e_err}")
         
         logger.info("Plots and analysis generated")
         logger.info(f"Predictions plot: {output_dir / 'predictions_plot.png'}")

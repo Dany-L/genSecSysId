@@ -52,6 +52,7 @@ P = sdpvar(nx,nx);
 m = sdpvar(nz,1);
 lambda = sdpvar(1,1);
 % S_hat = 1;
+multiplier_constraint = [];
 S_hat = sdpvar(1,1);
 for i=1:nw
     multiplier_constraint=[multiplier_constraint;m(i,1)>=eps];
@@ -129,15 +130,15 @@ xlabel('x_1'); ylabel('x_2'); grid on, hold on
 feasible_ic_and_inputs = {};
 infeasible_ic_and_input = {};
 gs = {}; ws = {}; zs={};xs={};
-counter  = 0; M = 1000; N = 100; b_nonlinear = false;
+counter  = 0; M = 1000; N = 500; b_nonlinear = false;
 t = linspace(0,(N-1)*dt, N);
 % lets plot some trajectories
 for i=1:M
     % Generate a random initial condition within the range [-5, 5]
     x0 = -max_ + (max_ - min_) * rand(nx, 1);
 
-    d = sqrt(s^2*(1-alpha))*sin(linspace(0,(N-1)*dt,N));
-    % d = sqrt(s^2*(1-alpha))*2*(rand(nd,N) - 0.5);
+    % d = sqrt(s^2*(1-alpha))*sin(linspace(0,(N-1)*dt,N));
+    d = sqrt(s^2*(1-alpha))*2*(rand(nd,N) - 0.5);
     % d = sqrt(s^2*(1-alpha))*ones(nd,N);
    
     % Call the simulation function
@@ -165,7 +166,7 @@ legend({'$x^T P x < s^2$', '$\|H x\|_\infty < 1$'}, 'Interpreter', 'latex', 'Loc
 
 % print(gcf, './matlab/plots/with external inputs/invariance.png', '-dpng');
 % exportgraphics(gcf, './matlab/plots/with external inputs/three-differnt-init-cond-x-w-z.png');
-save('./matlab/data/init_rand-input_sin.mat', "feasible_ic_and_inputs","s","dsys_", 'Lambda', 'X', 'H', 't', 'dt')
+save('./matlab/data/init_rand-input_noise.mat', "feasible_ic_and_inputs","s","dsys_", 'Lambda', 'X', 'H', 't', 'dt')
 
 count2 = 0;
 for i = 1:length(feasible_ic_and_inputs)

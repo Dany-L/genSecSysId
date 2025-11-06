@@ -3,6 +3,7 @@
 import torch
 import numpy as np
 import random
+from typing import List
 
 
 def set_seed(seed: int):
@@ -52,3 +53,10 @@ def print_model_summary(model: torch.nn.Module):
     print("=" * 60)
     print(f"Total trainable parameters: {count_parameters(model):,}")
     print("=" * 60)
+
+
+def torch_bmat(mat: List[List[torch.Tensor]]) -> torch.Tensor:
+    mat_list = []
+    for col in mat:
+        mat_list.append(torch.hstack(col))
+    return torch.vstack(mat_list)

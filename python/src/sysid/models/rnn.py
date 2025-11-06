@@ -36,18 +36,27 @@ class SimpleRNN(BaseRNN):
     
     def forward(
         self,
-        x: torch.Tensor,
-        hidden: Optional[torch.Tensor] = None,
+        d: torch.Tensor,  # input
+        hidden_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Forward pass."""
-        # x: (batch, seq_len, input_size)
-        rnn_out, hidden = self.rnn(x, hidden)
-        # rnn_out: (batch, seq_len, hidden_size)
+        """
+        Forward pass.
         
-        output = self.fc(rnn_out)
-        # output: (batch, seq_len, output_size)
+        Args:
+            d: Input tensor (batch, seq_len, input_size)
+            hidden_state: Hidden state (num_layers, batch, hidden_size)
+            
+        Returns:
+            e_hat: Predicted output (batch, seq_len, output_size)
+        """
+        # d: (batch, seq_len, input_size)
+        x, hidden_state = self.rnn(d, hidden_state)  # x: hidden state
+        # x: (batch, seq_len, hidden_size)
         
-        return output
+        e_hat = self.fc(x)  # e_hat: predicted output
+        # e_hat: (batch, seq_len, output_size)
+        
+        return e_hat
 
 
 class LSTM(BaseRNN):
@@ -75,18 +84,27 @@ class LSTM(BaseRNN):
     
     def forward(
         self,
-        x: torch.Tensor,
-        hidden: Optional[tuple] = None,
+        d: torch.Tensor,  # input
+        hidden_state: Optional[tuple] = None,
     ) -> torch.Tensor:
-        """Forward pass."""
-        # x: (batch, seq_len, input_size)
-        lstm_out, hidden = self.lstm(x, hidden)
-        # lstm_out: (batch, seq_len, hidden_size)
+        """
+        Forward pass.
         
-        output = self.fc(lstm_out)
-        # output: (batch, seq_len, output_size)
+        Args:
+            d: Input tensor (batch, seq_len, input_size)
+            hidden_state: Hidden state tuple (h, c) where each is (num_layers, batch, hidden_size)
+            
+        Returns:
+            e_hat: Predicted output (batch, seq_len, output_size)
+        """
+        # d: (batch, seq_len, input_size)
+        x, hidden_state = self.lstm(d, hidden_state)  # x: hidden state
+        # x: (batch, seq_len, hidden_size)
         
-        return output
+        e_hat = self.fc(x)  # e_hat: predicted output
+        # e_hat: (batch, seq_len, output_size)
+        
+        return e_hat
 
 
 class GRU(BaseRNN):
@@ -114,15 +132,24 @@ class GRU(BaseRNN):
     
     def forward(
         self,
-        x: torch.Tensor,
-        hidden: Optional[torch.Tensor] = None,
+        d: torch.Tensor,  # input
+        hidden_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Forward pass."""
-        # x: (batch, seq_len, input_size)
-        gru_out, hidden = self.gru(x, hidden)
-        # gru_out: (batch, seq_len, hidden_size)
+        """
+        Forward pass.
         
-        output = self.fc(gru_out)
-        # output: (batch, seq_len, output_size)
+        Args:
+            d: Input tensor (batch, seq_len, input_size)
+            hidden_state: Hidden state (num_layers, batch, hidden_size)
+            
+        Returns:
+            e_hat: Predicted output (batch, seq_len, output_size)
+        """
+        # d: (batch, seq_len, input_size)
+        x, hidden_state = self.gru(d, hidden_state)  # x: hidden state
+        # x: (batch, seq_len, hidden_size)
         
-        return output
+        e_hat = self.fc(x)  # e_hat: predicted output
+        # e_hat: (batch, seq_len, output_size)
+        
+        return e_hat

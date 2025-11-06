@@ -53,43 +53,47 @@ class Evaluator:
         """
         all_predictions = []
         all_targets = []
+        all_inputs = []
         
         with torch.no_grad():
-            for inputs, targets in test_loader:
-                inputs = inputs.to(self.device)
-                targets = targets.to(self.device)
+            for d, e in test_loader:  # d: input, e: output
+                d = d.to(self.device)
+                e = e.to(self.device)
                 
                 # Forward pass
-                outputs = self.model(inputs)
+                e_hat = self.model(d)  # e_hat: predicted output
                 
-                all_predictions.append(outputs.cpu().numpy())
-                all_targets.append(targets.cpu().numpy())
+                all_predictions.append(e_hat.cpu().numpy())
+                all_targets.append(e.cpu().numpy())
+                all_inputs.append(d.cpu().numpy())
         
         # Concatenate all batches
-        predictions = np.concatenate(all_predictions, axis=0)
-        targets = np.concatenate(all_targets, axis=0)
+        e_hat = np.concatenate(all_predictions, axis=0)
+        e = np.concatenate(all_targets, axis=0)
+        d = np.concatenate(all_inputs, axis=0)
         
         # Denormalize if normalizer provided
         if normalizer is not None:
-            predictions = normalizer.inverse_transform_outputs(predictions)
-            targets = normalizer.inverse_transform_outputs(targets)
+            e_hat = normalizer.inverse_transform_outputs(e_hat)
+            e = normalizer.inverse_transform_outputs(e)
+            d = normalizer.inverse_transform_inputs(d)
         
         # Compute metrics
         metrics = compute_metrics(
-            predictions.reshape(-1, predictions.shape[-1]),
-            targets.reshape(-1, targets.shape[-1]),
+            e_hat.reshape(-1, e_hat.shape[-1]),
+            e.reshape(-1, e.shape[-1]),
         )
         
         # Compute per-step metrics for sequences
-        if predictions.ndim == 3:
-            sim_metrics = compute_simulation_metrics(predictions, targets)
+        if e_hat.ndim == 3:
+            sim_metrics = compute_simulation_metrics(e_hat, e)
             metrics.update(sim_metrics)
         
         # Save results
         results = {
             "metrics": metrics,
-            "predictions_shape": predictions.shape,
-            "targets_shape": targets.shape,
+            "predictions_shape": e_hat.shape,
+            "targets_shape": e.shape,
         }
         
         with open(self.output_dir / "evaluation_results.json", "w") as f:
@@ -97,9 +101,10 @@ class Evaluator:
             save_metrics = {k: v for k, v in metrics.items() if k != "per_step"}
             json.dump({"metrics": save_metrics}, f, indent=2)
         
-        # Save predictions and targets
-        np.save(self.output_dir / "predictions.npy", predictions)
-        np.save(self.output_dir / "targets.npy", targets)
+        # Save predictions, targets, and inputs
+        np.save(self.output_dir / "predictions.npy", e_hat)
+        np.save(self.output_dir / "targets.npy", e)
+        np.save(self.output_dir / "inputs.npy", d)
         
         print("Evaluation Results:")
         for key, value in metrics.items():
@@ -110,46 +115,71 @@ class Evaluator:
     
     def plot_predictions(
         self,
-        predictions: np.ndarray,
-        targets: np.ndarray,
+        e_hat: np.ndarray,  # predicted output
+        e: np.ndarray,      # output (target)
+        d: Optional[np.ndarray] = None,  # input
         num_samples: int = 5,
         save_path: Optional[str] = None,
     ):
         """
-        Plot predictions vs targets.
+        Plot predictions vs targets and optionally inputs.
         
         Args:
-            predictions: Predicted values
-            targets: Target values
+            e_hat: Predicted output values
+            e: Output (target) values
+            d: Input values (optional)
             num_samples: Number of samples to plot
             save_path: Path to save figure
         """
-        num_samples = min(num_samples, predictions.shape[0])
+        num_samples = min(num_samples, e_hat.shape[0])
         
-        fig, axes = plt.subplots(num_samples, 1, figsize=(12, 3 * num_samples))
+        # Determine number of subplots
+        num_plots = 2 if d is not None else 1
+        
+        fig, axes = plt.subplots(num_samples, num_plots, figsize=(12 * num_plots, 3 * num_samples))
         
         if num_samples == 1:
-            axes = [axes]
+            axes = axes.reshape(1, -1) if num_plots > 1 else [[axes]]
+        elif num_plots == 1:
+            axes = axes.reshape(-1, 1)
         
         for i in range(num_samples):
-            ax = axes[i]
+            # Plot predictions vs targets
+            ax_pred = axes[i, 0] if num_plots > 1 else axes[i, 0]
             
-            if predictions.ndim == 3:
+            if e_hat.ndim == 3:
                 # Sequence data
-                seq_len = predictions.shape[1]
-                for feat in range(predictions.shape[2]):
-                    ax.plot(predictions[i, :, feat], label=f"Predicted (feat {feat})", alpha=0.7)
-                    ax.plot(targets[i, :, feat], label=f"Target (feat {feat})", linestyle="--", alpha=0.7)
+                seq_len = e_hat.shape[1]
+                for feat in range(e_hat.shape[2]):
+                    ax_pred.plot(e_hat[i, :, feat], label=f"e_hat (predicted output, feat {feat})", alpha=0.7)
+                    ax_pred.plot(e[i, :, feat], label=f"e (output, feat {feat})", linestyle="--", alpha=0.7)
             else:
                 # Single-step data
-                ax.plot(predictions[i], label="Predicted", alpha=0.7)
-                ax.plot(targets[i], label="Target", linestyle="--", alpha=0.7)
+                ax_pred.plot(e_hat[i], label="e_hat (predicted output)", alpha=0.7)
+                ax_pred.plot(e[i], label="e (output)", linestyle="--", alpha=0.7)
             
-            ax.set_xlabel("Time Step")
-            ax.set_ylabel("Value")
-            ax.set_title(f"Sample {i + 1}")
-            ax.legend()
-            ax.grid(True, alpha=0.3)
+            ax_pred.set_xlabel("Time Step")
+            ax_pred.set_ylabel("Output (e)")
+            ax_pred.set_title(f"Sample {i + 1}: Output Prediction")
+            ax_pred.legend()
+            ax_pred.grid(True, alpha=0.3)
+            
+            # Plot inputs if provided
+            if d is not None:
+                ax_input = axes[i, 1]
+                
+                if d.ndim == 3:
+                    # Sequence data
+                    for feat in range(d.shape[2]):
+                        ax_input.plot(d[i, :, feat], label=f"d (input, feat {feat})", alpha=0.7)
+                else:
+                    ax_input.plot(d[i], label="d (input)", alpha=0.7)
+                
+                ax_input.set_xlabel("Time Step")
+                ax_input.set_ylabel("Input (d)")
+                ax_input.set_title(f"Sample {i + 1}: Input Signal")
+                ax_input.legend()
+                ax_input.grid(True, alpha=0.3)
         
         plt.tight_layout()
         
@@ -163,60 +193,46 @@ class Evaluator:
     
     def analyze_errors(
         self,
-        predictions: np.ndarray,
-        targets: np.ndarray,
+        e_hat: np.ndarray,  # predicted output
+        e: np.ndarray,      # output (target)
         save_path: Optional[str] = None,
     ):
         """
-        Analyze prediction errors.
+        Analyze prediction errors - simplified to show error over time.
         
         Args:
-            predictions: Predicted values
-            targets: Target values
+            e_hat: Predicted output values
+            e: Output (target) values
             save_path: Path to save figure
         """
-        errors = predictions - targets
+        errors = e_hat - e
         
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig, ax = plt.subplots(1, 1, figsize=(12, 6))
         
-        # Error distribution
-        axes[0, 0].hist(errors.flatten(), bins=50, edgecolor="black", alpha=0.7)
-        axes[0, 0].set_xlabel("Error")
-        axes[0, 0].set_ylabel("Frequency")
-        axes[0, 0].set_title("Error Distribution")
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # Absolute error over time (for sequences)
-        if predictions.ndim == 3:
+        # Error over time (for sequences)
+        if e_hat.ndim == 3:
             abs_errors_per_step = np.mean(np.abs(errors), axis=(0, 2))
-            axes[0, 1].plot(abs_errors_per_step)
-            axes[0, 1].set_xlabel("Time Step")
-            axes[0, 1].set_ylabel("Mean Absolute Error")
-            axes[0, 1].set_title("Error Over Time")
-            axes[0, 1].grid(True, alpha=0.3)
-        
-        # Predictions vs targets scatter
-        axes[1, 0].scatter(targets.flatten(), predictions.flatten(), alpha=0.3, s=1)
-        axes[1, 0].plot(
-            [targets.min(), targets.max()],
-            [targets.min(), targets.max()],
-            "r--",
-            linewidth=2,
-            label="Perfect prediction"
-        )
-        axes[1, 0].set_xlabel("Target")
-        axes[1, 0].set_ylabel("Prediction")
-        axes[1, 0].set_title("Predictions vs Targets")
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        # Error vs target value
-        axes[1, 1].scatter(targets.flatten(), errors.flatten(), alpha=0.3, s=1)
-        axes[1, 1].axhline(y=0, color="r", linestyle="--", linewidth=2)
-        axes[1, 1].set_xlabel("Target")
-        axes[1, 1].set_ylabel("Error")
-        axes[1, 1].set_title("Error vs Target Value")
-        axes[1, 1].grid(True, alpha=0.3)
+            ax.plot(abs_errors_per_step, linewidth=2)
+            ax.set_xlabel("Time Step", fontsize=12)
+            ax.set_ylabel("Mean Absolute Error (MAE)", fontsize=12)
+            ax.set_title("Prediction Error Over Time", fontsize=14, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            
+            # Add statistical info
+            mean_error = np.mean(abs_errors_per_step)
+            max_error = np.max(abs_errors_per_step)
+            ax.axhline(y=mean_error, color='r', linestyle='--', linewidth=1.5, 
+                      label=f'Mean MAE: {mean_error:.4f}', alpha=0.7)
+            ax.axhline(y=max_error, color='orange', linestyle='--', linewidth=1.5,
+                      label=f'Max MAE: {max_error:.4f}', alpha=0.7)
+            ax.legend(fontsize=10)
+        else:
+            # For non-sequence data, show error distribution
+            ax.hist(np.abs(errors).flatten(), bins=50, edgecolor="black", alpha=0.7)
+            ax.set_xlabel("Absolute Error", fontsize=12)
+            ax.set_ylabel("Frequency", fontsize=12)
+            ax.set_title("Prediction Error Distribution", fontsize=14, fontweight='bold')
+            ax.grid(True, alpha=0.3, axis='y')
         
         plt.tight_layout()
         

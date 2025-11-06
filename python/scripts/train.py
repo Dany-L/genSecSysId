@@ -7,11 +7,12 @@ import sys
 from datetime import datetime
 import json
 import mlflow
+import os
 
 from sysid.config import Config
 from sysid.data import create_dataloaders, DataLoader
 from sysid.data.direct_loader import load_split_data
-from sysid.models import SimpleRNN, LSTM, GRU
+from sysid.models import SimpleRNN, LSTM, GRU, SimpleLure
 from sysid.training import Trainer, get_loss_function, get_optimizer, get_scheduler
 from sysid.utils import set_seed, get_device, print_model_summary
 
@@ -39,31 +40,40 @@ def setup_logging(output_dir: Path, experiment_name: str) -> logging.Logger:
 def create_model(config: Config):
     """Create model from configuration."""
     model_config = config.model
+    data_config = config.data
     
     if model_config.model_type == "rnn":
         model = SimpleRNN(
-            input_size=model_config.input_size,
-            hidden_size=model_config.hidden_size,
-            output_size=model_config.output_size,
+            input_size=len(data_config.input_col),
+            hidden_size=model_config.nw,
+            output_size=len(data_config.output_col),
             num_layers=model_config.num_layers,
             dropout=model_config.dropout,
             activation=model_config.activation,
         )
     elif model_config.model_type == "lstm":
         model = LSTM(
-            input_size=model_config.input_size,
-            hidden_size=model_config.hidden_size,
-            output_size=model_config.output_size,
+            input_size=len(data_config.input_col),
+            hidden_size=model_config.nw,
+            output_size=len(data_config.output_col),
             num_layers=model_config.num_layers,
             dropout=model_config.dropout,
         )
     elif model_config.model_type == "gru":
         model = GRU(
-            input_size=model_config.input_size,
-            hidden_size=model_config.hidden_size,
-            output_size=model_config.output_size,
+            input_size=len(data_config.input_col),
+            hidden_size=model_config.nw,
+            output_size=len(data_config.output_col),
             num_layers=model_config.num_layers,
             dropout=model_config.dropout,
+        )
+    elif model_config.model_type == "crnn":
+        model = SimpleLure(
+            nd=len(data_config.input_col),
+            ne=len(data_config.output_col),
+            nw=model_config.nw,
+            nx=model_config.nx,
+            activation=model_config.activation,
         )
     else:
         raise ValueError(f"Unknown model type: {model_config.model_type}")
@@ -86,16 +96,19 @@ def main():
     else:
         raise ValueError(f"Unsupported config file format: {config_path.suffix}")
     
+    output_dir = os.path.expanduser(config.output_dir)
+    model_dir = os.path.expanduser(config.model_dir)
+    log_dir = os.path.expanduser(config.log_dir)
     # Setup logging
-    logger = setup_logging(Path(config.output_dir), config.mlflow.experiment_name)
+    logger = setup_logging(Path(os.path.expanduser(output_dir)), config.mlflow.experiment_name)
     
     logger.info("=" * 70)
     logger.info("Training RNN for System Identification")
     logger.info("=" * 70)
     logger.info(f"Config file: {config_path}")
     logger.info(f"Model type: {config.model.model_type}")
-    logger.info(f"Output directory: {config.output_dir}")
-    logger.info(f"Model directory: {config.model_dir}")
+    logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Model directory: {model_dir}")
     
     # Set seed for reproducibility
     set_seed(config.seed)
@@ -113,20 +126,32 @@ def main():
     
     try:
         # Auto-detect loading method based on path
-        train_path = Path(data_config.train_path)
+        train_path = Path(os.path.expanduser(data_config.train_path))
         
         if train_path.is_dir():
             # Primary method: Load directly from CSV folder structure
             logger.info("Loading directly from CSV folder structure...")
             logger.info(f"Data directory: {data_config.train_path}")
             
-            # Load from train/test/validation subfolders
-            train_inputs, train_outputs, val_inputs, val_outputs, test_inputs, test_outputs = load_split_data(
+            # Get state column if provided
+            state_col = getattr(data_config, 'state_col', None)
+            if state_col and len(state_col) == 0:  # Empty list means no state
+                state_col = None
+            
+            # Load from train/validation subfolders (skip test for training)
+            result = load_split_data(
                 data_dir=str(train_path),
-                input_col=getattr(data_config, 'input_col', 'd'),
-                output_col=getattr(data_config, 'output_col', 'e'),
-                pattern=getattr(data_config, 'pattern', '*.csv')
+                input_col=getattr(data_config, 'input_col', ['d']),
+                output_col=getattr(data_config, 'output_col', ['e']),
+                state_col=state_col,
+                pattern=getattr(data_config, 'pattern', '*.csv'),
+                load_test=False  # Don't load test data during training
             )
+            
+            # Unpack (test_* will be None)
+            train_inputs, train_outputs, val_inputs, val_outputs, _, _, train_states, val_states, _ = result
+            if train_states is not None:
+                logger.info(f"State information loaded: train_states={train_states.shape}")
             
         elif train_path.suffix == '.csv':
             # Fallback: Load from single CSV files (requires train_path, val_path, test_path)
@@ -183,8 +208,8 @@ def main():
     
     # Save normalizer
     if normalizer is not None:
-        normalizer_path = Path(config.model_dir) / "normalizer.json"
-        Path(config.model_dir).mkdir(parents=True, exist_ok=True)
+        normalizer_path = Path(model_dir) / "normalizer.json"
+        Path(model_dir).mkdir(parents=True, exist_ok=True)
         normalizer.save(str(normalizer_path))
         logger.info(f"Normalizer saved to {normalizer_path}")
         print(f"Normalizer saved to {normalizer_path}")
@@ -253,8 +278,8 @@ def main():
         logger.info(f"MLflow run ID: {run_id}")
         
         # Update directories to include run_id for better organization
-        run_model_dir = Path(config.model_dir) / run_id
-        run_output_dir = Path(config.output_dir) / run_id
+        run_model_dir = Path(model_dir) / run_id
+        run_output_dir = Path(output_dir) / run_id
         run_model_dir.mkdir(parents=True, exist_ok=True)
         run_output_dir.mkdir(parents=True, exist_ok=True)
         
@@ -264,7 +289,8 @@ def main():
         # Log config
         mlflow.log_params({
             "model_type": config.model.model_type,
-            "hidden_size": config.model.hidden_size,
+            "hidden_size": config.model.nw,
+            "activation": config.model.activation,
             "num_layers": config.model.num_layers,
             "learning_rate": config.optimizer.learning_rate,
             "batch_size": config.data.batch_size,
@@ -298,12 +324,15 @@ def main():
             device=str(device),
             output_dir=str(run_output_dir),
             model_dir=str(run_model_dir),
-            log_dir=config.log_dir,
+            log_dir=log_dir,
             gradient_clip_value=config.training.gradient_clip_value,
             regularization_weight=config.training.regularization_weight if config.training.use_custom_regularization else 0.0,
+            decay_regularization_weight=getattr(config.training, 'decay_regularization_weight', False) if config.training.use_custom_regularization else False,
+            regularization_decay_factor=getattr(config.training, 'regularization_decay_factor', 0.5),
             checkpoint_frequency=config.training.checkpoint_frequency,
             early_stopping_patience=config.training.early_stopping_patience,
             mlflow_tracking=True,
+            log_gradients=getattr(config.training, 'log_gradients', True),
         )
         
         if scheduler is not None:
@@ -315,6 +344,15 @@ def main():
         logger.info(f"Max epochs: {config.training.max_epochs}")
         logger.info(f"Early stopping patience: {config.training.early_stopping_patience}")
         logger.info(f"Gradient clipping: {config.training.gradient_clip_value}")
+        logger.info(f"Gradient logging: {getattr(config.training, 'log_gradients', True)}")
+        if config.training.use_custom_regularization:
+            logger.info(f"Custom regularization: enabled")
+            logger.info(f"  Initial weight: {config.training.regularization_weight}")
+            if getattr(config.training, 'decay_regularization_weight', False):
+                logger.info(f"  Decay with LR: enabled (Interior Point Method)")
+                logger.info(f"  Decay factor: {getattr(config.training, 'regularization_decay_factor', 0.5)}")
+            else:
+                logger.info(f"  Decay with LR: disabled")
         logger.info("=" * 70)
         print("\nStarting training...")
         
@@ -345,7 +383,7 @@ def main():
             logger.info("Artifacts logged to MLflow")
             logger.info(f"Models saved in: {run_model_dir}")
             logger.info(f"Outputs saved in: {run_output_dir}")
-            logger.info(f"Logs saved in: {config.log_dir}")
+            logger.info(f"Logs saved in: {log_dir}")
             logger.info(f"Run ID: {run_id} - Use this for evaluation/analysis")
             
         except Exception as e:

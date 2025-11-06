@@ -5,36 +5,36 @@ from typing import Dict
 import torch
 
 
-def compute_metrics(predictions: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
+def compute_metrics(e_hat: np.ndarray, e: np.ndarray) -> Dict[str, float]:
     """
     Compute various evaluation metrics.
     
     Args:
-        predictions: Predicted values
-        targets: Target values
+        e_hat: Predicted output values
+        e: Output (target) values
         
     Returns:
         Dictionary of metrics
     """
     # Mean Squared Error
-    mse = np.mean((predictions - targets) ** 2)
+    mse = np.mean((e_hat - e) ** 2)
     
     # Root Mean Squared Error
     rmse = np.sqrt(mse)
     
     # Mean Absolute Error
-    mae = np.mean(np.abs(predictions - targets))
+    mae = np.mean(np.abs(e_hat - e))
     
     # R-squared score
-    ss_res = np.sum((targets - predictions) ** 2)
-    ss_tot = np.sum((targets - np.mean(targets)) ** 2)
+    ss_res = np.sum((e - e_hat) ** 2)
+    ss_tot = np.sum((e - np.mean(e)) ** 2)
     r2 = 1 - (ss_res / (ss_tot + 1e-10))
     
     # Normalized RMSE (NRMSE)
-    nrmse = rmse / (np.max(targets) - np.min(targets) + 1e-10)
+    nrmse = rmse / (np.max(e) - np.min(e) + 1e-10)
     
     # Max error
-    max_error = np.max(np.abs(predictions - targets))
+    max_error = np.max(np.abs(e_hat - e))
     
     return {
         "mse": float(mse),
@@ -47,30 +47,30 @@ def compute_metrics(predictions: np.ndarray, targets: np.ndarray) -> Dict[str, f
 
 
 def compute_simulation_metrics(
-    predictions: np.ndarray,
-    targets: np.ndarray,
+    e_hat: np.ndarray,  # predicted output
+    e: np.ndarray,      # output (target)
     horizon: int = None,
 ) -> Dict[str, float]:
     """
     Compute metrics for multi-step simulation.
     
     Args:
-        predictions: Predicted sequences (n_samples, seq_len, features)
-        targets: Target sequences
+        e_hat: Predicted output sequences (n_samples, seq_len, features)
+        e: Output (target) sequences
         horizon: Prediction horizon to evaluate (if None, use full sequence)
         
     Returns:
         Dictionary of metrics per time step
     """
     if horizon is None:
-        horizon = predictions.shape[1]
+        horizon = e_hat.shape[1]
     
     metrics_per_step = {}
     
     for t in range(horizon):
         step_metrics = compute_metrics(
-            predictions[:, t, :],
-            targets[:, t, :],
+            e_hat[:, t, :],
+            e[:, t, :],
         )
         for key, value in step_metrics.items():
             if key not in metrics_per_step:

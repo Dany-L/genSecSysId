@@ -1,9 +1,131 @@
 """Base model class for RNN-based system identification."""
 
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple, Union
+import numpy as np
 from abc import ABC, abstractmethod
+
+
+@dataclass
+class LureSystemClass:
+    A: torch.Tensor
+    B: torch.Tensor
+    B2: torch.Tensor
+    C: torch.Tensor
+    D: torch.Tensor
+    D12: torch.Tensor
+    C2: torch.Tensor
+    D21: torch.Tensor
+    D22: torch.Tensor
+    Delta: torch.nn.Module
+
+
+class DznActivation(nn.Module):
+    def forward(self, z):
+        return z - nn.Hardtanh(min_val=-1.0, max_val=1.0)(z)
+
+
+class Linear(nn.Module):
+    def __init__(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        D: torch.Tensor,
+        dt: torch.Tensor = torch.tensor(0.01),
+    ) -> None:
+        super().__init__()
+        self._nx = A.shape[0]
+        self._nd = B.shape[1]
+        self._ne = C.shape[0]
+
+        self.A = A
+        self.B = B
+        self.C = C
+        self.D = D
+        self.dt = dt
+
+    def _init_weights(self) -> None:
+        for p in self.parameters():
+            torch.nn.init.uniform_(
+                tensor=p, a=-np.sqrt(1 / self._nd), b=np.sqrt(1 / self._nd)
+            )
+
+    def state_dynamics(self, x: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
+        return self.A @ x + self.B @ d
+
+    def output_dynamics(self, x: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
+        return self.C @ x + self.D @ d
+
+    def forward(
+        self,
+        d: torch.Tensor,
+        x0: Optional[
+            Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]
+        ] = None,
+        theta: Optional[np.ndarray] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]],
+    ]:
+        n_batch, N, _, _ = d.shape
+        x = torch.zeros(size=(n_batch, N + 1, self._nx, 1))
+        e_hat = torch.zeros(size=(n_batch, N, self._ne, 1))
+        if x0 is not None:
+            if isinstance(x0, Tuple):
+                x[:, 0, :, :] = x0[0]  # Use first element if tuple
+            else:
+                x[:, 0, :, :] = x0
+
+        for k in range(N):
+            x[:, k + 1, :, :] = self.state_dynamics(x=x[:, k, :, :], d=d[:, k, :, :])
+            e_hat[:, k, :, :] = self.output_dynamics(x=x[:, k, :, :], d=d[:, k, :, :])
+
+        return e_hat, (x,)
+
+    def is_stable(self) -> bool:
+        """Check if the system is stable by checking the eigenvalues of A."""
+        eigenvalues = torch.linalg.eigvals(self.A)
+        return bool(torch.all(torch.abs(eigenvalues) < 1.0))
+
+
+class LureSystem(Linear):
+    def __init__(
+        self,
+        sys: LureSystemClass,
+    ) -> None:
+        super().__init__(A=sys.A, B=sys.B, C=sys.C, D=sys.D)
+        self._nw = sys.B2.shape[1]
+        self._nz = sys.C2.shape[0]
+        assert self._nw == self._nz
+        self.B2 = sys.B2
+        self.C2 = sys.C2
+        self.D12 = sys.D12
+        self.D21 = sys.D21
+        self.Delta = sys.Delta  # static nonlinearity
+
+    def forward(
+        self,
+        d: torch.Tensor,
+        x0: Optional[
+            Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]
+        ] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]],
+    ]:
+        n_batch, N, _, _ = d.shape
+        e_hat = torch.zeros(size=(n_batch, N, self._ne, 1))
+        x = x0.reshape(n_batch, self._nx, 1)
+
+        for k in range(N):
+            w = self.Delta(self.C2 @ x + self.D21 @ d[:, k, :, :])
+            x = super().state_dynamics(x=x, d=d[:, k, :, :]) + self.B2 @ w
+            e_hat[:, k, :, :] = super().output_dynamics(x=x, d=d[:, k, :, :]) + self.D12 @ w
+
+        return (e_hat, x)
 
 
 class BaseRNN(nn.Module, ABC):
@@ -38,8 +160,8 @@ class BaseRNN(nn.Module, ABC):
     @abstractmethod
     def forward(
         self,
-        x: torch.Tensor,
-        hidden: Optional[torch.Tensor] = None,
+        d: torch.Tensor,  # input
+        hidden_state: Optional[tuple] = None,
     ) -> torch.Tensor:
         """
         Forward pass through the model.

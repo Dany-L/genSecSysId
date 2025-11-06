@@ -15,8 +15,9 @@ class DataConfig:
     test_path: Optional[str] = None  # Not required for folder loading
     
     # Direct folder loading parameters
-    input_col: str = "d"  # Column name for input
-    output_col: str = "e"  # Column name for output
+    input_col: list = None  # Column name(s) for input - supports MIMO
+    output_col: list = None  # Column name(s) for output - supports MIMO
+    state_col: list = None  # Column name(s) for state (optional)
     pattern: str = "*.csv"  # File pattern for folder loading
     
     # Preprocessing
@@ -26,15 +27,23 @@ class DataConfig:
     sequence_length: Optional[int] = None  # None = use full sequences
     shuffle: bool = True
     num_workers: int = 0
+    
+    def __post_init__(self):
+        """Set default column names if none provided."""
+        if self.input_col is None:
+            self.input_col = ["d"]
+        if self.output_col is None:
+            self.output_col = ["e"]
+        if self.state_col is None:
+            self.state_col = []  # Empty list means no state columns
 
 
 @dataclass
 class ModelConfig:
     """Configuration for model architecture."""
     model_type: str = "rnn"  # "rnn", "lstm", "gru", or custom
-    input_size: int = 1
-    hidden_size: int = 64
-    output_size: int = 1
+    nw: int = 64
+    nx: int = 64
     num_layers: int = 2
     dropout: float = 0.0
     activation: str = "tanh"
@@ -69,9 +78,14 @@ class TrainingConfig:
     # Loss function
     loss_type: str = "mse"  # "mse", "mae", "huber"
     
-    # Regularization
+    # Regularization (Interior Point Method for LMI constraints)
     use_custom_regularization: bool = False
     regularization_weight: float = 0.01
+    decay_regularization_weight: bool = True  # Decay reg weight with learning rate
+    regularization_decay_factor: float = 0.5  # Same as scheduler_factor by default
+    
+    # Gradient monitoring
+    log_gradients: bool = True  # Log gradient statistics to MLflow
     
     # Device
     device: str = "cuda"  # "cuda", "cpu", "mps"

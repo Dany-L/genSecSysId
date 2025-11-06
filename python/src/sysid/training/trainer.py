@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 from tqdm import tqdm
 import json
+import numpy as np
 from typing import Optional, Dict, Any
 import mlflow
 
@@ -30,9 +31,12 @@ class Trainer:
         log_dir: str = "logs",
         gradient_clip_value: Optional[float] = None,
         regularization_weight: float = 0.0,
+        decay_regularization_weight: bool = False,
+        regularization_decay_factor: float = 0.5,
         checkpoint_frequency: int = 10,
         early_stopping_patience: int = 50,
         mlflow_tracking: bool = True,
+        log_gradients: bool = True,
     ):
         """
         Initialize trainer.
@@ -48,10 +52,13 @@ class Trainer:
             model_dir: Directory for saved models
             log_dir: Directory for logs
             gradient_clip_value: Gradient clipping value
-            regularization_weight: Weight for custom regularization
+            regularization_weight: Initial weight for custom regularization
+            decay_regularization_weight: Whether to decay reg weight with LR
+            regularization_decay_factor: Factor to decay reg weight (interior point method)
             checkpoint_frequency: Save checkpoint every N epochs
             early_stopping_patience: Patience for early stopping
             mlflow_tracking: Whether to use MLflow tracking
+            log_gradients: Whether to log gradient statistics
         """
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -72,11 +79,15 @@ class Trainer:
         # Training parameters
         self.gradient_clip_value = gradient_clip_value
         self.regularization_weight = regularization_weight
+        self.initial_regularization_weight = regularization_weight  # Store initial value
+        self.decay_regularization_weight = decay_regularization_weight
+        self.regularization_decay_factor = regularization_decay_factor
         self.checkpoint_frequency = checkpoint_frequency
         self.early_stopping_patience = early_stopping_patience
         
         # Logging
         self.mlflow_tracking = mlflow_tracking
+        self.log_gradients = log_gradients
         
         # Training state
         self.current_epoch = 0
@@ -93,24 +104,123 @@ class Trainer:
         """Set learning rate scheduler."""
         self.scheduler = scheduler
     
-    def train_epoch(self) -> float:
-        """Train for one epoch."""
+    def compute_gradient_stats(self) -> Dict[str, float]:
+        """
+        Compute comprehensive gradient statistics.
+        
+        Returns:
+            Dictionary with gradient statistics:
+            - grad_norm_total: Global gradient norm (L2)
+            - grad_norm_max: Maximum gradient norm across parameters
+            - grad_norm_min: Minimum gradient norm across parameters
+            - grad_value_max: Largest gradient value (absolute)
+            - grad_value_min: Smallest gradient value (absolute)
+            - grad_mean: Mean gradient value
+            - grad_std: Standard deviation of gradients
+            - dead_params_ratio: Ratio of parameters with zero gradient
+            - grad_param_ratio_mean: Mean ratio of gradient norm to parameter norm
+            - grad_param_ratio_max: Max ratio of gradient norm to parameter norm
+        """
+        stats = {}
+        
+        # Collect all gradients and parameters
+        all_grads = []
+        all_params = []
+        param_grad_norms = []
+        param_norms = []
+        dead_params = 0
+        total_params = 0
+        
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                grad = param.grad.detach()
+                param_val = param.detach()
+                
+                # Collect flattened gradients
+                all_grads.append(grad.flatten())
+                all_params.append(param_val.flatten())
+                
+                # Per-parameter norms
+                grad_norm = grad.norm().item()
+                param_norm = param_val.norm().item()
+                
+                param_grad_norms.append(grad_norm)
+                param_norms.append(param_norm)
+                
+                # Check for dead parameters
+                if grad_norm < 1e-10:
+                    dead_params += 1
+                total_params += 1
+        
+        if len(all_grads) > 0:
+            # Concatenate all gradients
+            all_grads_tensor = torch.cat(all_grads)
+            all_params_tensor = torch.cat(all_params)
+            
+            # Global statistics
+            stats['grad_norm_total'] = all_grads_tensor.norm().item()
+            stats['grad_value_max'] = all_grads_tensor.abs().max().item()
+            stats['grad_value_min'] = all_grads_tensor.abs().min().item()
+            stats['grad_mean'] = all_grads_tensor.mean().item()
+            stats['grad_std'] = all_grads_tensor.std().item()
+            
+            # Per-parameter statistics
+            if len(param_grad_norms) > 0:
+                stats['grad_norm_max'] = max(param_grad_norms)
+                stats['grad_norm_min'] = min(param_grad_norms)
+                
+                # Gradient-to-parameter ratio (indicates update size)
+                grad_param_ratios = []
+                for g_norm, p_norm in zip(param_grad_norms, param_norms):
+                    if p_norm > 1e-10:  # Avoid division by zero
+                        grad_param_ratios.append(g_norm / p_norm)
+                
+                if len(grad_param_ratios) > 0:
+                    stats['grad_param_ratio_mean'] = np.mean(grad_param_ratios)
+                    stats['grad_param_ratio_max'] = max(grad_param_ratios)
+            
+            # Dead parameters
+            stats['dead_params_ratio'] = dead_params / total_params if total_params > 0 else 0.0
+        
+        return stats
+    
+    def decay_regularization(self):
+        """
+        Decay regularization weight (Interior Point Method).
+        
+        In interior point methods for convex optimization, the barrier parameter
+        is reduced as we approach the solution. Here we decay the regularization
+        weight whenever the learning rate is reduced.
+        """
+        if self.decay_regularization_weight and self.regularization_weight > 0:
+            old_weight = self.regularization_weight
+            self.regularization_weight *= self.regularization_decay_factor
+            print(f"  Regularization weight decayed: {old_weight:.6e} → {self.regularization_weight:.6e}")
+    
+    def train_epoch(self) -> Dict[str, float]:
+        """
+        Train for one epoch.
+        
+        Returns:
+            Dictionary with training loss and gradient statistics
+        """
         self.model.train()
         total_loss = 0.0
         num_batches = 0
         
-        pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}")
+        # Accumulate gradient stats over epoch
+        epoch_grad_stats = {}
         
-        for batch_idx, (inputs, targets) in enumerate(pbar):
-            inputs = inputs.to(self.device)
-            targets = targets.to(self.device)
+        for batch_idx, (d, e) in enumerate(self.train_loader):  # d: input, e: output
+            d = d.to(self.device)
+            e = e.to(self.device)
             
             # Forward pass
             self.optimizer.zero_grad()
-            outputs = self.model(inputs)
+            e_hat = self.model(d)  # e_hat: predicted output
             
             # Compute loss
-            loss = self.loss_fn(outputs, targets)
+            loss = self.loss_fn(e_hat, e)
             
             # Add custom regularization
             if self.regularization_weight > 0:
@@ -119,6 +229,16 @@ class Trainer:
             
             # Backward pass
             loss.backward()
+            
+            # Compute gradient statistics (before clipping) if logging enabled
+            if self.log_gradients:
+                grad_stats = self.compute_gradient_stats()
+                
+                # Accumulate stats (compute epoch average later)
+                for key, value in grad_stats.items():
+                    if key not in epoch_grad_stats:
+                        epoch_grad_stats[key] = []
+                    epoch_grad_stats[key].append(value)
             
             # Gradient clipping
             if self.gradient_clip_value is not None:
@@ -133,12 +253,16 @@ class Trainer:
             # Update metrics
             total_loss += loss.item()
             num_batches += 1
-            
-            # Update progress bar
-            pbar.set_postfix({"loss": loss.item()})
         
+        # Average loss
         avg_loss = total_loss / num_batches
-        return avg_loss
+        
+        # Average gradient statistics over epoch
+        avg_grad_stats = {
+            key: np.mean(values) for key, values in epoch_grad_stats.items()
+        }
+        
+        return {'loss': avg_loss, **avg_grad_stats}
     
     def validate(self) -> float:
         """Validate the model."""
@@ -147,15 +271,15 @@ class Trainer:
         num_batches = 0
         
         with torch.no_grad():
-            for inputs, targets in self.val_loader:
-                inputs = inputs.to(self.device)
-                targets = targets.to(self.device)
+            for d, e in self.val_loader:  # d: input, e: output
+                d = d.to(self.device)
+                e = e.to(self.device)
                 
                 # Forward pass
-                outputs = self.model(inputs)
+                e_hat = self.model(d)  # e_hat: predicted output
                 
                 # Compute loss
-                loss = self.loss_fn(outputs, targets)
+                loss = self.loss_fn(e_hat, e)
                 
                 total_loss += loss.item()
                 num_batches += 1
@@ -176,31 +300,60 @@ class Trainer:
         print(f"Starting training for {max_epochs} epochs")
         print(f"Model has {self.model.count_parameters()} trainable parameters")
         
-        for epoch in range(max_epochs):
+        # Epoch-level progress bar
+        pbar = tqdm(range(max_epochs), desc="Training Progress")
+        
+        for epoch in pbar:
             self.current_epoch = epoch
             
-            # Train
-            train_loss = self.train_epoch()
+            # Train (returns dict with loss and gradient stats)
+            train_results = self.train_epoch()
+            train_loss = train_results['loss']
+            grad_stats = {k: v for k, v in train_results.items() if k != 'loss'}
+            
             self.train_losses.append(train_loss)
             
             # Validate
             val_loss = self.validate()
             self.val_losses.append(val_loss)
             
-            print(f"Epoch {epoch}: train_loss={train_loss:.6f}, val_loss={val_loss:.6f}")
+            # Update progress bar with current metrics
+            progress_metrics = {
+                "train_loss": f"{train_loss:.4f}",
+                "val_loss": f"{val_loss:.4f}",
+                "best_val": f"{self.best_val_loss:.4f}",
+                "patience": f"{self.patience_counter}/{self.early_stopping_patience}"
+            }
+            if self.log_gradients and grad_stats:
+                progress_metrics["grad_norm"] = f"{grad_stats.get('grad_norm_total', 0):.2e}"
+            pbar.set_postfix(progress_metrics)
             
             # Log to MLflow
             if self.mlflow_tracking:
+                # Loss metrics
                 mlflow.log_metric("train_loss", train_loss, step=epoch)
                 mlflow.log_metric("val_loss", val_loss, step=epoch)
                 mlflow.log_metric("lr", self.optimizer.param_groups[0]["lr"], step=epoch)
+                if self.regularization_weight > 0:
+                    mlflow.log_metric("regularization_weight", self.regularization_weight, step=epoch)
+                
+                # Gradient statistics (if enabled)
+                if self.log_gradients:
+                    for stat_name, stat_value in grad_stats.items():
+                        mlflow.log_metric(f"grad/{stat_name}", stat_value, step=epoch)
             
             # Learning rate scheduling
+            prev_lr = self.optimizer.param_groups[0]["lr"]
             if self.scheduler is not None:
                 if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     self.scheduler.step(val_loss)
                 else:
                     self.scheduler.step()
+            
+            # Decay regularization weight when learning rate is reduced (Interior Point Method)
+            current_lr = self.optimizer.param_groups[0]["lr"]
+            if current_lr < prev_lr:
+                self.decay_regularization()
             
             # Save checkpoint
             if (epoch + 1) % self.checkpoint_frequency == 0:
@@ -212,12 +365,15 @@ class Trainer:
                 self.best_epoch = epoch  # Track the best epoch
                 self.patience_counter = 0
                 self.save_checkpoint("best_model.pt")
-                print(f"New best model saved (val_loss={val_loss:.6f})")
+                pbar.write(f"✓ Epoch {epoch}: New best model (val_loss={val_loss:.6f})")
             else:
                 self.patience_counter += 1
                 if self.patience_counter >= self.early_stopping_patience:
-                    print(f"Early stopping triggered after {epoch + 1} epochs")
+                    pbar.write(f"\n⚠ Early stopping triggered after {epoch + 1} epochs")
                     break
+        
+        # Close progress bar
+        pbar.close()
         
         # Save final model
         self.save_checkpoint("final_model.pt")
