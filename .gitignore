@@ -234,9 +234,10 @@ python/data/**/
 **/*.pickle
 
 # ============================================================================
-# Machine Learning: Models & Checkpoints
+# Machine Learning:  & Checkpoints
 # ============================================================================
-models/
+# models/
+python/models
 mlruns/
 mlartifacts/
 .mlruns/
@@ -294,3 +295,4 @@ docs/_templates/
 # VS Code workspace settings
 # ============================================================================
 .vscode/
+
