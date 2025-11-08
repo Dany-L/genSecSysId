@@ -54,9 +54,17 @@ class Evaluator:
         all_predictions = []
         all_targets = []
         all_inputs = []
+        all_states = []
         
         with torch.no_grad():
-            for d, e in test_loader:  # d: input, e: output
+            for batch in test_loader:
+                # Unpack batch (states may be None)
+                if len(batch) == 3:
+                    d, e, x = batch  # d: input, e: output, x: states (optional)
+                else:
+                    d, e = batch
+                    x = None
+                
                 d = d.to(self.device)
                 e = e.to(self.device)
                 
@@ -66,11 +74,14 @@ class Evaluator:
                 all_predictions.append(e_hat.cpu().numpy())
                 all_targets.append(e.cpu().numpy())
                 all_inputs.append(d.cpu().numpy())
+                if x is not None:
+                    all_states.append(x.cpu().numpy())
         
         # Concatenate all batches
         e_hat = np.concatenate(all_predictions, axis=0)
         e = np.concatenate(all_targets, axis=0)
         d = np.concatenate(all_inputs, axis=0)
+        x = np.concatenate(all_states, axis=0) if len(all_states) > 0 else None
         
         # Denormalize if normalizer provided
         if normalizer is not None:
@@ -95,16 +106,20 @@ class Evaluator:
             "predictions_shape": e_hat.shape,
             "targets_shape": e.shape,
         }
+        if x is not None:
+            results["states_shape"] = x.shape
         
         with open(self.output_dir / "evaluation_results.json", "w") as f:
             # Remove per_step from saved metrics (too verbose)
             save_metrics = {k: v for k, v in metrics.items() if k != "per_step"}
             json.dump({"metrics": save_metrics}, f, indent=2)
         
-        # Save predictions, targets, and inputs
+        # Save predictions, targets, inputs, and states
         np.save(self.output_dir / "predictions.npy", e_hat)
         np.save(self.output_dir / "targets.npy", e)
         np.save(self.output_dir / "inputs.npy", d)
+        if x is not None:
+            np.save(self.output_dir / "states.npy", x)
         
         print("Evaluation Results:")
         for key, value in metrics.items():

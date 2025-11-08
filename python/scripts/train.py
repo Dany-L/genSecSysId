@@ -12,73 +12,41 @@ import os
 from sysid.config import Config
 from sysid.data import create_dataloaders, DataLoader
 from sysid.data.direct_loader import load_split_data
-from sysid.models import SimpleRNN, LSTM, GRU, SimpleLure
+from sysid.models import create_model
 from sysid.training import Trainer, get_loss_function, get_optimizer, get_scheduler
 from sysid.utils import set_seed, get_device, print_model_summary
 
 
-def setup_logging(output_dir: Path, experiment_name: str) -> logging.Logger:
-    """Setup logging to file and console."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    log_file = output_dir / f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+def setup_console_logging() -> logging.Logger:
+    """Setup console-only logging (before run_id is known)."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)],
+        force=True
+    )
+    return logging.getLogger(__name__)
+
+
+def setup_file_logging(log_dir: Path, log_prefix: str) -> logging.Logger:
+    """Setup logging with both file and console output (after run_id is known)."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_filename = f"{log_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_file_path = log_dir / log_filename
     
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_file),
+            logging.FileHandler(log_file_path),
             logging.StreamHandler(sys.stdout)
-        ]
+        ],
+        force=True
     )
     logger = logging.getLogger(__name__)
-    logger.info(f"Log file: {log_file}")
-    logger.info(f"Experiment: {experiment_name}")
+    logger.info(f"Log file: {log_file_path}")
     
     return logger
-
-
-def create_model(config: Config):
-    """Create model from configuration."""
-    model_config = config.model
-    data_config = config.data
-    
-    if model_config.model_type == "rnn":
-        model = SimpleRNN(
-            input_size=len(data_config.input_col),
-            hidden_size=model_config.nw,
-            output_size=len(data_config.output_col),
-            num_layers=model_config.num_layers,
-            dropout=model_config.dropout,
-            activation=model_config.activation,
-        )
-    elif model_config.model_type == "lstm":
-        model = LSTM(
-            input_size=len(data_config.input_col),
-            hidden_size=model_config.nw,
-            output_size=len(data_config.output_col),
-            num_layers=model_config.num_layers,
-            dropout=model_config.dropout,
-        )
-    elif model_config.model_type == "gru":
-        model = GRU(
-            input_size=len(data_config.input_col),
-            hidden_size=model_config.nw,
-            output_size=len(data_config.output_col),
-            num_layers=model_config.num_layers,
-            dropout=model_config.dropout,
-        )
-    elif model_config.model_type == "crnn":
-        model = SimpleLure(
-            nd=len(data_config.input_col),
-            ne=len(data_config.output_col),
-            nw=model_config.nw,
-            nx=model_config.nx,
-            activation=model_config.activation,
-        )
-    else:
-        raise ValueError(f"Unknown model type: {model_config.model_type}")
-    
-    return model
 
 
 def main():
@@ -96,11 +64,20 @@ def main():
     else:
         raise ValueError(f"Unsupported config file format: {config_path.suffix}")
     
-    output_dir = os.path.expanduser(config.output_dir)
-    model_dir = os.path.expanduser(config.model_dir)
-    log_dir = os.path.expanduser(config.log_dir)
-    # Setup logging
-    logger = setup_logging(Path(os.path.expanduser(output_dir)), config.mlflow.experiment_name)
+    # Derive directories. If config.root_dir is provided, derive model/output/log dirs
+    # as: <root>/models/<model_type>, <root>/outputs/<model_type>, <root>/logs/<model_type>
+    if getattr(config, 'root_dir', None):
+        base = Path(os.path.expanduser(config.root_dir))
+        model_dir = base / "models" / config.model.model_type
+        output_dir = base / "outputs" / config.model.model_type
+        log_dir = base / "logs" / config.model.model_type
+    else:
+        output_dir = Path(os.path.expanduser(config.output_dir))
+        model_dir = Path(os.path.expanduser(config.model_dir))
+        log_dir = Path(os.path.expanduser(config.log_dir))
+
+    # Setup basic console-only logging until we have run_id
+    logger = setup_console_logging()
     
     logger.info("=" * 70)
     logger.info("Training RNN for System Identification")
@@ -193,8 +170,10 @@ def main():
     train_loader, val_loader, _, normalizer = create_dataloaders(
         train_inputs=train_inputs,
         train_outputs=train_outputs,
+        train_states=train_states,
         val_inputs=val_inputs,
         val_outputs=val_outputs,
+        val_states=val_states,
         batch_size=data_config.batch_size,
         sequence_length=data_config.sequence_length,
         normalize=data_config.normalize,
@@ -206,13 +185,7 @@ def main():
     logger.info(f"Batch size: {data_config.batch_size}")
     logger.info(f"Normalization: {data_config.normalization_method if data_config.normalize else 'None'}")
     
-    # Save normalizer
-    if normalizer is not None:
-        normalizer_path = Path(model_dir) / "normalizer.json"
-        Path(model_dir).mkdir(parents=True, exist_ok=True)
-        normalizer.save(str(normalizer_path))
-        logger.info(f"Normalizer saved to {normalizer_path}")
-        print(f"Normalizer saved to {normalizer_path}")
+
     
     # Create model
     logger.info("Creating model...")
@@ -276,15 +249,31 @@ def main():
     with mlflow.start_run(run_name=config.mlflow.run_name):
         run_id = mlflow.active_run().info.run_id
         logger.info(f"MLflow run ID: {run_id}")
-        
+
         # Update directories to include run_id for better organization
         run_model_dir = Path(model_dir) / run_id
         run_output_dir = Path(output_dir) / run_id
+        run_log_dir = Path(log_dir) / run_id
         run_model_dir.mkdir(parents=True, exist_ok=True)
         run_output_dir.mkdir(parents=True, exist_ok=True)
-        
+        run_log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Setup full logging (console + file) now that we have run_id
+        logger = setup_file_logging(run_log_dir, "training")
+        logger.info(f"MLflow run ID: {run_id}")
+        logger.info(f"Experiment: {config.mlflow.experiment_name}")
+
         logger.info(f"Model directory: {run_model_dir}")
         logger.info(f"Output directory: {run_output_dir}")
+        logger.info(f"Log directory: {run_log_dir}")
+
+        # Save normalizer
+        if normalizer is not None:
+            normalizer_path = Path(run_model_dir) / "normalizer.json"
+            Path(model_dir).mkdir(parents=True, exist_ok=True)
+            normalizer.save(str(normalizer_path))
+            logger.info(f"Normalizer saved to {normalizer_path}")
+            print(f"Normalizer saved to {normalizer_path}")
         
         # Log config
         mlflow.log_params({
@@ -295,6 +284,7 @@ def main():
             "learning_rate": config.optimizer.learning_rate,
             "batch_size": config.data.batch_size,
             "max_epochs": config.training.max_epochs,
+            "custom_parameters": str(getattr(config.model, 'custom_params', None)),
         })
         
         # Save config
@@ -346,10 +336,10 @@ def main():
         logger.info(f"Gradient clipping: {config.training.gradient_clip_value}")
         logger.info(f"Gradient logging: {getattr(config.training, 'log_gradients', True)}")
         if config.training.use_custom_regularization:
-            logger.info(f"Custom regularization: enabled")
+            logger.info("Custom regularization: enabled")
             logger.info(f"  Initial weight: {config.training.regularization_weight}")
             if getattr(config.training, 'decay_regularization_weight', False):
-                logger.info(f"  Decay with LR: enabled (Interior Point Method)")
+                logger.info(f"  Decay with LR: enabled")
                 logger.info(f"  Decay factor: {getattr(config.training, 'regularization_decay_factor', 0.5)}")
             else:
                 logger.info(f"  Decay with LR: disabled")

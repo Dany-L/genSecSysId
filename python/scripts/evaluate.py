@@ -13,8 +13,40 @@ import mlflow
 from sysid.config import Config
 from sysid.data import create_dataloaders, DataLoader, DataNormalizer
 from sysid.data.direct_loader import load_csv_folder, load_split_data
-from sysid.models import SimpleRNN, LSTM, GRU
+from sysid.models import load_model
 from sysid.evaluation import Evaluator
+
+
+def setup_console_logging() -> logging.Logger:
+    """Setup console-only logging (before run_id is known)."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)],
+        force=True
+    )
+    return logging.getLogger(__name__)
+
+
+def setup_file_logging(log_dir: Path, log_prefix: str) -> logging.Logger:
+    """Setup logging with both file and console output (after run_id is known)."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_filename = f"{log_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_file_path = log_dir / log_filename
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file_path),
+            logging.StreamHandler(sys.stdout)
+        ],
+        force=True
+    )
+    logger = logging.getLogger(__name__)
+    logger.info(f"Log file: {log_file_path}")
+    
+    return logger
 
 
 def filter_metrics(metrics: dict, allowed_metrics: list) -> dict:
@@ -55,26 +87,6 @@ def filter_metrics(metrics: dict, allowed_metrics: list) -> dict:
     return filtered
 
 
-def setup_logging(output_dir: Path, model_name: str) -> logging.Logger:
-    """Setup logging to file and console."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    log_file = output_dir / f"evaluation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    logger = logging.getLogger(__name__)
-    logger.info(f"Log file: {log_file}")
-    logger.info(f"Model: {model_name}")
-    
-    return logger
-
-
 def load_run_info(model_path: str):
     """
     Load MLflow run info from model directory.
@@ -94,49 +106,6 @@ def load_run_info(model_path: str):
     return None
 
 
-def load_model(model_path: str, config: Config, device: str):
-    """Load trained model."""
-    model_config = config.model
-    
-    if model_config.model_type == "rnn":
-        model = SimpleRNN(
-            input_size=model_config.input_size,
-            hidden_size=model_config.hidden_size,
-            output_size=model_config.output_size,
-            num_layers=model_config.num_layers,
-            dropout=model_config.dropout,
-            activation=model_config.activation,
-        )
-    elif model_config.model_type == "lstm":
-        model = LSTM(
-            input_size=model_config.input_size,
-            hidden_size=model_config.hidden_size,
-            output_size=model_config.output_size,
-            num_layers=model_config.num_layers,
-            dropout=model_config.dropout,
-        )
-    elif model_config.model_type == "gru":
-        model = GRU(
-            input_size=model_config.input_size,
-            hidden_size=model_config.hidden_size,
-            output_size=model_config.output_size,
-            num_layers=model_config.num_layers,
-            dropout=model_config.dropout,
-        )
-    else:
-        raise ValueError(f"Unknown model type: {model_config.model_type}")
-    
-    # Load checkpoint
-    checkpoint = torch.load(model_path, map_location=device)
-    if "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
-    else:
-        model.load_state_dict(checkpoint)
-    
-    model.eval()
-    return model
-
-
 def main():
     parser = argparse.ArgumentParser(description="Evaluate trained RNN model")
     parser.add_argument("--config", type=str, required=True, help="Path to config file")
@@ -146,21 +115,53 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     args = parser.parse_args()
     
+    # Load configuration early so we can derive directories from config.root_dir
+    config_path = Path(args.config)
+    if config_path.suffix == ".yaml" or config_path.suffix == ".yml":
+        config = Config.from_yaml(args.config)
+    elif config_path.suffix == ".json":
+        config = Config.from_json(args.config)
+    else:
+        raise ValueError(f"Unsupported config file format: {config_path.suffix}")
+
     # Try to load run info from model directory
     run_info = load_run_info(args.model)
-    
-    # Setup logging (use run_id if available)
-    if run_info:
-        run_id = run_info['run_id']
-        output_dir = Path(args.output_dir) / run_id
-        logger = setup_logging(output_dir, f"eval_{run_id[:8]}")
-        logger.info(f"Found MLflow run ID: {run_id}")
-        logger.info(f"Will log evaluation results to the same run")
+
+    # Setup console-only logging initially
+    logger = setup_console_logging()
+
+    # If a root_dir is configured, derive output/log dirs from it
+    if getattr(config, 'root_dir', None):
+        base = Path(config.root_dir)
+        model_type = config.model.model_type
+        if run_info:
+            run_id = run_info['run_id']
+            output_dir = base / "outputs" / model_type / run_id
+            log_dir = base / "logs" / model_type / run_id
+            # Setup file logging now that we have the log directory
+            logger = setup_file_logging(log_dir, "evaluation")
+            logger.info(f"Found MLflow run ID: {run_id}")
+            logger.info("Will log evaluation results to the same run")
+        else:
+            # No run info - create timestamped folder under outputs/model_type
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_dir = base / "outputs" / model_type / f"eval_{ts}"
+            log_dir = base / "logs" / model_type / f"eval_{ts}"
+            logger = setup_file_logging(log_dir, "evaluation")
+            logger.warning("No run_info.json found - evaluation results will not be logged to MLflow")
     else:
-        output_dir = Path(args.output_dir)
-        model_name = Path(args.model).stem
-        logger = setup_logging(output_dir, model_name)
-        logger.warning("No run_info.json found - evaluation results will not be logged to MLflow")
+        # Fallback: use CLI-provided output dir
+        if run_info:
+            run_id = run_info['run_id']
+            output_dir = Path(args.output_dir) / run_id
+            logger = setup_file_logging(output_dir, "evaluation")
+            logger.info(f"Found MLflow run ID: {run_id}")
+            logger.info(f"Will log evaluation results to the same run")
+        else:
+            output_dir = Path(args.output_dir)
+            model_name = Path(args.model).stem
+            logger = setup_file_logging(output_dir, "evaluation")
+            logger.warning("No run_info.json found - evaluation results will not be logged to MLflow")
     
     logger.info("=" * 70)
     logger.info("Model Evaluation")
@@ -169,15 +170,6 @@ def main():
     logger.info(f"Model checkpoint: {args.model}")
     logger.info(f"Test data: {args.test_data}")
     logger.info(f"Output directory: {output_dir}")
-    
-    # Load configuration
-    config_path = Path(args.config)
-    if config_path.suffix == ".yaml" or config_path.suffix == ".yml":
-        config = Config.from_yaml(args.config)
-    elif config_path.suffix == ".json":
-        config = Config.from_json(args.config)
-    else:
-        raise ValueError(f"Unsupported config file format: {config_path.suffix}")
     
     logger.info(f"Model type: {config.model.model_type}")
     logger.info(f"Evaluation metrics: {config.evaluation.metrics}")
@@ -281,8 +273,12 @@ def main():
         logger.info(f"Loaded normalizer from {normalizer_path}")
         print(f"Loaded normalizer from {normalizer_path}")
     else:
-        # Fallback to config model_dir
+        # Fallback to config model_dir. Also check derived root model folder if configured.
         normalizer_path_fallback = Path(config.model_dir) / "normalizer.json"
+        if getattr(config, 'root_dir', None):
+            derived = Path(config.root_dir) / "models" / config.model.model_type / "normalizer.json"
+            if derived.exists():
+                normalizer_path_fallback = derived
         if normalizer_path_fallback.exists():
             normalizer = DataNormalizer.load(str(normalizer_path_fallback))
             logger.info(f"Loaded normalizer from {normalizer_path_fallback}")
@@ -304,6 +300,7 @@ def main():
     test_dataset = TimeSeriesDataset(
         test_inputs_norm,
         test_outputs_norm,
+        test_states,
         sequence_length=config.data.sequence_length,
     )
     

@@ -133,6 +133,40 @@ class DataNormalizer:
             denormalized = outputs * output_std + output_mean
         
         return denormalized
+
+    def inverse_transform_inputs(self, inputs: np.ndarray) -> np.ndarray:
+        """Denormalize inputs."""
+        if not self.is_fitted:
+            raise RuntimeError("Normalizer must be fitted before inverse_transform")
+
+        if self.method == "minmax":
+            denormalized = (inputs - self.feature_range[0]) / (self.feature_range[1] - self.feature_range[0])
+            denormalized = denormalized * (self.input_max - self.input_min) + self.input_min
+        else:  # standard
+            denormalized = inputs * self.input_std + self.input_mean
+
+        return denormalized
+
+    def inverse_transform_inputs_torch(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Denormalize inputs (PyTorch version)."""
+        if not self.is_fitted:
+            raise RuntimeError("Normalizer must be fitted before inverse_transform")
+
+        device = inputs.device
+
+        if self.method == "minmax":
+            input_min = torch.from_numpy(self.input_min).float().to(device)
+            input_max = torch.from_numpy(self.input_max).float().to(device)
+
+            denormalized = (inputs - self.feature_range[0]) / (self.feature_range[1] - self.feature_range[0])
+            denormalized = denormalized * (input_max - input_min) + input_min
+        else:  # standard
+            input_mean = torch.from_numpy(self.input_mean).float().to(device)
+            input_std = torch.from_numpy(self.input_std).float().to(device)
+
+            denormalized = inputs * input_std + input_mean
+
+        return denormalized
     
     def save(self, path: str):
         """Save normalizer parameters to JSON."""

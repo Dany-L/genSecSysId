@@ -9,6 +9,7 @@ import json
 import numpy as np
 from typing import Optional, Dict, Any
 import mlflow
+from scipy.io import savemat
 
 from ..models.base import BaseRNN
 from .losses import get_loss_function
@@ -211,13 +212,19 @@ class Trainer:
         # Accumulate gradient stats over epoch
         epoch_grad_stats = {}
         
-        for batch_idx, (d, e) in enumerate(self.train_loader):  # d: input, e: output
+        for batch_idx, batch in enumerate(self.train_loader):
+            # Unpack batch (states may be None)
+            if len(batch) == 3:
+                d, e, x0 = batch  # d: input, e: output, x: states (optional)
+            else:
+                d, e = batch
+                x0 = None
             d = d.to(self.device)
             e = e.to(self.device)
             
             # Forward pass
             self.optimizer.zero_grad()
-            e_hat = self.model(d)  # e_hat: predicted output
+            e_hat = self.model(d, x0=x0)  # e_hat: predicted output
             
             # Compute loss
             loss = self.loss_fn(e_hat, e)
@@ -271,7 +278,14 @@ class Trainer:
         num_batches = 0
         
         with torch.no_grad():
-            for d, e in self.val_loader:  # d: input, e: output
+            for batch in self.val_loader:
+                # Unpack batch (states may be None)
+                if len(batch) == 3:
+                    d, e, x = batch  # d: input, e: output, x: states (optional)
+                else:
+                    d, e = batch
+                    x = None
+                
                 d = d.to(self.device)
                 e = e.to(self.device)
                 
@@ -322,7 +336,8 @@ class Trainer:
                 "train_loss": f"{train_loss:.4f}",
                 "val_loss": f"{val_loss:.4f}",
                 "best_val": f"{self.best_val_loss:.4f}",
-                "patience": f"{self.patience_counter}/{self.early_stopping_patience}"
+                "patience": f"{self.patience_counter}/{self.early_stopping_patience}",
+                "constraints": f"{self.model.check_constraints()}"
             }
             if self.log_gradients and grad_stats:
                 progress_metrics["grad_norm"] = f"{grad_stats.get('grad_norm_total', 0):.2e}"
@@ -355,6 +370,19 @@ class Trainer:
             if current_lr < prev_lr:
                 self.decay_regularization()
             
+            # Update dual penalty coefficient if using dual method
+            if hasattr(self.model, 'update_dual_penalty') and hasattr(self.model, 'regularization_method'):
+                if self.model.regularization_method == "dual":
+                    constraints_satisfied = self.model.check_constraints()
+                    self.model.update_dual_penalty(constraints_satisfied)
+                    
+                    # Log dual penalty and constraint violation to MLflow
+                    if self.mlflow_tracking:
+                        mlflow.log_metric("dual_penalty", self.model.dual_penalty.item(), step=epoch)
+                        if hasattr(self.model, 'get_constraint_violation'):
+                            violation = self.model.get_constraint_violation()
+                            mlflow.log_metric("constraint_violation", violation, step=epoch)
+            
             # Save checkpoint
             if (epoch + 1) % self.checkpoint_frequency == 0:
                 self.save_checkpoint(f"checkpoint_epoch_{epoch}.pt")
@@ -368,9 +396,9 @@ class Trainer:
                 pbar.write(f"✓ Epoch {epoch}: New best model (val_loss={val_loss:.6f})")
             else:
                 self.patience_counter += 1
-                if self.patience_counter >= self.early_stopping_patience:
-                    pbar.write(f"\n⚠ Early stopping triggered after {epoch + 1} epochs")
-                    break
+                # if self.patience_counter >= self.early_stopping_patience:
+                    # pbar.write(f"\n⚠ Early stopping triggered after {epoch + 1} epochs")
+                    # break
         
         # Close progress bar
         pbar.close()
@@ -411,13 +439,22 @@ class Trainer:
         
         torch.save(checkpoint, checkpoint_path)
         
+        # Save model parameters as .mat file for best model
+        if "best" in filename:
+            self.save_parameters_mat(filename.replace(".pt", "_params.mat"))
+        
         # Log model to MLflow (fixes: artifact_path deprecation + signature warnings)
         if self.mlflow_tracking and "best" in filename:
             try:
                 # Get a sample batch from train_loader for input example
                 sample_batch = next(iter(self.train_loader))
-                if isinstance(sample_batch, (tuple, list)) and len(sample_batch) >= 2:
-                    sample_input, _ = sample_batch
+                if isinstance(sample_batch, (tuple, list)):
+                    if len(sample_batch) == 3:
+                        sample_input, _, _ = sample_batch  # (input, output, initial_state)
+                    elif len(sample_batch) >= 2:
+                        sample_input, _ = sample_batch  # (input, output)
+                    else:
+                        sample_input = sample_batch[0]
                 else:
                     sample_input = sample_batch
                 
@@ -437,6 +474,34 @@ class Trainer:
                     pytorch_model=self.model,
                     name="model"
                 )
+    
+    def save_parameters_mat(self, filename: str):
+        """
+        Save model parameters as MATLAB .mat file.
+        
+        Args:
+            filename: Name of the .mat file (e.g., 'best_model_params.mat')
+        """
+        mat_path = self.model_dir / filename
+        
+        # Extract model parameters from state_dict and convert to numpy
+        params_dict = {}
+        for name, param in self.model.state_dict().items():
+            # Convert parameter name to MATLAB-compatible format (replace dots with underscores)
+            mat_name = name.replace('.', '_')
+            # Convert tensor to numpy array
+            params_dict[mat_name] = param.cpu().numpy()
+        
+        # Add metadata
+        params_dict['_metadata'] = {
+            'epoch': self.current_epoch,
+            'best_val_loss': float(self.best_val_loss),
+            'best_epoch': self.best_epoch,
+            'model_type': self.model.__class__.__name__
+        }
+        
+        # Save to .mat file
+        savemat(mat_path, params_dict)
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint."""

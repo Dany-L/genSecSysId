@@ -5,12 +5,43 @@ This module is kept for backward compatibility with single CSV files.
 """
 
 import numpy as np
+import torch
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 from torch.utils.data import DataLoader as TorchDataLoader
 
 from .dataset import TimeSeriesDataset
 from .normalizer import DataNormalizer
+
+
+def collate_with_optional_states(batch: List[Tuple]) -> Tuple:
+    """Custom collate function that handles optional initial state tensors.
+    
+    When states are None, the third element in the returned tuple is None
+    instead of trying to stack None values.
+    
+    Args:
+        batch: List of tuples (inputs, outputs, initial_state) where initial_state can be None
+        
+    Returns:
+        Tuple of (batched_inputs, batched_outputs, batched_initial_states or None)
+    """
+    # Separate the elements
+    inputs = [item[0] for item in batch]
+    outputs = [item[1] for item in batch]
+    initial_states = [item[2] for item in batch]
+    
+    # Stack inputs and outputs
+    batched_inputs = torch.stack(inputs)
+    batched_outputs = torch.stack(outputs)
+    
+    # Stack initial states only if they're not None
+    if initial_states[0] is not None:
+        batched_initial_states = torch.stack(initial_states)
+    else:
+        batched_initial_states = None
+    
+    return batched_inputs, batched_outputs, batched_initial_states
 
 
 class DataLoader:
@@ -69,6 +100,9 @@ def create_dataloaders(
     val_outputs: np.ndarray,
     test_inputs: Optional[np.ndarray] = None,
     test_outputs: Optional[np.ndarray] = None,
+    train_states: Optional[np.ndarray] = None,
+    val_states: Optional[np.ndarray] = None,
+    test_states: Optional[np.ndarray] = None,
     batch_size: int = 32,
     sequence_length: Optional[int] = None,
     normalize: bool = True,
@@ -112,15 +146,26 @@ def create_dataloaders(
             test_outputs = normalizer.transform_outputs(test_outputs)
     
     # Create datasets
-    train_dataset = TimeSeriesDataset(train_inputs, train_outputs, sequence_length)
-    val_dataset = TimeSeriesDataset(val_inputs, val_outputs, sequence_length)
-    
+    train_dataset = TimeSeriesDataset(
+        train_inputs, 
+        train_outputs, 
+        train_states, 
+        sequence_length
+    )
+    val_dataset = TimeSeriesDataset(
+        val_inputs, 
+        val_outputs, 
+        val_states, 
+        sequence_length
+    )
+
     # Create data loaders
     train_loader = TorchDataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
+        collate_fn=collate_with_optional_states,
     )
     
     val_loader = TorchDataLoader(
@@ -128,16 +173,23 @@ def create_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
+        collate_fn=collate_with_optional_states,
     )
     
     test_loader = None
     if test_inputs is not None:
-        test_dataset = TimeSeriesDataset(test_inputs, test_outputs, sequence_length)
+        test_dataset = TimeSeriesDataset(
+            test_inputs, 
+            test_outputs, 
+            test_states, 
+            sequence_length
+        )
         test_loader = TorchDataLoader(
             test_dataset,
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
+            collate_fn=collate_with_optional_states,
         )
     
     return train_loader, val_loader, test_loader, normalizer

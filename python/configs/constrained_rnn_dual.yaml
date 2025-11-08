@@ -1,0 +1,65 @@
+# Constrained RNN with Dual Regularization Method
+# This config uses the robust dual method that allows infeasible parameters during training
+
+data:
+  root_dir: "~/genSecSysId-Data"
+  train_path: "data/prepared/train.csv"
+  val_path: "data/prepared/val.csv"
+  test_path: "data/prepared/test.csv"
+  batch_size: 32
+  sequence_length: 100
+  input_cols: null  # null = auto-detect
+  output_cols: null
+  normalization: "minmax"
+
+model:
+  type: SimpleLure
+  input_size: null  # auto-detected from data
+  output_size: null  # auto-detected from data
+  nx: 4  # State dimension
+  nw: 4  # Nonlinearity dimension
+  activation: "tanh"
+  custom_params:
+    learn_L: true
+    # Dual regularization configuration
+    regularization_method: "dual"  # Use dual method instead of interior_point
+    dual_penalty_init: 1.0        # Initial penalty coefficient
+    dual_penalty_growth: 1.1      # Increase by 10% when constraints violated
+    dual_penalty_shrink: 0.9      # Decrease by 10% when constraints satisfied
+
+training:
+  epochs: 100
+  learning_rate: 0.001
+  optimizer: "adam"
+  loss_function: "mse"
+  device: "cuda"
+  
+  # Regularization settings
+  regularization_weight: 1.0  # Weight for LMI constraint regularization
+  decay_regularization_weight: false  # Don't decay for dual method (it adapts itself)
+  
+  # Gradient management
+  gradient_clip_value: 1.0
+  log_gradients: true
+  
+  # Checkpointing
+  checkpoint_frequency: 10
+  early_stopping_patience: 50
+
+paths:
+  # Using root_dir for simplified path management
+  # Actual paths will be: root_dir/models/SimpleLure/<run_id>, etc.
+  model_dir: "models"
+  output_dir: "outputs"
+  log_dir: "logs"
+
+mlflow:
+  tracking: true
+  experiment_name: "SimpleLure_Dual_Regularization"
+
+scheduler:
+  type: "ReduceLROnPlateau"
+  mode: "min"
+  factor: 0.5
+  patience: 10
+  min_lr: 1.0e-6

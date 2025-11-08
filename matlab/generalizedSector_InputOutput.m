@@ -5,6 +5,7 @@ run('shared.m')
 % Same setup as proposition 2 LaBella, but with an input
 % analysis
 % standard sector
+alpha = 0.925;
 eps = 1e-5;
 disp('--- STANDARD SECTOR CONDITIONS ---')
 a = 0; b = 1; %lower and upper bound of sector condition
@@ -28,7 +29,7 @@ L2 = [zeros(ne,nx), eye(nd), zeros(ne,nw);
 L3 = [zeros(nz,nx), zeros(nz,nd), eye(nw);
     C2d, D21d, D22d]; 
 lmis = [];
-lmi = L1' * [-X, zeros(nx,nx); zeros(nx,nx), X] * L1 + ...
+lmi = L1' * [-alpha*X, zeros(nx,nx); zeros(nx,nx), X] * L1 + ...
     L2' * [-eye(nd), zeros(nd,ne); zeros(ne,nd), zeros(ne,ne)] * L2 + ...
     L3' * Pm(Lambda) * L3;
 % lmi = [-X C2d'*Lambda Ad'*X;
@@ -60,7 +61,6 @@ end
 M = diag(m);
 
 lmis = [];
-alpha = 0.925;
 F = [-alpha*P zeros(nx,nd) P*C2d' + L' P*Ad';
     zeros(nd,nx) -eye(nd) D21d' Bd';
     C2d*P+L D21d -2*M M*B2d';

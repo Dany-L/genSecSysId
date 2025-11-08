@@ -11,25 +11,37 @@ import numpy as np
 import mlflow
 
 from sysid.config import Config
-from sysid.models import SimpleRNN, LSTM, GRU
+from sysid.models import load_model
 
 
-def setup_logging(output_dir: Path, model_name: str) -> logging.Logger:
-    """Setup logging to file and console."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    log_file = output_dir / f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+def setup_console_logging() -> logging.Logger:
+    """Setup console-only logging (before run_id is known)."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)],
+        force=True
+    )
+    return logging.getLogger(__name__)
+
+
+def setup_file_logging(log_dir: Path, log_prefix: str) -> logging.Logger:
+    """Setup logging with both file and console output (after run_id is known)."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_filename = f"{log_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_file_path = log_dir / log_filename
     
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_file),
+            logging.FileHandler(log_file_path),
             logging.StreamHandler(sys.stdout)
-        ]
+        ],
+        force=True
     )
     logger = logging.getLogger(__name__)
-    logger.info(f"Log file: {log_file}")
-    logger.info(f"Model: {model_name}")
+    logger.info(f"Log file: {log_file_path}")
     
     return logger
 
@@ -51,49 +63,6 @@ def load_run_info(model_path: str):
         with open(run_info_path, 'r') as f:
             return json.load(f)
     return None
-
-
-def load_model(model_path: str, config: Config, device: str):
-    """Load trained model."""
-    model_config = config.model
-    
-    if model_config.model_type == "rnn":
-        model = SimpleRNN(
-            input_size=model_config.input_size,
-            hidden_size=model_config.hidden_size,
-            output_size=model_config.output_size,
-            num_layers=model_config.num_layers,
-            dropout=model_config.dropout,
-            activation=model_config.activation,
-        )
-    elif model_config.model_type == "lstm":
-        model = LSTM(
-            input_size=model_config.input_size,
-            hidden_size=model_config.hidden_size,
-            output_size=model_config.output_size,
-            num_layers=model_config.num_layers,
-            dropout=model_config.dropout,
-        )
-    elif model_config.model_type == "gru":
-        model = GRU(
-            input_size=model_config.input_size,
-            hidden_size=model_config.hidden_size,
-            output_size=model_config.output_size,
-            num_layers=model_config.num_layers,
-            dropout=model_config.dropout,
-        )
-    else:
-        raise ValueError(f"Unknown model type: {model_config.model_type}")
-    
-    # Load checkpoint
-    checkpoint = torch.load(model_path, map_location=device)
-    if "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
-    else:
-        model.load_state_dict(checkpoint)
-    
-    model.eval()
-    return model
 
 
 def analyze_parameters(model, output_dir: Path, logger: logging.Logger):
@@ -231,21 +200,51 @@ def main():
     parser.add_argument("--upper-bound", type=float, default=None, help="Upper bound for parameters")
     args = parser.parse_args()
     
+    # Load configuration early so we can derive directories from config.root_dir
+    config_path = Path(args.config)
+    if config_path.suffix == ".yaml" or config_path.suffix == ".yml":
+        config = Config.from_yaml(args.config)
+    elif config_path.suffix == ".json":
+        config = Config.from_json(args.config)
+    else:
+        raise ValueError(f"Unsupported config file format: {config_path.suffix}")
+
     # Try to load run info from model directory
     run_info = load_run_info(args.model)
-    
-    # Setup logging (use run_id if available)
-    if run_info:
-        run_id = run_info['run_id']
-        output_dir = Path(args.output_dir) / run_id
-        logger = setup_logging(output_dir, f"analysis_{run_id[:8]}")
-        logger.info(f"Found MLflow run ID: {run_id}")
-        logger.info(f"Will log analysis results to the same run")
+
+    # Setup console-only logging initially
+    logger = setup_console_logging()
+
+    # If a root_dir is configured, derive output/log dirs from it
+    if getattr(config, 'root_dir', None):
+        base = Path(config.root_dir)
+        model_type = config.model.model_type
+        if run_info:
+            run_id = run_info['run_id']
+            output_dir = base / "analysis_results" / model_type / run_id
+            log_dir = base / "logs" / model_type / run_id
+            logger = setup_file_logging(log_dir, "analysis")
+            logger.info(f"Found MLflow run ID: {run_id}")
+            logger.info("Will log analysis results to the same run")
+        else:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_dir = base / "analysis_results" / model_type / f"analysis_{ts}"
+            log_dir = base / "logs" / model_type / f"analysis_{ts}"
+            logger = setup_file_logging(log_dir, "analysis")
+            logger.warning("No run_info.json found - analysis results will not be logged to MLflow")
     else:
-        output_dir = Path(args.output_dir)
-        model_name = Path(args.model).stem
-        logger = setup_logging(output_dir, model_name)
-        logger.warning("No run_info.json found - analysis results will not be logged to MLflow")
+        # Fallback: use CLI-provided output dir
+        if run_info:
+            run_id = run_info['run_id']
+            output_dir = Path(args.output_dir) / run_id
+            logger = setup_file_logging(output_dir, "analysis")
+            logger.info(f"Found MLflow run ID: {run_id}")
+            logger.info(f"Will log analysis results to the same run")
+        else:
+            output_dir = Path(args.output_dir)
+            model_name = Path(args.model).stem
+            logger = setup_file_logging(output_dir, "analysis")
+            logger.warning("No run_info.json found - analysis results will not be logged to MLflow")
     
     logger.info("=" * 70)
     logger.info("Model Analysis")

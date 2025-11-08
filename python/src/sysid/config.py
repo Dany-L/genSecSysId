@@ -143,6 +143,9 @@ class Config:
     output_dir: str = "outputs"
     model_dir: str = "models"
     log_dir: str = "logs"
+    # Optional root directory: when set, model/output/log dirs are derived from it
+    # as: <root>/models/<model_type>, <root>/outputs/<model_type>, <root>/logs/<model_type>
+    root_dir: Optional[str] = None
     
     # Reproducibility
     seed: int = 42
@@ -184,6 +187,7 @@ class Config:
             output_dir=config_dict.get("output_dir", "outputs"),
             model_dir=config_dict.get("model_dir", "models"),
             log_dir=config_dict.get("log_dir", "logs"),
+            root_dir=config_dict.get("root_dir", None),
             seed=config_dict.get("seed", 42),
         )
     
@@ -199,6 +203,7 @@ class Config:
             "output_dir": self.output_dir,
             "model_dir": self.model_dir,
             "log_dir": self.log_dir,
+            "root_dir": self.root_dir,
             "seed": self.seed,
         }
     

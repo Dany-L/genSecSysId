@@ -85,6 +85,7 @@ class LSTM(BaseRNN):
     def forward(
         self,
         d: torch.Tensor,  # input
+        x0: Optional[tuple] = None,
         hidden_state: Optional[tuple] = None,
     ) -> torch.Tensor:
         """
@@ -105,6 +106,10 @@ class LSTM(BaseRNN):
         # e_hat: (batch, seq_len, output_size)
         
         return e_hat
+    
+    def check_constraints(self) -> bool:
+        """Check if the LSTM constraints are satisfied."""
+        return True  # No constraints for standard LSTM
 
 
 class GRU(BaseRNN):
