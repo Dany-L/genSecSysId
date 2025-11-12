@@ -13,6 +13,8 @@ from torch.utils.data import DataLoader as TorchDataLoader
 from .dataset import TimeSeriesDataset
 from .normalizer import DataNormalizer
 
+torch.set_default_dtype(torch.float64)
+
 
 def collate_with_optional_states(batch: List[Tuple]) -> Tuple:
     """Custom collate function that handles optional initial state tensors.

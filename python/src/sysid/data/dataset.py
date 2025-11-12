@@ -25,9 +25,9 @@ class TimeSeriesDataset(Dataset):
             states: Optional state data of shape (n_samples, n_timesteps, n_states) or (n_samples, n_states)
             sequence_length: Length of sequences to extract (for sliding window). If None, use full sequences.
         """
-        self.inputs = torch.FloatTensor(inputs)
-        self.outputs = torch.FloatTensor(outputs)
-        self.states = torch.FloatTensor(states) if states is not None else None
+        self.inputs = torch.Tensor(inputs)
+        self.outputs = torch.Tensor(outputs)
+        self.states = torch.Tensor(states) if states is not None else None
         self.sequence_length = sequence_length
         
         # Ensure 3D shape (n_samples, n_timesteps, n_features)

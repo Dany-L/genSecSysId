@@ -40,6 +40,7 @@ class Evaluator:
         self,
         test_loader: DataLoader,
         normalizer: Optional[Any] = None,
+        print_results: bool = True,
     ) -> Dict[str, Any]:
         """
         Evaluate model on test dataset.
@@ -69,7 +70,7 @@ class Evaluator:
                 e = e.to(self.device)
                 
                 # Forward pass
-                e_hat = self.model(d)  # e_hat: predicted output
+                e_hat = self.model(d, x)  # e_hat: predicted output
                 
                 all_predictions.append(e_hat.cpu().numpy())
                 all_targets.append(e.cpu().numpy())
@@ -105,6 +106,8 @@ class Evaluator:
             "metrics": metrics,
             "predictions_shape": e_hat.shape,
             "targets_shape": e.shape,
+            "e_hat": e_hat,
+            "e": e,
         }
         if x is not None:
             results["states_shape"] = x.shape
@@ -121,10 +124,11 @@ class Evaluator:
         if x is not None:
             np.save(self.output_dir / "states.npy", x)
         
-        print("Evaluation Results:")
-        for key, value in metrics.items():
-            if key != "per_step":
-                print(f"  {key}: {value:.6f}")
+        if print_results:
+            print("Evaluation Results:")
+            for key, value in metrics.items():
+                if key != "per_step":
+                    print(f"  {key}: {value:.6f}")
         
         return results
     
@@ -204,7 +208,7 @@ class Evaluator:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.close()
         
-        print(f"Predictions plot saved to {save_path}")
+        # print(f"Predictions plot saved to {save_path}")
     
     def analyze_errors(
         self,

@@ -112,20 +112,35 @@ class LureSystem(Linear):
         x0: Optional[
             Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]
         ] = None,
+        return_states: bool = False,
     ) -> Tuple[
         torch.Tensor,
         Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]],
     ]:
         n_batch, N, _, _ = d.shape
         e_hat = torch.zeros(size=(n_batch, N, self._ne, 1))
-        x = x0.reshape(n_batch, self._nx, 1)
 
-        for k in range(N):
-            w = self.Delta(self.C2 @ x + self.D21 @ d[:, k, :, :])
-            x = super().state_dynamics(x=x, d=d[:, k, :, :]) + self.B2 @ w
-            e_hat[:, k, :, :] = super().output_dynamics(x=x, d=d[:, k, :, :]) + self.D12 @ w
+        if return_states:
+        
+            w = torch.zeros(size=(n_batch,N, self._nw, 1))
+            x = torch.zeros(size=(n_batch, N+1, self._nx, 1))
+            x[:, 0, :, :] =x0.reshape(n_batch, self._nx, 1)
 
-        return (e_hat, x)
+            for k in range(N):
+                w[:, k, :, :] = self.Delta(self.C2 @ x[:,k,:,:] + self.D21 @ d[:, k, :, :])
+                x[:, k+1,:, :] = super().state_dynamics(x=x[:,k,:,:], d=d[:, k, :, :]) + self.B2 @ w[:,k,:,:]
+                e_hat[:, k, :, :] = super().output_dynamics(x=x[:,k,:,:], d=d[:, k, :, :]) + self.D12 @ w[:,k,:,:]
+
+            return (e_hat, (x,w))
+
+        else:
+            x =x0.reshape(n_batch, self._nx, 1)
+            for k in range(N):
+                w = self.Delta(self.C2 @ x + self.D21 @ d[:, k, :, :])
+                x = super().state_dynamics(x=x, d=d[:, k, :, :]) + self.B2 @ w
+                e_hat[:, k, :, :] = super().output_dynamics(x=x, d=d[:, k, :, :]) + self.D12 @ w
+
+            return (e_hat, (x,w))
 
 
 class BaseRNN(nn.Module, ABC):

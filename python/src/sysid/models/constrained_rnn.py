@@ -3,7 +3,8 @@ from .base import LureSystem, LureSystemClass, DznActivation
 import torch
 import torch.nn as nn
 from sysid.utils import torch_bmat
-
+import cvxpy as cp
+import numpy as np
 
 
 class SimpleLure(nn.Module):
@@ -17,6 +18,8 @@ class SimpleLure(nn.Module):
         nw: int,
         activation: str, # saturation nonlinearity
         custom_params: Optional[dict] = None,
+        delta: np.float64=0.1,
+        max_x0: np.float64=1.0,
     ):
         """
         Initialize the Simple Lure system.
@@ -29,6 +32,8 @@ class SimpleLure(nn.Module):
         self.ne = ne
         self.nw = nw
         self.nz = nz
+        self.delta = torch.tensor(delta)
+        self.max_x0 = max_x0
 
         self.P = nn.Parameter(torch.eye(nx)) # Lyapunov matrix
         if custom_params is not None:
@@ -43,6 +48,8 @@ class SimpleLure(nn.Module):
             self.dual_penalty_init = 1.0
             self.dual_penalty_growth = 1.1
             self.dual_penalty_shrink = 0.9
+
+        self.learn_L = learn_L
 
         # Dual penalty coefficient (not a parameter, updated manually)
         self.register_buffer('dual_penalty', torch.tensor(self.dual_penalty_init))
@@ -67,8 +74,9 @@ class SimpleLure(nn.Module):
         self.D21 = nn.Parameter(torch.zeros(nz, nd))
         self.D22 = nn.Parameter(torch.zeros(nz, nw))
 
-        self.s = torch.tensor(1.0)
-        self.alpha = torch.tensor(.99)
+        self.alpha = nn.Parameter(torch.tensor(0.99), requires_grad=False)
+        self.s = nn.Parameter(torch.tensor(0.0), requires_grad = False)
+        
         if activation == "sat":
             Delta = nn.Hardtanh(min_val=-1.0, max_val=1.0)
         elif activation == "dzn":
@@ -91,15 +99,114 @@ class SimpleLure(nn.Module):
             Delta=Delta,
         ))
 
-        self.initialize_parameters()
+        # self.initialize_parameters()
+        
+
+    def initialize_parameters(self, train_inputs, train_states, train_outputs):
+        """Initialize parameters with small random values."""
+
+        # 1. extract delta from training data delta = max ||d|| and pick s
+        # actually this is done in the init already
+
+        # 2. calculate s based on delta and alpha
+        # self.s.data = torch.sqrt(self.delta**2 /(1-self.alpha**2)).squeeze()
+        self.s.data = torch.sqrt(self.delta**2 /(1-self.alpha**2)).squeeze()
+        # self.s.data = torch.tensor(1.0)
+
+        # 3. choose A to be stable, C2 random but large and get B, D21, P, L and M from solving the analysis problem
+        self.A.data = .9 * torch.eye(self.nx)
+        min_val, max_val = -1, 1
+        nn.init.uniform_(self.C2, a=min_val, b=max_val)
+        self.analysis_problem(learn_B_and_D21=True)
+
+        # 4. simulate the system to get x and w
+        with torch.no_grad():
+            B, N, _ = train_inputs.shape
+            # x0_1 = torch.tensor(train_states[0,0,:].reshape(1,self.nx,1))
+            # d_1 = torch.tensor(train_inputs[0,:,:].reshape(1,N,self.nd,1))
+            x0s = torch.tensor(train_states[:,0,:].reshape(B, self.nx,1))
+            ds = torch.tensor(train_inputs.reshape(B,N,self.nd,1))
+            _, (xs, ws) = self.lure.forward(x0=x0s, d=ds,return_states = True)
+
+        # 5. set C, D, and D12 based on least squares
+        self.D12.data = torch.zeros(self.ne, self.nw)
+        self.D.data = torch.zeros(self.ne, self.nd)
+        self.C.data = torch.zeros(self.ne, self.nx)
+        self.C.data[:,0] = torch.ones(self.ne)
+
         self.check_constraints()
 
-    def initialize_parameters(self):
-        """Initialize parameters with small random values."""
-        min_val, max_val = -1e-1, 1e-1
-        for name,param in self.named_parameters():
-            if not name in ["P", "M", "L"]:
-                nn.init.uniform_(param, a=min_val, b=max_val)
+
+    def analysis_problem(self, learn_B_and_D21: bool = False) -> bool:
+
+        eps = 1e-3
+
+        P = cp.Variable((self.nx, self.nx), symmetric=True)
+        la = cp.Variable((self.nz, 1))
+        M = cp.diag(la)
+        A = self.A.cpu().detach().numpy()
+        # B = self.B.cpu().detach().numpy()
+        if learn_B_and_D21:
+            B = cp.Variable(self.B.shape)
+            D21 = cp.Variable(self.D21.shape)
+        else:
+            B = self.B.cpu().detach().numpy()
+            D21 = self.D21.cpu().detach().numpy()
+        B2 = self.B2.cpu().detach().numpy()
+        C2 = self.C2.cpu().detach().numpy()
+        s = self.s.cpu().detach().numpy()
+        # D21 = self.D21.cpu().detach().numpy()   
+        
+        alpha = self.alpha.cpu().detach().numpy()
+
+        multiplier_constraints = []
+        if self.learn_L:
+            L = cp.Variable((self.nz, self.nx))
+            for li in L:
+                li = li.reshape((1,-1), 'C')
+                multiplier_constraints.append(
+                    cp.bmat(
+                        [
+                            [np.array([[(1/s**2)]]), li],
+                            [li.T, P],
+                        ]
+                    ) >> eps * np.eye(self.nx + 1)
+                )
+        else:
+            L = self.L.cpu().detach().numpy()
+        
+        F = cp.bmat(
+            [
+                [-alpha**2 * P, np.zeros((self.nx, self.nd)), P @ C2.T + L.T, P @ A.T],
+                [np.zeros((self.nd, self.nx)), -np.eye(self.nd), D21.T, B.T],
+                [C2 @ P + L, D21, -2 * M,  M @ B2.T],
+                [A @ P, B, B2 @ M, -P],
+            ]
+        )
+
+        init_constraints = [P - np.linalg.norm(self.max_x0,2) / s**2 * np.eye(self.nx)<< 0 ]
+        
+        nF = F.shape[0]
+        problem = cp.Problem(
+            cp.Minimize([None]),
+            [F << -eps * np.eye(nF), *multiplier_constraints, *init_constraints]
+        )
+        try:
+            problem.solve(solver=cp.MOSEK)
+        except Exception as e:
+            return False  # SDP failed due to solver error
+        if not problem.status == "optimal":
+            return False  # SDP failed to find feasible solution
+
+        self.P.data = torch.tensor(P.value)
+        self.M.data = torch.tensor(M.value)
+        if self.learn_L:
+            self.L.data = torch.tensor(L.value)
+        if learn_B_and_D21:
+            self.B.data = torch.tensor(B.value)
+            self.D21.data = torch.tensor(D21.value)
+        
+        return True  # SDP successfully found feasible solution
 
     def get_lmis(self):
         lmi_list = []
@@ -118,21 +225,42 @@ class SimpleLure(nn.Module):
         for l_i in self.L:
             l_i = l_i.reshape(1,-1)
             def locality_lmi_i(l_i=l_i) -> torch.Tensor:
-                return torch_bmat([
-                [(1/self.s**2).reshape(1,1), l_i],
-                [l_i.T, torch.eye(self.nx)]
-                ])
+                R = torch_bmat([
+                    [(1/self.s**2).reshape(1,1), l_i],
+                    [l_i.T, self.P]
+                    ])
+                return 0.5 * (R + R.T)
             lmi_list.append(locality_lmi_i)
 
         return lmi_list
+
+    def get_scalar_inequalities(self):
+        inequalities = []
+        """Construct scalar inequalities for positivity of la."""
+        def input_size_condition() -> torch.Tensor:
+            return -(self.delta**2 - (1-self.alpha**2)*self.s**2)
+        # inequalities.append(input_size_condition)
+        
+        def alpha_smaller_one() -> torch.Tensor:
+            return 1.0 - self.alpha
+        inequalities.append(alpha_smaller_one)
+
+        def alpha_positive() -> torch.Tensor:
+            return self.alpha 
+        inequalities.append(alpha_positive)
+
+        return inequalities
 
     def check_constraints(self) -> bool:
         """Check if the Lure system constraints are satisfied."""
         with torch.no_grad():
             for lmi in self.get_lmis():
-                try:
-                    torch.linalg.cholesky(lmi())
-                except RuntimeError:
+                _, info = torch.linalg.cholesky_ex(lmi())
+                if info > 0:
+                    return False
+                
+            for inequality in self.get_scalar_inequalities():
+                if inequality() < 0:
                     return False
         return True
     

@@ -10,10 +10,18 @@ import numpy as np
 from typing import Optional, Dict, Any
 import mlflow
 from scipy.io import savemat
+import logging
+import copy
+import matplotlib.pyplot as plt
+
+# Set default dtype to float64 to match numpy's default and avoid type clashes
+# torch.set_default_dtype(torch.float64)
 
 from ..models.base import BaseRNN
+from ..models.constrained_rnn import SimpleLure
 from .losses import get_loss_function
 from .optimizers import get_optimizer, get_scheduler
+from ..evaluation.evaluator import Evaluator
 
 
 class Trainer:
@@ -107,83 +115,72 @@ class Trainer:
     
     def compute_gradient_stats(self) -> Dict[str, float]:
         """
-        Compute comprehensive gradient statistics.
+        Compute gradient norms for each model parameter.
         
         Returns:
-            Dictionary with gradient statistics:
-            - grad_norm_total: Global gradient norm (L2)
-            - grad_norm_max: Maximum gradient norm across parameters
-            - grad_norm_min: Minimum gradient norm across parameters
-            - grad_value_max: Largest gradient value (absolute)
-            - grad_value_min: Smallest gradient value (absolute)
-            - grad_mean: Mean gradient value
-            - grad_std: Standard deviation of gradients
-            - dead_params_ratio: Ratio of parameters with zero gradient
-            - grad_param_ratio_mean: Mean ratio of gradient norm to parameter norm
-            - grad_param_ratio_max: Max ratio of gradient norm to parameter norm
+            Dictionary with gradient norms: {param_name: grad_norm}
         """
         stats = {}
         
-        # Collect all gradients and parameters
-        all_grads = []
-        all_params = []
-        param_grad_norms = []
-        param_norms = []
-        dead_params = 0
-        total_params = 0
-        
         for name, param in self.model.named_parameters():
             if param.grad is not None:
-                grad = param.grad.detach()
-                param_val = param.detach()
-                
-                # Collect flattened gradients
-                all_grads.append(grad.flatten())
-                all_params.append(param_val.flatten())
-                
-                # Per-parameter norms
-                grad_norm = grad.norm().item()
-                param_norm = param_val.norm().item()
-                
-                param_grad_norms.append(grad_norm)
-                param_norms.append(param_norm)
-                
-                # Check for dead parameters
-                if grad_norm < 1e-10:
-                    dead_params += 1
-                total_params += 1
-        
-        if len(all_grads) > 0:
-            # Concatenate all gradients
-            all_grads_tensor = torch.cat(all_grads)
-            all_params_tensor = torch.cat(all_params)
-            
-            # Global statistics
-            stats['grad_norm_total'] = all_grads_tensor.norm().item()
-            stats['grad_value_max'] = all_grads_tensor.abs().max().item()
-            stats['grad_value_min'] = all_grads_tensor.abs().min().item()
-            stats['grad_mean'] = all_grads_tensor.mean().item()
-            stats['grad_std'] = all_grads_tensor.std().item()
-            
-            # Per-parameter statistics
-            if len(param_grad_norms) > 0:
-                stats['grad_norm_max'] = max(param_grad_norms)
-                stats['grad_norm_min'] = min(param_grad_norms)
-                
-                # Gradient-to-parameter ratio (indicates update size)
-                grad_param_ratios = []
-                for g_norm, p_norm in zip(param_grad_norms, param_norms):
-                    if p_norm > 1e-10:  # Avoid division by zero
-                        grad_param_ratios.append(g_norm / p_norm)
-                
-                if len(grad_param_ratios) > 0:
-                    stats['grad_param_ratio_mean'] = np.mean(grad_param_ratios)
-                    stats['grad_param_ratio_max'] = max(grad_param_ratios)
-            
-            # Dead parameters
-            stats['dead_params_ratio'] = dead_params / total_params if total_params > 0 else 0.0
+                grad_norm = param.grad.detach().norm().item()
+                # Use forward slashes for nested module names (MLflow compatible)
+                stats[f"grad_norm/{name}"] = grad_norm
         
         return stats
+    
+    def plot_trajectories(self, normalizer=None, name="initial_trajectories"):
+        """
+        Plot initial model predictions before training as a reference.
+        Uses validation data and saves plots as MLflow artifacts.
+        
+        Args:
+            normalizer: Data normalizer for denormalization (optional)
+        """
+        
+        # Create temporary evaluator
+        temp_output_dir = self.output_dir / f'predictions'
+        temp_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        evaluator = Evaluator(
+            model=self.model,
+            device=self.device,
+            output_dir=str(temp_output_dir)
+        )
+        
+        # Evaluate on validation set
+        # try:
+        results = evaluator.evaluate(
+            test_loader=self.val_loader,
+            normalizer=normalizer,
+            print_results=False
+        )
+        
+        e_hat = results['e_hat']
+        e = results['e']
+        d = results.get('inputs', None)
+        
+        # Generate plot
+        plot_path = temp_output_dir / f'{name}.png'
+        evaluator.plot_predictions(
+            e_hat=e_hat,
+            e=e,
+            d=d,
+            num_samples=min(3, e_hat.shape[0]),  # Plot first 3 samples
+            save_path=str(plot_path)
+        )
+        
+        # Log to MLflow
+        if self.mlflow_tracking:
+            mlflow.log_artifact(str(plot_path), artifact_path="predictions")
+            # print(f"✓ Trajectory plot logged to MLflow")
+        
+        # print(f"✓ Trajectory plot saved: {plot_path}")
+            
+        # except Exception as e:
+        #     print(f"⚠ Failed to generate initial trajectory plot: {e}")
+        #     logging.warning(f"Failed to generate initial trajectory plot: {e}")
     
     def decay_regularization(self):
         """
@@ -254,8 +251,36 @@ class Trainer:
                     self.gradient_clip_value
                 )
             
+            # Save parameter state before update (for constrained models)
+            if isinstance(self.model, SimpleLure):
+                saved_state = {name: param.data.clone() for name, param in self.model.named_parameters() if param.requires_grad}
+            
             # Update weights
             self.optimizer.step()
+
+            # Check if constraints are satisfied (for constrained models)
+            if isinstance(self.model, SimpleLure):
+                if not self.model.check_constraints():
+                    # Constraints violated - try to solve feasibility SDP
+                    logging.info(f"Batch {batch_idx}: Constraints violated after parameter update, attempting feasibility SDP...")
+                    if self.model.alpha > 1:
+                        self.model.alpha.data = torch.tensor(0.99)
+                    
+                    b_feasible = self.model.analysis_problem()
+                    
+                    if not b_feasible:
+                        # SDP failed - roll back to previous parameters
+                        logging.warning(f"Batch {batch_idx}: Feasibility SDP failed, rolling back parameters")
+                        
+                        # Restore saved parameters
+                        with torch.no_grad():
+                            for name, param in self.model.named_parameters():
+                                if param.requires_grad and name in saved_state:
+                                    param.data.copy_(saved_state[name])
+                        
+                        logging.info(f"Batch {batch_idx}: Parameters rolled back successfully")
+                    else:
+                        logging.info(f"Batch {batch_idx}: Feasibility SDP succeeded, parameters updated")
             
             # Update metrics
             total_loss += loss.item()
@@ -290,7 +315,7 @@ class Trainer:
                 e = e.to(self.device)
                 
                 # Forward pass
-                e_hat = self.model(d)  # e_hat: predicted output
+                e_hat = self.model(d, x)  # e_hat: predicted output
                 
                 # Compute loss
                 loss = self.loss_fn(e_hat, e)
@@ -301,18 +326,22 @@ class Trainer:
         avg_loss = total_loss / num_batches
         return avg_loss
     
-    def train(self, max_epochs: int) -> Dict[str, Any]:
+    def train(self, max_epochs: int, normalizer=None) -> Dict[str, Any]:
         """
         Train the model.
         
         Args:
             max_epochs: Maximum number of epochs
+            normalizer: Data normalizer for plotting (optional)
             
         Returns:
             Training history
         """
         print(f"Starting training for {max_epochs} epochs")
         print(f"Model has {self.model.count_parameters()} trainable parameters")
+        
+        # Plot initial trajectories before training
+        self.plot_trajectories(normalizer=normalizer, name="initial_trajectories")
         
         # Epoch-level progress bar
         pbar = tqdm(range(max_epochs), desc="Training Progress")
@@ -322,6 +351,7 @@ class Trainer:
             
             # Train (returns dict with loss and gradient stats)
             train_results = self.train_epoch()
+            self.plot_trajectories(name=f"epoch_{epoch}")
             train_loss = train_results['loss']
             grad_stats = {k: v for k, v in train_results.items() if k != 'loss'}
             
@@ -331,16 +361,24 @@ class Trainer:
             val_loss = self.validate()
             self.val_losses.append(val_loss)
             
+            # Get scheduler patience info if using ReduceLROnPlateau
+            scheduler_patience_info = ""
+            if self.scheduler is not None and isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler_patience_info = f"{self.scheduler.num_bad_epochs}/{self.scheduler.patience}"
+            
             # Update progress bar with current metrics
             progress_metrics = {
                 "train_loss": f"{train_loss:.4f}",
                 "val_loss": f"{val_loss:.4f}",
                 "best_val": f"{self.best_val_loss:.4f}",
-                "patience": f"{self.patience_counter}/{self.early_stopping_patience}",
                 "constraints": f"{self.model.check_constraints()}"
             }
+            if scheduler_patience_info:
+                progress_metrics["scheduler_patience"] = scheduler_patience_info
             if self.log_gradients and grad_stats:
-                progress_metrics["grad_norm"] = f"{grad_stats.get('grad_norm_total', 0):.2e}"
+                # Compute total gradient norm from individual parameter norms
+                total_grad_norm = np.sqrt(sum(v**2 for k, v in grad_stats.items() if k.startswith('grad_norm/')))
+                progress_metrics["grad_norm"] = f"{total_grad_norm:.2e}"
             pbar.set_postfix(progress_metrics)
             
             # Log to MLflow
@@ -355,7 +393,7 @@ class Trainer:
                 # Gradient statistics (if enabled)
                 if self.log_gradients:
                     for stat_name, stat_value in grad_stats.items():
-                        mlflow.log_metric(f"grad/{stat_name}", stat_value, step=epoch)
+                        mlflow.log_metric(stat_name, stat_value, step=epoch)
             
             # Learning rate scheduling
             prev_lr = self.optimizer.param_groups[0]["lr"]

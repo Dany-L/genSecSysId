@@ -61,7 +61,7 @@ end
 M = diag(m);
 
 lmis = [];
-F = [-alpha*P zeros(nx,nd) P*C2d' + L' P*Ad';
+F = [-alpha^2*P zeros(nx,nd) P*C2d' + L' P*Ad';
     zeros(nd,nx) -eye(nd) D21d' Bd';
     C2d*P+L D21d -2*M M*B2d';
     Ad*P Bd B2d*M -P];

@@ -8,13 +8,21 @@ from datetime import datetime
 import json
 import mlflow
 import os
+import numpy as np
+import torch
 
 from sysid.config import Config
 from sysid.data import create_dataloaders, DataLoader
 from sysid.data.direct_loader import load_split_data
-from sysid.models import create_model
+from sysid.models import create_model, SimpleLure
 from sysid.training import Trainer, get_loss_function, get_optimizer, get_scheduler
 from sysid.utils import set_seed, get_device, print_model_summary
+
+
+
+torch.set_default_dtype(torch.float64)
+
+
 
 
 def setup_console_logging() -> logging.Logger:
@@ -164,6 +172,9 @@ def main():
     
     print(f"Train data: {train_inputs.shape}, {train_outputs.shape}")
     print(f"Validation data: {val_inputs.shape}, {val_outputs.shape}")
+
+    max_x0 = np.max(np.abs(train_states), axis=(0,1)) # only consider x0 not the trajectory
+    delta = np.max(np.abs(train_inputs), axis = (0,1))
     
     # Create data loaders
     logger.info("Creating data loaders...")
@@ -184,13 +195,17 @@ def main():
     logger.info(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
     logger.info(f"Batch size: {data_config.batch_size}")
     logger.info(f"Normalization: {data_config.normalization_method if data_config.normalize else 'None'}")
+
+    delta = normalizer.transform_inputs(delta).squeeze()
     
 
     
     # Create model
     logger.info("Creating model...")
     print("Creating model...")
-    model = create_model(config)
+    model = create_model(config, delta, max_x0)
+    if isinstance(model, SimpleLure):
+        model.initialize_parameters(train_inputs, train_states, train_outputs)
     print_model_summary(model)
     
     # Count parameters
@@ -347,7 +362,7 @@ def main():
         print("\nStarting training...")
         
         try:
-            history = trainer.train(max_epochs=config.training.max_epochs)
+            history = trainer.train(max_epochs=config.training.max_epochs, normalizer=normalizer)
             
             logger.info("=" * 70)
             logger.info("Training completed successfully!")
