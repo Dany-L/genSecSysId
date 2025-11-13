@@ -9,7 +9,7 @@ from .constrained_rnn import SimpleLure
 from ..config import Config, ModelConfig
 
 
-def create_model(config: Config, delta: Optional[float] = None, max_x0: Optional[float] = None):
+def create_model(config: Config, delta: Optional[float] = None, max_norm_x0: Optional[float] = None):
     """
     Create model from configuration.
     
@@ -60,7 +60,7 @@ def create_model(config: Config, delta: Optional[float] = None, max_x0: Optional
             activation=model_config.activation,
             custom_params=model_config.custom_params,
             delta=delta,
-            max_x0=max_x0,
+            max_norm_x0=max_norm_x0,
         )
     else:
         raise ValueError(f"Unknown model type: {model_config.model_type}")

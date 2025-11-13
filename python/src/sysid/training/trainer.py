@@ -22,6 +22,7 @@ from ..models.constrained_rnn import SimpleLure
 from .losses import get_loss_function
 from .optimizers import get_optimizer, get_scheduler
 from ..evaluation.evaluator import Evaluator
+from ..utils import plot_ellipse_and_parallelogram
 
 
 class Trainer:
@@ -104,6 +105,8 @@ class Trainer:
         self.best_epoch = 0  # Track which epoch had the best validation loss
         self.patience_counter = 0
         self.train_losses = []
+        self.train_pred_losses = []
+        self.train_reg_losses = []
         self.val_losses = []
         
         # Scheduler (can be set later)
@@ -154,12 +157,24 @@ class Trainer:
         results = evaluator.evaluate(
             test_loader=self.val_loader,
             normalizer=normalizer,
-            print_results=False
+            print_results=False,
+            save_files=False  # Don't save prediction files during training
         )
         
         e_hat = results['e_hat']
         e = results['e']
         d = results.get('inputs', None)
+        
+        # Select sample indices: always include sequence 0, plus 2 random sequences
+        num_sequences = e_hat.shape[0]
+        sample_indices = [0]  # Always include sequence 0
+        
+        if num_sequences > 1:
+            # Select 2 random sequences (excluding sequence 0)
+            other_indices = list(range(1, num_sequences))
+            num_random = min(2, len(other_indices))
+            random_indices = np.random.choice(other_indices, size=num_random, replace=False).tolist()
+            sample_indices.extend(random_indices)
         
         # Generate plot
         plot_path = temp_output_dir / f'{name}.png'
@@ -167,7 +182,7 @@ class Trainer:
             e_hat=e_hat,
             e=e,
             d=d,
-            num_samples=min(3, e_hat.shape[0]),  # Plot first 3 samples
+            sample_indices=sample_indices,
             save_path=str(plot_path)
         )
         
@@ -200,10 +215,12 @@ class Trainer:
         Train for one epoch.
         
         Returns:
-            Dictionary with training loss and gradient statistics
+            Dictionary with training loss, prediction loss, regularization loss, and gradient statistics
         """
         self.model.train()
         total_loss = 0.0
+        total_pred_loss = 0.0
+        total_reg_loss = 0.0
         num_batches = 0
         
         # Accumulate gradient stats over epoch
@@ -223,12 +240,15 @@ class Trainer:
             self.optimizer.zero_grad()
             e_hat = self.model(d, x0=x0)  # e_hat: predicted output
             
-            # Compute loss
-            loss = self.loss_fn(e_hat, e)
+            # Compute prediction loss
+            pred_loss = self.loss_fn(e_hat, e)
+            loss = pred_loss
             
             # Add custom regularization
+            reg_loss_value = 0.0
             if self.regularization_weight > 0:
                 reg_loss = self.model.get_regularization_loss()
+                reg_loss_value = reg_loss.item()
                 loss = loss + self.regularization_weight * reg_loss
             
             # Backward pass
@@ -284,17 +304,28 @@ class Trainer:
             
             # Update metrics
             total_loss += loss.item()
+            total_pred_loss += pred_loss.item()
+            total_reg_loss += reg_loss_value
             num_batches += 1
         
         # Average loss
         avg_loss = total_loss / num_batches
+        avg_pred_loss = total_pred_loss / num_batches
+        avg_reg_loss = total_reg_loss / num_batches
         
         # Average gradient statistics over epoch
         avg_grad_stats = {
             key: np.mean(values) for key, values in epoch_grad_stats.items()
         }
+
+
         
-        return {'loss': avg_loss, **avg_grad_stats}
+        return {
+            'loss': avg_loss,
+            'pred_loss': avg_pred_loss,
+            'reg_loss': avg_reg_loss,
+            **avg_grad_stats
+        }
     
     def validate(self) -> float:
         """Validate the model."""
@@ -353,9 +384,13 @@ class Trainer:
             train_results = self.train_epoch()
             self.plot_trajectories(name=f"epoch_{epoch}")
             train_loss = train_results['loss']
-            grad_stats = {k: v for k, v in train_results.items() if k != 'loss'}
+            train_pred_loss = train_results['pred_loss']
+            train_reg_loss = train_results['reg_loss']
+            grad_stats = {k: v for k, v in train_results.items() if k not in ['loss', 'pred_loss', 'reg_loss']}
             
             self.train_losses.append(train_loss)
+            self.train_pred_losses.append(train_pred_loss)
+            self.train_reg_losses.append(train_reg_loss)
             
             # Validate
             val_loss = self.validate()
@@ -369,6 +404,8 @@ class Trainer:
             # Update progress bar with current metrics
             progress_metrics = {
                 "train_loss": f"{train_loss:.4f}",
+                "pred": f"{train_pred_loss:.4f}",
+                "reg": f"{train_reg_loss:.4f}",
                 "val_loss": f"{val_loss:.4f}",
                 "best_val": f"{self.best_val_loss:.4f}",
                 "constraints": f"{self.model.check_constraints()}"
@@ -385,6 +422,8 @@ class Trainer:
             if self.mlflow_tracking:
                 # Loss metrics
                 mlflow.log_metric("train_loss", train_loss, step=epoch)
+                mlflow.log_metric("train_pred_loss", train_pred_loss, step=epoch)
+                mlflow.log_metric("train_reg_loss", train_reg_loss, step=epoch)
                 mlflow.log_metric("val_loss", val_loss, step=epoch)
                 mlflow.log_metric("lr", self.optimizer.param_groups[0]["lr"], step=epoch)
                 if self.regularization_weight > 0:
@@ -443,10 +482,32 @@ class Trainer:
         
         # Save final model
         self.save_checkpoint("final_model.pt")
+
+        # Plot and log final ellipse for SimpleLure models
+        if isinstance(self.model, SimpleLure):
+            X = np.linalg.inv(self.model.P.cpu().detach().numpy())
+            H = self.model.L.cpu().detach().numpy() @ X
+            s = self.model.s.cpu().detach().numpy()
+            max_norm_x0 = self.model.max_norm_x0
+            fig, ax = plot_ellipse_and_parallelogram(X, H, s, max_norm_x0)
+            
+            # Save and log to MLflow
+            if self.mlflow_tracking:
+                try:
+                    plot_path = self.output_dir / 'final_ellipse.png'
+                    fig.savefig(plot_path, bbox_inches='tight')
+                    mlflow.log_artifact(str(plot_path), artifact_path='plots')
+                    logging.info("Logged final ellipse plot to MLflow artifacts")
+                except Exception as e:
+                    logging.warning(f"Failed to log final ellipse plot: {e}")
+                finally:
+                    plt.close(fig)
         
         # Save training history
         history = {
             "train_losses": self.train_losses,
+            "train_pred_losses": self.train_pred_losses,
+            "train_reg_losses": self.train_reg_losses,
             "val_losses": self.val_losses,
             "best_val_loss": self.best_val_loss,
             "best_epoch": self.best_epoch,
@@ -469,6 +530,8 @@ class Trainer:
             "best_val_loss": self.best_val_loss,
             "best_epoch": self.best_epoch,
             "train_losses": self.train_losses,
+            "train_pred_losses": self.train_pred_losses,
+            "train_reg_losses": self.train_reg_losses,
             "val_losses": self.val_losses,
         }
         
@@ -551,6 +614,8 @@ class Trainer:
         self.best_val_loss = checkpoint["best_val_loss"]
         self.best_epoch = checkpoint.get("best_epoch", 0)  # Use .get() for backward compatibility
         self.train_losses = checkpoint.get("train_losses", [])
+        self.train_pred_losses = checkpoint.get("train_pred_losses", [])
+        self.train_reg_losses = checkpoint.get("train_reg_losses", [])
         self.val_losses = checkpoint.get("val_losses", [])
         
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:

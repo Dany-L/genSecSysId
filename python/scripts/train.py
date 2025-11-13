@@ -8,6 +8,8 @@ from datetime import datetime
 import json
 import mlflow
 import os
+import tempfile
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -173,7 +175,7 @@ def main():
     print(f"Train data: {train_inputs.shape}, {train_outputs.shape}")
     print(f"Validation data: {val_inputs.shape}, {val_outputs.shape}")
 
-    max_x0 = np.max(np.abs(train_states), axis=(0,1)) # only consider x0 not the trajectory
+    max_norm_x0 = np.max(np.linalg.norm(train_states[:,0,:],2, axis=1), axis=0) # only consider x0 not the trajectory
     delta = np.max(np.abs(train_inputs), axis = (0,1))
     
     # Create data loaders
@@ -196,16 +198,18 @@ def main():
     logger.info(f"Batch size: {data_config.batch_size}")
     logger.info(f"Normalization: {data_config.normalization_method if data_config.normalize else 'None'}")
 
-    delta = normalizer.transform_inputs(delta).squeeze()
+    if normalizer is not None:
+        delta = normalizer.transform_inputs(delta).squeeze()
     
 
     
     # Create model
     logger.info("Creating model...")
     print("Creating model...")
-    model = create_model(config, delta, max_x0)
+    model = create_model(config, delta, max_norm_x0)
+    init_fig = None
     if isinstance(model, SimpleLure):
-        model.initialize_parameters(train_inputs, train_states, train_outputs)
+        init_fig = model.initialize_parameters(train_inputs, train_states, train_outputs)
     print_model_summary(model)
     
     # Count parameters
@@ -307,6 +311,18 @@ def main():
         config.save_yaml(str(config_save_path))
         mlflow.log_artifact(str(config_save_path))
         logger.info(f"Config saved to {config_save_path}")
+        
+        # Log initialization plot if available
+        if init_fig is not None:
+            try:
+                plot_path = run_output_dir / 'init_ellipse.png'
+                init_fig.savefig(plot_path, bbox_inches='tight')
+                mlflow.log_artifact(str(plot_path), artifact_path='plots')
+                logger.info(f"Logged initialization plot to MLflow artifacts")
+            except Exception as e:
+                logger.warning(f"Failed to log initialization plot: {e}")
+            finally:
+                plt.close(init_fig)
         
         # Save run_id for later use (evaluation/analysis)
         run_info_path = run_model_dir / "run_info.json"

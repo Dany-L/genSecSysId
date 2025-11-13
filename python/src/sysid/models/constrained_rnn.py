@@ -2,9 +2,13 @@ from typing import Optional
 from .base import LureSystem, LureSystemClass, DznActivation
 import torch
 import torch.nn as nn
-from sysid.utils import torch_bmat
+from sysid.utils import torch_bmat, plot_ellipse_and_parallelogram
 import cvxpy as cp
 import numpy as np
+import matplotlib.pyplot as plt
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class SimpleLure(nn.Module):
@@ -19,7 +23,7 @@ class SimpleLure(nn.Module):
         activation: str, # saturation nonlinearity
         custom_params: Optional[dict] = None,
         delta: np.float64=0.1,
-        max_x0: np.float64=1.0,
+        max_norm_x0: np.float64=1.0,
     ):
         """
         Initialize the Simple Lure system.
@@ -32,8 +36,11 @@ class SimpleLure(nn.Module):
         self.ne = ne
         self.nw = nw
         self.nz = nz
-        self.delta = torch.tensor(delta)
-        self.max_x0 = max_x0
+        
+        # Register delta and max_norm_x0 as buffers (saved with model, not trainable)
+        self.register_buffer('delta', torch.tensor(delta))
+        self.register_buffer('max_norm_x0_buffer', torch.tensor(max_norm_x0))
+        self.max_norm_x0 = max_norm_x0  # Keep as attribute for compatibility
 
         self.P = nn.Parameter(torch.eye(nx)) # Lyapunov matrix
         if custom_params is not None:
@@ -74,8 +81,8 @@ class SimpleLure(nn.Module):
         self.D21 = nn.Parameter(torch.zeros(nz, nd))
         self.D22 = nn.Parameter(torch.zeros(nz, nw))
 
-        self.alpha = nn.Parameter(torch.tensor(0.99), requires_grad=False)
-        self.s = nn.Parameter(torch.tensor(0.0), requires_grad = False)
+        self.alpha = nn.Parameter(torch.tensor(0.95), requires_grad=False)
+        self.s = nn.Parameter(torch.tensor(0.0), requires_grad = True)
         
         if activation == "sat":
             Delta = nn.Hardtanh(min_val=-1.0, max_val=1.0)
@@ -119,6 +126,13 @@ class SimpleLure(nn.Module):
         nn.init.uniform_(self.C2, a=min_val, b=max_val)
         self.analysis_problem(learn_B_and_D21=True)
 
+        # 5. set C, D, and D12 based on least squares
+        # turns out the fixed choice works just fine, so we switched the order to get some results such that we can check if the condition on the input is satisfied
+        self.D12.data = torch.zeros(self.ne, self.nw)
+        self.D.data = torch.zeros(self.ne, self.nd)
+        self.C.data = torch.zeros(self.ne, self.nx)
+        self.C.data[:,0] = torch.ones(self.ne)
+
         # 4. simulate the system to get x and w
         with torch.no_grad():
             B, N, _ = train_inputs.shape
@@ -126,18 +140,27 @@ class SimpleLure(nn.Module):
             # d_1 = torch.tensor(train_inputs[0,:,:].reshape(1,N,self.nd,1))
             x0s = torch.tensor(train_states[:,0,:].reshape(B, self.nx,1))
             ds = torch.tensor(train_inputs.reshape(B,N,self.nd,1))
-            _, (xs, ws) = self.lure.forward(x0=x0s, d=ds,return_states = True)
+            xs, (xs, ws) = self.lure.forward(x0=x0s, d=ds,return_states = True)
 
-        # 5. set C, D, and D12 based on least squares
-        self.D12.data = torch.zeros(self.ne, self.nw)
-        self.D.data = torch.zeros(self.ne, self.nd)
-        self.C.data = torch.zeros(self.ne, self.nx)
-        self.C.data[:,0] = torch.ones(self.ne)
+
+        X = np.linalg.inv(self.P.cpu().detach().numpy())
+        H = self.L.cpu().detach().numpy() @ X
+
+        fig, ax = plot_ellipse_and_parallelogram(X, H, self.s.cpu().detach().numpy(), self.max_norm_x0)
+        for x0i in x0s:
+            ax.plot(x0i[0].cpu().detach().numpy(), x0i[1].cpu().detach().numpy(), 'x', color='red', markersize=2)
+
+        for xi in xs:
+            ax.plot(xi[:20,0].cpu().detach().numpy(), xi[:20,1].cpu().detach().numpy())
 
         self.check_constraints()
+        
+        return fig
 
 
     def analysis_problem(self, learn_B_and_D21: bool = False) -> bool:
+
+        
 
         eps = 1e-3
 
@@ -145,6 +168,7 @@ class SimpleLure(nn.Module):
         la = cp.Variable((self.nz, 1))
         M = cp.diag(la)
         A = self.A.cpu().detach().numpy()
+        # s_hat = cp.Variable((1,1))
         # B = self.B.cpu().detach().numpy()
         if learn_B_and_D21:
             B = cp.Variable(self.B.shape)
@@ -154,10 +178,17 @@ class SimpleLure(nn.Module):
             D21 = self.D21.cpu().detach().numpy()
         B2 = self.B2.cpu().detach().numpy()
         C2 = self.C2.cpu().detach().numpy()
-        s = self.s.cpu().detach().numpy()
-        # D21 = self.D21.cpu().detach().numpy()   
         
         alpha = self.alpha.cpu().detach().numpy()
+        delta = self.delta.cpu().detach().numpy()
+        s = self.s.cpu().detach().numpy()
+        
+        if delta**2 - (1-alpha**2)*s**2 > 0:
+            s = np.sqrt(delta**2/(1-alpha**2)).squeeze()
+            
+        # D21 = self.D21.cpu().detach().numpy()   
+        
+        
 
         multiplier_constraints = []
         if self.learn_L:
@@ -167,7 +198,7 @@ class SimpleLure(nn.Module):
                 multiplier_constraints.append(
                     cp.bmat(
                         [
-                            [np.array([[(1/s**2)]]), li],
+                            [np.array([[1/s**2]]), li],
                             [li.T, P],
                         ]
                     ) >> eps * np.eye(self.nx + 1)
@@ -184,7 +215,7 @@ class SimpleLure(nn.Module):
             ]
         )
 
-        init_constraints = [P - np.linalg.norm(self.max_x0,2) / s**2 * np.eye(self.nx)<< 0 ]
+        init_constraints = [-P + self.max_norm_x0**2/s**2 * np.eye(self.nx)<< 0]
         
         nF = F.shape[0]
         problem = cp.Problem(
@@ -197,6 +228,7 @@ class SimpleLure(nn.Module):
             return False  # SDP failed due to solver error
         if not problem.status == "optimal":
             return False  # SDP failed to find feasible solution
+        logger.info(f"SDP analysis problem solved: {problem.status}")
 
         self.P.data = torch.tensor(P.value)
         self.M.data = torch.tensor(M.value)
@@ -205,8 +237,13 @@ class SimpleLure(nn.Module):
         if learn_B_and_D21:
             self.B.data = torch.tensor(B.value)
             self.D21.data = torch.tensor(D21.value)
+
+        self.s.data = torch.tensor(s)
+
         
         return True  # SDP successfully found feasible solution
+
+
 
     def get_lmis(self):
         lmi_list = []
@@ -239,15 +276,15 @@ class SimpleLure(nn.Module):
         """Construct scalar inequalities for positivity of la."""
         def input_size_condition() -> torch.Tensor:
             return -(self.delta**2 - (1-self.alpha**2)*self.s**2)
-        # inequalities.append(input_size_condition)
+        inequalities.append(input_size_condition)
         
-        def alpha_smaller_one() -> torch.Tensor:
-            return 1.0 - self.alpha
-        inequalities.append(alpha_smaller_one)
+        # def alpha_smaller_one() -> torch.Tensor:
+        #     return 1.0 - self.alpha
+        # inequalities.append(alpha_smaller_one)
 
-        def alpha_positive() -> torch.Tensor:
-            return self.alpha 
-        inequalities.append(alpha_positive)
+        # def alpha_positive() -> torch.Tensor:
+        #     return self.alpha 
+        # inequalities.append(alpha_positive)
 
         return inequalities
 

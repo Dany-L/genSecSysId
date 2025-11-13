@@ -106,8 +106,10 @@ theta = linspace(0, 2*pi, 200); % angle values
 unit_circle = [cos(theta); sin(theta)]; % points on unit circle
 
 % compute X^(-1/2)
-[V, D] = eig(1/s^2*X);
-X_half_inv = V * diag(1 ./ sqrt(diag(D))) * V';
+L = chol(X);
+% [V, D] = eig(1/s^2*X);
+% X_half_inv = V * diag(1 ./ sqrt(diag(D))) * V';
+X_half_inv = inv(L');
 
 ellipse = X_half_inv * unit_circle; % transform the circle
 figure; hold on; grid on
@@ -116,16 +118,7 @@ plot(ellipse(1,:), ellipse(2,:), 'b-', 'LineWidth', 2);
 xlabel('x_1'); ylabel('x_2'); grid on, hold on
 
 % Generate all sign combinations for s ∈ {-1,1}^2
-% S = [-1 -1; -1 1; 1 1; 1 -1];
-% 
-% % Compute vertices
-% X_ = (H \ S')';  % equivalent to inv(H)*s'
-% 
-% % Close the polygon by repeating the first vertex
-% X_ = [X_; X_(1,:)];
-% 
-% % Plot the edges
-% plot(X_(:,1), X_(:,2), 'r-', 'LineWidth', 2);
+
 
 feasible_ic_and_inputs = {};
 infeasible_ic_and_input = {};

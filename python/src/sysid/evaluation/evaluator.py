@@ -41,6 +41,7 @@ class Evaluator:
         test_loader: DataLoader,
         normalizer: Optional[Any] = None,
         print_results: bool = True,
+        save_files: bool = True,
     ) -> Dict[str, Any]:
         """
         Evaluate model on test dataset.
@@ -48,6 +49,8 @@ class Evaluator:
         Args:
             test_loader: Test data loader
             normalizer: Data normalizer (for denormalization)
+            print_results: Whether to print results to console
+            save_files: Whether to save prediction/target files to disk
             
         Returns:
             Dictionary of evaluation results
@@ -112,17 +115,18 @@ class Evaluator:
         if x is not None:
             results["states_shape"] = x.shape
         
-        with open(self.output_dir / "evaluation_results.json", "w") as f:
-            # Remove per_step from saved metrics (too verbose)
-            save_metrics = {k: v for k, v in metrics.items() if k != "per_step"}
-            json.dump({"metrics": save_metrics}, f, indent=2)
-        
-        # Save predictions, targets, inputs, and states
-        np.save(self.output_dir / "predictions.npy", e_hat)
-        np.save(self.output_dir / "targets.npy", e)
-        np.save(self.output_dir / "inputs.npy", d)
-        if x is not None:
-            np.save(self.output_dir / "states.npy", x)
+        if save_files:
+            with open(self.output_dir / "evaluation_results.json", "w") as f:
+                # Remove per_step from saved metrics (too verbose)
+                save_metrics = {k: v for k, v in metrics.items() if k != "per_step"}
+                json.dump({"metrics": save_metrics}, f, indent=2)
+            
+            # Save predictions, targets, inputs, and states
+            np.save(self.output_dir / "predictions.npy", e_hat)
+            np.save(self.output_dir / "targets.npy", e)
+            np.save(self.output_dir / "inputs.npy", d)
+            if x is not None:
+                np.save(self.output_dir / "states.npy", x)
         
         if print_results:
             print("Evaluation Results:")
@@ -138,6 +142,7 @@ class Evaluator:
         e: np.ndarray,      # output (target)
         d: Optional[np.ndarray] = None,  # input
         num_samples: int = 5,
+        sample_indices: Optional[list] = None,
         save_path: Optional[str] = None,
     ):
         """
@@ -147,10 +152,16 @@ class Evaluator:
             e_hat: Predicted output values
             e: Output (target) values
             d: Input values (optional)
-            num_samples: Number of samples to plot
+            num_samples: Number of samples to plot (used if sample_indices is None)
+            sample_indices: Specific sample indices to plot (overrides num_samples)
             save_path: Path to save figure
         """
-        num_samples = min(num_samples, e_hat.shape[0])
+        if sample_indices is not None:
+            indices = sample_indices
+            num_samples = len(indices)
+        else:
+            num_samples = min(num_samples, e_hat.shape[0])
+            indices = list(range(num_samples))
         
         # Determine number of subplots
         num_plots = 2 if d is not None else 1
@@ -163,6 +174,9 @@ class Evaluator:
             axes = axes.reshape(-1, 1)
         
         for i in range(num_samples):
+            # Use the actual index from the indices list
+            idx = indices[i]
+            
             # Plot predictions vs targets
             ax_pred = axes[i, 0] if num_plots > 1 else axes[i, 0]
             
@@ -170,16 +184,16 @@ class Evaluator:
                 # Sequence data
                 seq_len = e_hat.shape[1]
                 for feat in range(e_hat.shape[2]):
-                    ax_pred.plot(e_hat[i, :, feat], label=f"e_hat (predicted output, feat {feat})", alpha=0.7)
-                    ax_pred.plot(e[i, :, feat], label=f"e (output, feat {feat})", linestyle="--", alpha=0.7)
+                    ax_pred.plot(e_hat[idx, :, feat], label=f"e_hat (predicted output, feat {feat})", alpha=0.7)
+                    ax_pred.plot(e[idx, :, feat], label=f"e (output, feat {feat})", linestyle="--", alpha=0.7)
             else:
                 # Single-step data
-                ax_pred.plot(e_hat[i], label="e_hat (predicted output)", alpha=0.7)
-                ax_pred.plot(e[i], label="e (output)", linestyle="--", alpha=0.7)
+                ax_pred.plot(e_hat[idx], label="e_hat (predicted output)", alpha=0.7)
+                ax_pred.plot(e[idx], label="e (output)", linestyle="--", alpha=0.7)
             
             ax_pred.set_xlabel("Time Step")
             ax_pred.set_ylabel("Output (e)")
-            ax_pred.set_title(f"Sample {i + 1}: Output Prediction")
+            ax_pred.set_title(f"Sample {idx}: Output Prediction")
             ax_pred.legend()
             ax_pred.grid(True, alpha=0.3)
             
@@ -190,13 +204,13 @@ class Evaluator:
                 if d.ndim == 3:
                     # Sequence data
                     for feat in range(d.shape[2]):
-                        ax_input.plot(d[i, :, feat], label=f"d (input, feat {feat})", alpha=0.7)
+                        ax_input.plot(d[idx, :, feat], label=f"d (input, feat {feat})", alpha=0.7)
                 else:
-                    ax_input.plot(d[i], label="d (input)", alpha=0.7)
+                    ax_input.plot(d[idx], label="d (input)", alpha=0.7)
                 
                 ax_input.set_xlabel("Time Step")
                 ax_input.set_ylabel("Input (d)")
-                ax_input.set_title(f"Sample {i + 1}: Input Signal")
+                ax_input.set_title(f"Sample {idx}: Input Signal")
                 ax_input.legend()
                 ax_input.grid(True, alpha=0.3)
         
