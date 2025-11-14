@@ -372,7 +372,18 @@ def main():
                     e = np.load(output_dir / "targets.npy")  # output (target)
                     d = np.load(output_dir / "inputs.npy")  # input
                     
-                    evaluator.plot_predictions(e_hat, e, d, num_samples=5)
+                    # Select sample indices: always include sample 0, plus 4 random samples
+                    num_sequences = e_hat.shape[0]
+                    sample_indices = [0]  # Always include sample 0
+                    
+                    if num_sequences > 1:
+                        # Select 4 random samples (excluding sample 0)
+                        other_indices = list(range(1, num_sequences))
+                        num_random = min(4, len(other_indices))
+                        random_indices = np.random.choice(other_indices, size=num_random, replace=False).tolist()
+                        sample_indices.extend(random_indices)
+                    
+                    evaluator.plot_predictions(e_hat, e, d, sample_indices=sample_indices)
                     evaluator.analyze_errors(e_hat, e)
                     logger.info("Plots generated successfully")
                 except Exception as e_err:
@@ -410,7 +421,18 @@ def main():
                 e = np.load(output_dir / "targets.npy")  # output (target)
                 d = np.load(output_dir / "inputs.npy")  # input
                 
-                evaluator.plot_predictions(e_hat, e, d, num_samples=5)
+                # Select sample indices: always include sample 0, plus 4 random samples
+                num_sequences = e_hat.shape[0]
+                sample_indices = [0]  # Always include sample 0
+                
+                if num_sequences > 1:
+                    # Select 4 random samples (excluding sample 0)
+                    other_indices = list(range(1, num_sequences))
+                    num_random = min(4, len(other_indices))
+                    random_indices = np.random.choice(other_indices, size=num_random, replace=False).tolist()
+                    sample_indices.extend(random_indices)
+                
+                evaluator.plot_predictions(e_hat, e, d, sample_indices=sample_indices)
                 evaluator.analyze_errors(e_hat, e)
                 logger.info("Plots generated successfully")
             except Exception as e_err:

@@ -1,7 +1,6 @@
 clear all, close all;
-generation_type = {'noise', 'sin'};
-filename = 'init_rand';
-local_folder_path = './matlab/data/'; % needs to run from root folder
+generation_type = {'rand-input_noise', 'rand-input_sin', 'zero-input_noise','zero-input_sin'};
+local_folder_path = './data/'; % needs to run from root folder
 raw_folder_name = 'raw';
 raw_folder_path = fullfile(local_folder_path,raw_folder_name);
 if ~exist(raw_folder_path, 'dir')
@@ -10,7 +9,7 @@ end
 
 for i = 1:length(generation_type)
     gen_type = generation_type{i};
-    data_filename = sprintf('%s-input_%s.mat', filename, gen_type);
+    data_filename = sprintf('init_%s.mat' , gen_type);
     load(fullfile(local_folder_path, data_filename))
 
     % some general data
@@ -24,7 +23,7 @@ for i = 1:length(generation_type)
         tab = table(t', data.d', data.e', data.x(:,1:N)', ...
             'VariableNames', {'time', 'd', 'e', 'x'});
             % Save the table to a CSV file
-        csv_filename = sprintf('%s-output_%s_%i.csv', filename, gen_type, ii);
+        csv_filename = sprintf('init_%s-output_%i.csv', gen_type, ii);
         fullfilename = fullfile(raw_folder_path, csv_filename);
         writetable(tab, fullfilename);
         fprintf('%i/%i: write %s to %s\n', ii, length(feasible_ic_and_inputs), gen_type, fullfilename)

@@ -52,16 +52,21 @@ def create_model(config: Config, delta: Optional[float] = None, max_norm_x0: Opt
             dropout=model_config.dropout,
         )
     elif model_config.model_type == "crnn":
-        model = SimpleLure(
-            nd=input_size,
-            ne=output_size,
-            nw=model_config.nw,
-            nx=model_config.nx,
-            activation=model_config.activation,
-            custom_params=model_config.custom_params,
-            delta=delta,
-            max_norm_x0=max_norm_x0,
-        )
+        # Build kwargs for SimpleLure, only including delta and max_norm_x0 if provided
+        crnn_kwargs = {
+            'nd': input_size,
+            'ne': output_size,
+            'nw': model_config.nw,
+            'nx': model_config.nx,
+            'activation': model_config.activation,
+            'custom_params': model_config.custom_params,
+        }
+        if delta is not None:
+            crnn_kwargs['delta'] = delta
+        if max_norm_x0 is not None:
+            crnn_kwargs['max_norm_x0'] = max_norm_x0
+            
+        model = SimpleLure(**crnn_kwargs)
     else:
         raise ValueError(f"Unknown model type: {model_config.model_type}")
     

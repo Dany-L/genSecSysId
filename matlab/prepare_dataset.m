@@ -1,6 +1,6 @@
 clear all, close all;
 raw_folder_name = 'raw';
-local_folder_path = './matlab/data/'; % needs to run from root folder
+local_folder_path = './data/'; % needs to run from root folder
 prepared_folder_name = 'prepared';
 prepared_path = fullfile(local_folder_path, prepared_folder_name);
 if ~exist(prepared_path, 'dir')

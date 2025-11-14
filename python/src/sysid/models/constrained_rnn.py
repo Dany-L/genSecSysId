@@ -49,12 +49,14 @@ class SimpleLure(nn.Module):
             self.dual_penalty_init = custom_params.get("dual_penalty_init", 1.0)
             self.dual_penalty_growth = custom_params.get("dual_penalty_growth", 1.1)
             self.dual_penalty_shrink = custom_params.get("dual_penalty_shrink", 0.9)
+            self.l_nonzero_weight = custom_params.get("l_nonzero_weight", 0.0)
         else:
             learn_L = True
             self.regularization_method = "interior_point"
             self.dual_penalty_init = 1.0
             self.dual_penalty_growth = 1.1
             self.dual_penalty_shrink = 0.9
+            self.l_nonzero_weight = 0.0
 
         self.learn_L = learn_L
 
@@ -81,7 +83,7 @@ class SimpleLure(nn.Module):
         self.D21 = nn.Parameter(torch.zeros(nz, nd))
         self.D22 = nn.Parameter(torch.zeros(nz, nw))
 
-        self.alpha = nn.Parameter(torch.tensor(0.95), requires_grad=False)
+        self.alpha = nn.Parameter(torch.tensor(0.99), requires_grad=True)
         self.s = nn.Parameter(torch.tensor(0.0), requires_grad = True)
         
         if activation == "sat":
@@ -124,7 +126,7 @@ class SimpleLure(nn.Module):
         self.A.data = .9 * torch.eye(self.nx)
         min_val, max_val = -1, 1
         nn.init.uniform_(self.C2, a=min_val, b=max_val)
-        self.analysis_problem(learn_B_and_D21=True)
+        self.analysis_problem_init(learn_B_and_D21=True)
 
         # 5. set C, D, and D12 based on least squares
         # turns out the fixed choice works just fine, so we switched the order to get some results such that we can check if the condition on the input is satisfied
@@ -156,11 +158,86 @@ class SimpleLure(nn.Module):
         self.check_constraints()
         
         return fig
-
-
+    
+    
     def analysis_problem(self, learn_B_and_D21: bool = False) -> bool:
 
+        eps = 1e-3
+
+        P = cp.Variable((self.nx, self.nx), symmetric=True)
+        la = cp.Variable((self.nz, 1))
+        M = cp.diag(la)
+        # s_hat = cp.Variable((1,1))
+        if learn_B_and_D21:
+            B = cp.Variable(self.B.shape)
+            D21 = cp.Variable(self.D21.shape)
+        else:
+            B = self.B.cpu().detach().numpy()
+            D21 = self.D21.cpu().detach().numpy()
+        A = self.A.cpu().detach().numpy()
+        B2 = self.B2.cpu().detach().numpy()
+        C2 = self.C2.cpu().detach().numpy()
+        alpha = self.alpha.cpu().detach().numpy() 
+        s = self.s.cpu().detach().numpy()
+        if alpha < 0.9:
+            self.alpha.data = torch.tensor(0.99)
         
+        multiplier_constraints = []
+        if self.learn_L:
+            L = cp.Variable((self.nz, self.nx))
+            for li in L:
+                li = li.reshape((1,-1), 'C')
+                multiplier_constraints.append(
+                    cp.bmat(
+                        [
+                            [np.array([[1/s**2]]), li],
+                            [li.T, P],
+                        ]
+                    ) >> eps * np.eye(self.nx + 1)
+                )
+        else:
+            L = self.L.cpu().detach().numpy()
+        
+        F = cp.bmat(
+            [
+                [-alpha**2 * P, np.zeros((self.nx, self.nd)), P @ C2.T + L.T, P @ A.T],
+                [np.zeros((self.nd, self.nx)), -np.eye(self.nd), D21.T, B.T],
+                [C2 @ P + L, D21, -2 * M,  M @ B2.T],
+                [A @ P, B, B2 @ M, -P],
+            ]
+        )
+
+        # init_constraints = [-P + self.max_norm_x0**2/s**2 * np.eye(self.nx)<< 0]
+        
+        nF = F.shape[0]
+        problem = cp.Problem(
+            cp.Minimize([None]),
+            [F << -eps * np.eye(nF), *multiplier_constraints]
+        )
+        try:
+            problem.solve(solver=cp.MOSEK)
+        except Exception as e:
+            return False  # SDP failed due to solver error
+        if not problem.status == "optimal":
+            return False  # SDP failed to find feasible solution
+        # logger.info(f"SDP analysis problem solved: {problem.status}")
+
+        self.P.data = torch.tensor(P.value)
+        self.M.data = torch.tensor(M.value)
+        if self.learn_L:
+            self.L.data = torch.tensor(L.value)
+        if learn_B_and_D21:
+            self.B.data = torch.tensor(B.value)
+            self.D21.data = torch.tensor(D21.value)
+
+        # self.s.data = torch.tensor(np.sqrt(1/s_hat.value).squeeze())
+
+        
+        return True  # SDP successfully found feasible solution
+
+
+
+    def analysis_problem_init(self, learn_B_and_D21: bool = False) -> bool:
 
         eps = 1e-3
 
@@ -183,8 +260,8 @@ class SimpleLure(nn.Module):
         delta = self.delta.cpu().detach().numpy()
         s = self.s.cpu().detach().numpy()
         
-        if delta**2 - (1-alpha**2)*s**2 > 0:
-            s = np.sqrt(delta**2/(1-alpha**2)).squeeze()
+        # if delta**2 - (1-alpha**2)*s**2 > 0:
+        #     s = np.sqrt(delta**2/(1-alpha**2)).squeeze()
             
         # D21 = self.D21.cpu().detach().numpy()   
         
@@ -275,16 +352,16 @@ class SimpleLure(nn.Module):
         inequalities = []
         """Construct scalar inequalities for positivity of la."""
         def input_size_condition() -> torch.Tensor:
-            return -(self.delta**2 - (1-self.alpha**2)*self.s**2)
+            return -(self.delta**2 - (1-self.alpha**2)*self.s**2) +1e-3 # small margin
         inequalities.append(input_size_condition)
         
-        # def alpha_smaller_one() -> torch.Tensor:
-        #     return 1.0 - self.alpha
-        # inequalities.append(alpha_smaller_one)
+        def alpha_smaller_one() -> torch.Tensor:
+            return 1.0 - self.alpha
+        inequalities.append(alpha_smaller_one)
 
-        # def alpha_positive() -> torch.Tensor:
-        #     return self.alpha 
-        # inequalities.append(alpha_positive)
+        def alpha_positive() -> torch.Tensor:
+            return self.alpha
+        inequalities.append(alpha_positive)
 
         return inequalities
 
@@ -350,12 +427,17 @@ class SimpleLure(nn.Module):
         if method is None:
             method = self.regularization_method
             
+
         if method == "interior_point":
             return self._interior_point_regularization()
         elif method == "dual":
             return self._dual_regularization()
         else:
             raise ValueError(f"Unknown regularization method: {method}")
+
+        # add parameter regularization
+
+
     
     def _interior_point_regularization(self) -> torch.Tensor:
         """
@@ -369,6 +451,12 @@ class SimpleLure(nn.Module):
         reg_loss = torch.tensor(0.0, device=self.P.device)
         for f_i in self.get_lmis():
             reg_loss += -torch.logdet(f_i())
+        for s_i in self.get_scalar_inequalities():
+            reg_loss += -torch.log(s_i()).squeeze()
+        
+        # Add parametric regularization to encourage non-zero L
+        reg_loss += self._parametric_regularization()
+        
         return reg_loss
     
     def _dual_regularization(self) -> torch.Tensor:
@@ -398,7 +486,29 @@ class SimpleLure(nn.Module):
             
             reg_loss += self.dual_penalty * violation
         
+        # Add parametric regularization to encourage non-zero L
+        reg_loss += self._parametric_regularization()
+        
         return reg_loss
+    
+    def _parametric_regularization(self) -> torch.Tensor:
+        """
+        Parametric regularization to encourage specific parameter properties.
+        
+        Currently implements:
+        - Negative Frobenius norm penalty on L to encourage non-zero values
+          (penalizes small ||L||, encourages larger magnitude)
+        
+        Returns:
+            Parametric regularization loss
+        """
+        param_loss = torch.tensor(0.0, device=self.P.device)
+        
+        if self.l_nonzero_weight > 0 and self.learn_L:
+            # param_loss = self.l_nonzero_weight * torch.max(torch.tensor(0.0, device=self.P.device), 1 - torch.linalg.norm(self.L)**2)
+            param_loss -= self.l_nonzero_weight * torch.norm(self.L, p='fro')
+        
+        return param_loss
     
     def update_dual_penalty(self, constraints_satisfied: bool):
         """

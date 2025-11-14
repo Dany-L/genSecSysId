@@ -5,7 +5,7 @@ run('shared.m')
 % Same setup as proposition 2 LaBella, but with an input
 % analysis
 % standard sector
-alpha = 0.925;
+alpha = 0.97;
 eps = 1e-5;
 disp('--- STANDARD SECTOR CONDITIONS ---')
 a = 0; b = 1; %lower and upper bound of sector condition
@@ -29,7 +29,7 @@ L2 = [zeros(ne,nx), eye(nd), zeros(ne,nw);
 L3 = [zeros(nz,nx), zeros(nz,nd), eye(nw);
     C2d, D21d, D22d]; 
 lmis = [];
-lmi = L1' * [-alpha*X, zeros(nx,nx); zeros(nx,nx), X] * L1 + ...
+lmi = L1' * [-alpha^2*X, zeros(nx,nx); zeros(nx,nx), X] * L1 + ...
     L2' * [-eye(nd), zeros(nd,ne); zeros(ne,nd), zeros(ne,ne)] * L2 + ...
     L3' * Pm(Lambda) * L3;
 % lmi = [-X C2d'*Lambda Ad'*X;
@@ -73,8 +73,8 @@ end
 lmis = lmis + multiplier_constraint;
 lmis = lmis + (P>=eps*eye(nx));
 
-% sol = optimize(lmis, [], sdpsettings('solver','mosek','verbose', 0))
-sol = optimize(lmis, S_hat, sdpsettings('solver','mosek','verbose', 0))
+sol = optimize(lmis, [], sdpsettings('solver','mosek','verbose', 0))
+% sol = optimize(lmis, S_hat, sdpsettings('solver','mosek','verbose', 0))
 
 s = sqrt(1/double(S_hat))
 % s = 1
@@ -100,7 +100,7 @@ end
 %% plot the ellipsoid, any initial condition in this ellipsoid is guaranteed to be exponentially stable
 % thus this is the invariant set under the system dynamics
 % starting from this initial condition the state will never leave the set
-min_ = -7; max_ = -min_;
+min_ = -6; max_ = -min_;
 
 theta = linspace(0, 2*pi, 200); % angle values
 unit_circle = [cos(theta); sin(theta)]; % points on unit circle
@@ -123,12 +123,13 @@ xlabel('x_1'); ylabel('x_2'); grid on, hold on
 feasible_ic_and_inputs = {};
 infeasible_ic_and_input = {};
 gs = {}; ws = {}; zs={};xs={};
-counter  = 0; M = 1000; N = 500; b_nonlinear = false;
+counter  = 0; M = 300; N = 50; b_nonlinear = false;
 t = linspace(0,(N-1)*dt, N);
 % lets plot some trajectories
 for i=1:M
     % Generate a random initial condition within the range [-5, 5]
     x0 = -max_ + (max_ - min_) * rand(nx, 1);
+    % x0 = [0;0];
 
     % d = sqrt(s^2*(1-alpha))*sin(linspace(0,(N-1)*dt,N));
     d = sqrt(s^2*(1-alpha))*2*(rand(nd,N) - 0.5);
@@ -140,14 +141,15 @@ for i=1:M
     
     % if norm(d,'inf') > s^2
     if x0'*X*x0  > s^2 || norm(d.^2,'inf') > (1-alpha)*s^2
-        plot(x0(1,1), x0(2,1), 'x', 'LineWidth', 1.5)
-        plot(x(1,1:5), x(2,1:5), 'LineWidth', 1.5)
+        % plot(x0(1,1), x0(2,1), 'x', 'LineWidth', 1.5)
+        % plot(x(1,1:5), x(2,1:5), 'LineWidth', 1.5)
         counter = counter +1;
-        infeasible_ic_and_input{end+1} = struct('d', d, 'x0', x0, 'e', e, 'x', x, 'w', w, 'z', z);
-        continue
+        % infeasible_ic_and_input{end+1} = struct('d', d, 'x0', x0, 'e', e, 'x', x, 'w', w, 'z', z);
+        % continue
     else
-        feasible_ic_and_inputs{end+1} = struct('d', d, 'x0', x0, 'e', e, 'x', x, 'w', w, 'z', z);
+        % feasible_ic_and_inputs{end+1} = struct('d', d, 'x0', x0, 'e', e, 'x', x, 'w', w, 'z', z);
     end
+    feasible_ic_and_inputs{end+1} = struct('d', d, 'x0', x0, 'e', e, 'x', x, 'w', w, 'z', z);
     plot(x0(1,1), x0(2,1), 'o', 'LineWidth', 1.5)
     plot(x(1,:), x(2,:), 'LineWidth', 1.5)
     
@@ -159,7 +161,7 @@ legend({'$x^T P x < s^2$', '$\|H x\|_\infty < 1$'}, 'Interpreter', 'latex', 'Loc
 
 % print(gcf, './matlab/plots/with external inputs/invariance.png', '-dpng');
 % exportgraphics(gcf, './matlab/plots/with external inputs/three-differnt-init-cond-x-w-z.png');
-save('./matlab/data/init_rand-input_noise.mat', "feasible_ic_and_inputs","s","dsys_", 'Lambda', 'X', 'H', 't', 'dt')
+save('./data/init_rand-input_rand.mat', "feasible_ic_and_inputs","s","dsys_", 'Lambda', 'X', 'H', 't', 'dt','alpha','sys','min_')
 
 count2 = 0;
 for i = 1:length(feasible_ic_and_inputs)

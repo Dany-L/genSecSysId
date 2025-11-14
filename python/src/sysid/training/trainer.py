@@ -277,15 +277,17 @@ class Trainer:
             
             # Update weights
             self.optimizer.step()
+            # logging.info(f"B:{batch_idx}: s= {self.model.s.detach().numpy():.4f}, alpha= {self.model.alpha.detach().numpy():.4f}")
 
             # Check if constraints are satisfied (for constrained models)
             if isinstance(self.model, SimpleLure):
                 if not self.model.check_constraints():
                     # Constraints violated - try to solve feasibility SDP
                     logging.info(f"Batch {batch_idx}: Constraints violated after parameter update, attempting feasibility SDP...")
-                    if self.model.alpha > 1:
-                        self.model.alpha.data = torch.tensor(0.99)
+                    # if self.model.alpha > 1:
+                    #     self.model.alpha.data = torch.tensor(0.99)
                     
+                    # logging.info(f"B:{batch_idx}: s= {self.model.s.detach().numpy():.4f}, alpha= {self.model.alpha.detach().numpy():.4f}")
                     b_feasible = self.model.analysis_problem()
                     
                     if not b_feasible:
@@ -299,9 +301,12 @@ class Trainer:
                                     param.data.copy_(saved_state[name])
                         
                         logging.info(f"Batch {batch_idx}: Parameters rolled back successfully")
-                    else:
-                        logging.info(f"Batch {batch_idx}: Feasibility SDP succeeded, parameters updated")
-            
+                    # else:
+                        # logging.info(f"Batch {batch_idx}: Feasibility SDP succeeded, parameters updated")
+
+
+
+
             # Update metrics
             total_loss += loss.item()
             total_pred_loss += pred_loss.item()
@@ -382,7 +387,6 @@ class Trainer:
             
             # Train (returns dict with loss and gradient stats)
             train_results = self.train_epoch()
-            self.plot_trajectories(name=f"epoch_{epoch}")
             train_loss = train_results['loss']
             train_pred_loss = train_results['pred_loss']
             train_reg_loss = train_results['reg_loss']
@@ -433,6 +437,30 @@ class Trainer:
                 if self.log_gradients:
                     for stat_name, stat_value in grad_stats.items():
                         mlflow.log_metric(stat_name, stat_value, step=epoch)
+
+                if isinstance(self.model, SimpleLure):
+                    mlflow.log_metric("s", self.model.s.item(), step=epoch)
+                    mlflow.log_metric("alpha", self.model.alpha.item(), step=epoch)
+            
+            # Plot trajectories and ellipse periodically (at checkpoint frequency)
+            if (epoch + 1) % self.checkpoint_frequency == 0:
+                self.plot_trajectories(name=f"epoch_{epoch}", normalizer=normalizer)
+                
+                if isinstance(self.model, SimpleLure) and self.mlflow_tracking:
+                    X = np.linalg.inv(self.model.P.cpu().detach().numpy())
+                    H = self.model.L.cpu().detach().numpy() @ X
+                    s = self.model.s.cpu().detach().numpy()
+                    max_norm_x0 = self.model.max_norm_x0
+                    fig, ax = plot_ellipse_and_parallelogram(X, H, s, max_norm_x0)
+                    
+                    try:
+                        # Log directly to MLflow without saving to output_dir
+                        mlflow.log_figure(fig, f'plots/ellipse_epoch_{epoch}.png')
+                    except Exception as e:
+                        logging.warning(f"Failed to log ellipse plot: {e}")
+                    finally:
+                        plt.close(fig)
+            
             
             # Learning rate scheduling
             prev_lr = self.optimizer.param_groups[0]["lr"]
@@ -494,9 +522,8 @@ class Trainer:
             # Save and log to MLflow
             if self.mlflow_tracking:
                 try:
-                    plot_path = self.output_dir / 'final_ellipse.png'
-                    fig.savefig(plot_path, bbox_inches='tight')
-                    mlflow.log_artifact(str(plot_path), artifact_path='plots')
+                    # Log directly to MLflow without saving to output_dir
+                    mlflow.log_figure(fig, 'plots/final_ellipse.png')
                     logging.info("Logged final ellipse plot to MLflow artifacts")
                 except Exception as e:
                     logging.warning(f"Failed to log final ellipse plot: {e}")
@@ -544,8 +571,9 @@ class Trainer:
         if "best" in filename:
             self.save_parameters_mat(filename.replace(".pt", "_params.mat"))
         
-        # Log model to MLflow (fixes: artifact_path deprecation + signature warnings)
-        if self.mlflow_tracking and "best" in filename:
+        # Only log model to MLflow for final model (not every best model update)
+        # This avoids slowdown from logging the model every time validation improves
+        if self.mlflow_tracking and "final" in filename:
             try:
                 # Get a sample batch from train_loader for input example
                 sample_batch = next(iter(self.train_loader))

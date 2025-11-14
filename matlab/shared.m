@@ -20,7 +20,7 @@ D12 = ones(nd,nw); % output channel
 
 % C2 = 0.1*eye(nz); % nonlinearity channel
 C2 = 0* ones(nz,nx);
-C2(1:nx,:) = 0.15*eye(nx);
+C2(1:nx,:) = 0.18*eye(nx);
 D21 = ones(nz,nd); 
 D22 = zeros(nz,nw); % at this point must be zero
 
