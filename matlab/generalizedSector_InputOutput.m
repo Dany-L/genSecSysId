@@ -73,8 +73,8 @@ end
 lmis = lmis + multiplier_constraint;
 lmis = lmis + (P>=eps*eye(nx));
 
-sol = optimize(lmis, [], sdpsettings('solver','mosek','verbose', 0))
-% sol = optimize(lmis, S_hat, sdpsettings('solver','mosek','verbose', 0))
+% sol = optimize(lmis, [], sdpsettings('solver','mosek','verbose', 0))
+sol = optimize(lmis, S_hat, sdpsettings('solver','mosek','verbose', 0))
 
 s = sqrt(1/double(S_hat))
 % s = 1

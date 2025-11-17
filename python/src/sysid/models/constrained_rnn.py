@@ -179,8 +179,10 @@ class SimpleLure(nn.Module):
         C2 = self.C2.cpu().detach().numpy()
         alpha = self.alpha.cpu().detach().numpy() 
         s = self.s.cpu().detach().numpy()
-        if alpha < 0.9:
+        if alpha >= 1:
             self.alpha.data = torch.tensor(0.99)
+        # if alpha < 0.9:
+        #     
         
         multiplier_constraints = []
         if self.learn_L:
@@ -220,7 +222,7 @@ class SimpleLure(nn.Module):
             return False  # SDP failed due to solver error
         if not problem.status == "optimal":
             return False  # SDP failed to find feasible solution
-        # logger.info(f"SDP analysis problem solved: {problem.status}")
+        logger.info(f"SDP analysis problem solved: {problem.status}")
 
         self.P.data = torch.tensor(P.value)
         self.M.data = torch.tensor(M.value)
