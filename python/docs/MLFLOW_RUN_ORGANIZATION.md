@@ -112,16 +112,6 @@ If `run_info.json` doesn't exist (legacy models), evaluation still works but res
 
 ### 3. Analysis
 
-**Automatic run detection (recommended):**
-```bash
-python scripts/analyze.py \
-    --config configs/rnn_baseline.yaml \
-    --model models/abc123def456/best_model.pt \
-    --check-stability \
-    --lower-bound -10 \
-    --upper-bound 10
-```
-
 **What happens:**
 - Detects `run_info.json` in model directory
 - Automatically reopens the training MLflow run

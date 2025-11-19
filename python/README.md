@@ -119,15 +119,39 @@ python scripts/evaluate.py \
     --test-data data/test.csv
 ```
 
-### 5. Analyze the model
+### 5. Compare multiple models
 
 ```bash
-python scripts/analyze.py \
-    --config configs/rnn_baseline.yaml \
-    --model models/rnn_baseline/best_model.pt \
-    --check-stability \
-    --lower-bound -10 \
-    --upper-bound 10
+python scripts/compare.py \
+    --run-ids <run_id_1> <run_id_2> <run_id_3> \
+    --test-data data/prepared/test \
+    --output-dir comparisons/my_comparison
+```
+
+This generates:
+- Summary table with parameters and metrics
+- Evaluation metrics comparison
+- Training curves for each run
+- Validation loss comparison plot
+
+### 6. Post-process a model (Optional)
+
+For SimpleLure models, you can solve an SDP to optimize P and L while keeping A, B, C, D fixed:
+
+**Using the script:**
+```bash
+# Feasibility: find valid P and L
+python scripts/post_process.py --run-id <run_id>
+
+# Optimization: minimize s for tightest certificate
+python scripts/post_process.py --run-id <run_id> --optimize-s
+```
+
+**Or call the method directly:**
+```python
+model = mlflow.pytorch.load_model(f"runs:/{run_id}/model")
+result = model.post_process(optimize_s=True)
+# Model is automatically updated with optimized P, L
 ```
 
 ## Data Loading Options
@@ -186,7 +210,9 @@ python/
 ├── scripts/                # Main scripts
 │   ├── train.py           # Training script (auto-detects folder/CSV)
 │   ├── evaluate.py        # Evaluation script (supports folder/CSV)
-│   ├── analyze.py         # Model analysis script
+│   ├── compare.py         # Compare multiple MLflow runs
+│   ├── post_process.py    # Post-process models (optimize P/L only)
+│   ├── export_for_matlab.py  # Export models to MATLAB .mat format
 │   └── generate_sample_data.py  # Generate sample data for testing
 ├── tests/                 # Unit tests
 ├── configs/               # Example configurations

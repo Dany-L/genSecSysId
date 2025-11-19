@@ -321,6 +321,30 @@ def main():
         total_params = sum(p.numel() for p in model.parameters())
         logger.info(f"Total parameters: {total_params:,}")
         print(f"Model loaded from {args.model}")
+        
+        # Generate ellipse/polytope plot for SimpleLure models
+        from sysid.models import SimpleLure
+        from sysid.utils import plot_ellipse_and_parallelogram
+        import matplotlib.pyplot as plt
+        
+        if isinstance(model, SimpleLure) and model.nx == 2:
+            logger.info("Generating ellipse and polytope visualization...")
+            try:
+                X = np.linalg.inv(model.P.cpu().detach().numpy())
+                H = model.L.cpu().detach().numpy() @ X
+                s = model.s.cpu().detach().numpy()
+                max_norm_x0 = model.max_norm_x0 if hasattr(model, 'max_norm_x0') else None
+                
+                fig, ax = plot_ellipse_and_parallelogram(X, H, s, max_norm_x0, show=False)
+                
+                # Save to output directory
+                ellipse_plot_path = output_dir / "ellipse_polytope.png"
+                fig.savefig(ellipse_plot_path, dpi=150, bbox_inches='tight')
+                plt.close(fig)
+                logger.info(f"Ellipse/polytope plot saved to {ellipse_plot_path}")
+            except Exception as e:
+                logger.warning(f"Failed to generate ellipse/polytope plot: {e}")
+        
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         raise

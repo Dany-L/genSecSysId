@@ -104,11 +104,9 @@ def main():
     # Get device
     device = get_device(config.training.device)
     logger.info(f"Using device: {device}")
-    print(f"Using device: {device}")
     
     # Load data
     logger.info("Loading data...")
-    print("Loading data...")
     data_config = config.data
     
     try:
@@ -268,6 +266,8 @@ def main():
     with mlflow.start_run(run_name=config.mlflow.run_name):
         run_id = mlflow.active_run().info.run_id
         logger.info(f"MLflow run ID: {run_id}")
+        mlflow.log_param("total_parameters", total_params)
+        mlflow.log_param("trainable_parameters", trainable_params)
 
         # Update directories to include run_id for better organization
         run_model_dir = Path(model_dir) / run_id
@@ -317,7 +317,7 @@ def main():
             try:
                 plot_path = run_output_dir / 'init_ellipse.png'
                 init_fig.savefig(plot_path, bbox_inches='tight')
-                mlflow.log_artifact(str(plot_path), artifact_path='plots')
+                mlflow.log_artifact(str(plot_path), name='plots')
                 logger.info(f"Logged initialization plot to MLflow artifacts")
             except Exception as e:
                 logger.warning(f"Failed to log initialization plot: {e}")

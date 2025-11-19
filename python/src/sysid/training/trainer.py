@@ -188,7 +188,7 @@ class Trainer:
         
         # Log to MLflow
         if self.mlflow_tracking:
-            mlflow.log_artifact(str(plot_path), artifact_path="predictions")
+            mlflow.log_artifact(str(plot_path), name="predictions")
             # print(f"✓ Trajectory plot logged to MLflow")
         
         # print(f"✓ Trajectory plot saved: {plot_path}")

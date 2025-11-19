@@ -143,15 +143,7 @@ python scripts/evaluate.py \
     --model models/rnn_direct/best_model.pt
 ```
 
-### 2. Analyze model parameters
-```bash
-python scripts/analyze.py \
-    --config configs/rnn_direct.yaml \
-    --model models/rnn_direct/best_model.pt \
-    --check-stability
-```
-
-### 3. Try different architectures
+### 2. Try different architectures
 ```bash
 # Copy config and modify
 cp configs/rnn_direct.yaml configs/lstm_direct.yaml

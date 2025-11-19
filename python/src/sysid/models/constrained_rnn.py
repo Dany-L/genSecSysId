@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, List
 from .base import LureSystem, LureSystemClass, DznActivation
 import torch
 import torch.nn as nn
@@ -385,6 +385,7 @@ class SimpleLure(nn.Module):
         self,
         d: torch.Tensor,  # input
         x0: Optional[torch.Tensor] = None,
+        return_state: bool = False
     ) -> torch.Tensor:
         """
         Forward pass.
@@ -403,17 +404,238 @@ class SimpleLure(nn.Module):
         if x0 is None:
             x0 = torch.zeros(size=(B, self.nx))
         ds = d.reshape(shape=(B, N, nd, 1))
-        es_hat, x = self.lure.forward(x0=x0, d=ds)
+        es_hat, x = self.lure.forward(x0=x0, d=ds, return_states=return_state)
         # return (
         #     es_hat.reshape(B, N, self.lure._nd),
         #     (x.reshape(B, self.nx),),
         # )
-        return es_hat.reshape(B, N, self.lure._nd)
+        if return_state:
+            return es_hat.reshape(B, N, self.lure._nd), x
+        else:
+            return es_hat.reshape(B, N, self.lure._nd)
 
 
     def count_parameters(self) -> int:
         """Count the number of trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+    
+    def freeze_system_matrices(self):
+        """
+        Freeze A, B, C, D (and related) system matrices for post-processing.
+        Only P and L remain trainable for constraint optimization.
+        
+        This is useful for post-processing where you want to keep the learned
+        dynamics fixed but optimize the Lyapunov certificate.
+        """
+        # Freeze linear system matrices
+        self.A.requires_grad = False
+        self.B.requires_grad = False
+        self.B2.requires_grad = False
+        self.C.requires_grad = False
+        self.D.requires_grad = False
+        self.D12.requires_grad = False
+        self.C2.requires_grad = False
+        self.D21.requires_grad = False
+        self.D22.requires_grad = False
+        
+        # Freeze stability parameters
+        self.alpha.requires_grad = False
+        self.s.requires_grad = False
+        
+        # Keep P and L trainable (if L is learnable)
+        self.P.requires_grad = True
+        if self.learn_L:
+            self.L.requires_grad = True
+        
+        logger.info("Froze system matrices A, B, C, D. P and L remain trainable.")
+    
+    def unfreeze_all_parameters(self):
+        """Unfreeze all parameters for normal training."""
+        for param in self.parameters():
+            param.requires_grad = True
+        logger.info("Unfroze all parameters.")
+    
+    def get_frozen_parameters_info(self) -> dict:
+        """
+        Get information about which parameters are frozen/trainable.
+        
+        Returns:
+            Dictionary with parameter names and their trainable status
+        """
+        param_info = {}
+        for name, param in self.named_parameters():
+            param_info[name] = {
+                'shape': tuple(param.shape),
+                'requires_grad': param.requires_grad,
+                'num_elements': param.numel()
+            }
+        return param_info
+    
+    def post_process(self, eps: float = 1e-3) -> dict:
+        """
+        Post-process the model by solving an SDP to find optimal P and L
+        while keeping system matrices (A, B, C, D) fixed.
+        
+        This solves the following SDP:
+        - Decision variables: P (Lyapunov), L (coupling), m (multipliers), S_hat (optional)
+        - Constraints: Main LMI for stability, locality LMIs, positive definiteness
+        - Objective: minimize S_hat (minimize s) or feasibility
+        
+        Args:
+            optimize_s: If True, optimize for minimum s. If False, keep s fixed.
+            eps: Small positive constant for strict inequalities (default: 1e-3)
+            
+        Returns:
+            Dictionary with results including:
+                - success: bool, whether SDP was solved successfully
+                - P_opt: Optimized Lyapunov matrix
+                - L_opt: Optimized coupling matrix
+                - s_opt: Optimized sector bound
+                - max_eig_F: Maximum eigenvalue of F matrix
+                - summary: Dictionary with comparison metrics
+        """
+        import cvxpy as cp
+        import numpy as np
+        
+        logger.info("="*80)
+        logger.info("POST-PROCESSING: Solving SDP for optimal s with P, L and M as decision variables")
+        logger.info("="*80)
+
+        # Extract current parameters
+        A = self.A.cpu().detach().numpy()
+        B = self.B.cpu().detach().numpy()
+        B2 = self.B2.cpu().detach().numpy()
+        C2 = self.C2.cpu().detach().numpy()
+        D21 = self.D21.cpu().detach().numpy()
+        alpha = self.alpha.cpu().detach().numpy()
+        s_original = self.s.cpu().detach().numpy()
+        
+        P_original = self.P.cpu().detach().numpy()
+        L_original = self.L.cpu().detach().numpy() if self.learn_L else None
+        
+        logger.info(f"Current alpha = {alpha:.6f}, s = {s_original:.6f}")
+        
+        # Decision variables
+        P = cp.Variable((self.nx, self.nx), symmetric=True)
+        L = cp.Variable((self.nz, self.nx))
+        m = cp.Variable((self.nz, 1))
+        M = cp.diag(m)
+        
+        # S_hat for optimizing s
+        S_hat = cp.Variable((1, 1))
+        
+        # Constraints
+        constraints = []
+        
+        # Multiplier constraints: m(i) >= eps for all i
+        for i in range(self.nz):
+            constraints.append(m[i, 0] >= eps)
+        
+        # Main LMI: F <= -eps*I
+        F = cp.bmat([
+            [-alpha**2 * P, np.zeros((self.nx, self.nd)), P @ C2.T + L.T, P @ A.T],
+            [np.zeros((self.nd, self.nx)), -np.eye(self.nd), D21.T, B.T],
+            [C2 @ P + L, D21, -2 * M, M @ B2.T],
+            [A @ P, B, B2 @ M, -P]
+        ])
+        nF = F.shape[0]
+        constraints.append(F << -eps * np.eye(nF))
+        
+        # Locality constraints: [S_hat, li; li', P] >= eps*I for each row of L
+        for i in range(self.nz):
+            li = L[i, :].reshape((1, -1), order='C')
+            locality_lmi = cp.bmat([
+                [S_hat, li],
+                [li.T, P]
+            ])
+            constraints.append(locality_lmi >> eps * np.eye(self.nx + 1))
+        
+        # P positive definite
+        constraints.append(P >> eps * np.eye(self.nx))
+        
+        # Objective
+        objective = cp.Minimize(S_hat)
+
+        # Solve
+        problem = cp.Problem(objective, constraints)
+        logger.info(f"Solving SDP with {len(constraints)} constraints using MOSEK...")
+        
+        try:
+            problem.solve(solver=cp.MOSEK, verbose=False)
+        except Exception as e:
+            logger.error(f"SDP solver failed: {e}")
+            return {'success': False, 'error': str(e)}
+        
+        # Check solution status
+        if problem.status not in ["optimal", "optimal_inaccurate"]:
+            logger.error(f"SDP failed with status: {problem.status}")
+            return {'success': False, 'status': problem.status}
+        
+        logger.info(f"✓ SDP solved successfully: {problem.status}")
+        
+        # Extract solution
+        P_opt = P.value
+        L_opt = L.value
+        m_opt = m.value
+        M_opt = np.diag(m_opt.flatten())
+        
+        S_hat_opt = S_hat.value[0, 0] if hasattr(S_hat.value, '__len__') else S_hat.value
+        s_opt = np.sqrt(1.0 / S_hat_opt)
+        
+        # Verify solution
+        F_value = np.block([
+            [-alpha**2 * P_opt, np.zeros((self.nx, self.nd)), P_opt @ C2.T + L_opt.T, P_opt @ A.T],
+            [np.zeros((self.nd, self.nx)), -np.eye(self.nd), D21.T, B.T],
+            [C2 @ P_opt + L_opt, D21, -2 * M_opt, M_opt @ B2.T],
+            [A @ P_opt, B, B2 @ M_opt, -P_opt]
+        ])
+        max_eig_F = np.max(np.real(np.linalg.eigvals(F_value)))
+        
+        # Update model parameters
+        self.P.data = torch.tensor(P_opt)
+        self.L.data = torch.tensor(L_opt)
+        self.la.data = torch.tensor(np.diag(M_opt))
+        self.M = torch.diag(self.la)
+        self.s.data = torch.tensor(s_opt)
+        
+        # Verify constraints
+        constraints_satisfied = self.check_constraints()
+        
+        summary = {
+            'original': {
+                's': float(s_original),
+                'max_eig_P': float(np.max(np.linalg.eigvals(P_original))),
+                'min_eig_P': float(np.min(np.linalg.eigvals(P_original))),
+                'cond_P': float(np.linalg.cond(P_original)),
+            },
+            'optimized': {
+                's': float(s_opt),
+                'max_eig_P': float(np.max(np.linalg.eigvals(P_opt))),
+                'min_eig_P': float(np.min(np.linalg.eigvals(P_opt))),
+                'cond_P': float(np.linalg.cond(P_opt)),
+                'max_eig_F': float(max_eig_F),
+            },
+        }
+        
+        # Log results
+        logger.info("─"*80)
+        logger.info(f"Original s:      {summary['original']['s']:.6f}")
+        logger.info(f"Optimized s:     {summary['optimized']['s']:.6f}")
+        logger.info(f"Max eig(F):      {max_eig_F:.6e}")
+        logger.info(f"Constraints OK:  {constraints_satisfied}")
+        logger.info("="*80)
+        
+        return {
+            'success': True,
+            'P_opt': P_opt,
+            'L_opt': L_opt,
+            'm_opt': m_opt,
+            's_opt': s_opt,
+            'S_hat_opt': S_hat_opt,
+            'max_eig_F': max_eig_F,
+            'constraints_satisfied': constraints_satisfied,
+            'summary': summary,
+        }
     
     def get_regularization_loss(self, method: Optional[str] = None) -> torch.Tensor:
         """

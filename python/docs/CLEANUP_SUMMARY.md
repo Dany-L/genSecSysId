@@ -48,7 +48,7 @@ python/
 ├── scripts/
 │   ├── train.py                  # Simplified loading
 │   ├── evaluate.py               # Simplified loading
-│   └── analyze.py                # Unchanged
+
 ├── configs/
 │   ├── rnn_baseline.yaml         # Updated for direct loading
 │   ├── lstm_baseline.yaml        # Updated for direct loading
