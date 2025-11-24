@@ -3,7 +3,7 @@ clear, close all
 % generalized sector conditions
 % folder_name = '~/genSecSysId-Data/models/crnn/44a34327b5e14d92baa101236e7d8aee';
 % folder_name = '~/genSecSysId-Data/models/crnn/76e61a76f426478b917b05015e19b0a1';
-folder_name = '~/genSecSysId-Data/models/crnn/82d830f4d3a14f1c88fa939d9944e42e';
+folder_name = '~/genSecSysId-Data/models/crnn/5e62439bc5834a65b91b2482ca40d6e4';
 bGenSec = true;
 % standard sector conditions
 % folder_name = '~/genSecSysId-Data/models/crnn/2c79b58d71fa43b59fc8769d937082b8';

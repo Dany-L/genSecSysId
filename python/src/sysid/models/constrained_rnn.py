@@ -65,8 +65,12 @@ class SimpleLure(nn.Module):
 
         if learn_L:
             self.L = nn.Parameter(torch.zeros((nz, nx)))  # Coupling matrix
+            self.alpha = nn.Parameter(torch.tensor(0.99), requires_grad=True)
+            self.s = nn.Parameter(torch.tensor(0.0), requires_grad = True)
         else:
             self.L = torch.zeros((nz, nx))  # Coupling matrix, not learnable
+            self.alpha = nn.Parameter(torch.tensor(0.99), requires_grad=False)
+            self.s = nn.Parameter(torch.tensor(1.0), requires_grad = False)
             
         self.la = nn.Parameter(torch.ones(nz))
         self.M = torch.diag(self.la)
@@ -83,8 +87,7 @@ class SimpleLure(nn.Module):
         self.D21 = nn.Parameter(torch.zeros(nz, nd))
         self.D22 = nn.Parameter(torch.zeros(nz, nw))
 
-        self.alpha = nn.Parameter(torch.tensor(0.99), requires_grad=True)
-        self.s = nn.Parameter(torch.tensor(0.0), requires_grad = True)
+        
         
         if activation == "sat":
             Delta = nn.Hardtanh(min_val=-1.0, max_val=1.0)
@@ -110,6 +113,9 @@ class SimpleLure(nn.Module):
 
         # self.initialize_parameters()
         
+    def reset_s(self):
+        self.s.data = torch.sqrt(self.delta**2 /(1-self.alpha**2)).squeeze()
+
 
     def initialize_parameters(self, train_inputs, train_states, train_outputs):
         """Initialize parameters with small random values."""
@@ -182,6 +188,10 @@ class SimpleLure(nn.Module):
         if alpha >= 1:
             self.alpha.data = torch.tensor(0.99)
         # if alpha < 0.9:
+
+        if self.get_scalar_inequalities()[0]() < 0 and self.learn_L:
+            logger.info("Condition on inputs is not satisfied")
+            self.reset_s()
         #     
         
         multiplier_constraints = []
@@ -222,7 +232,7 @@ class SimpleLure(nn.Module):
             return False  # SDP failed due to solver error
         if not problem.status == "optimal":
             return False  # SDP failed to find feasible solution
-        logger.info(f"SDP analysis problem solved: {problem.status}")
+        # logger.info(f"SDP analysis problem solved: {problem.status}")
 
         self.P.data = torch.tensor(P.value)
         self.M.data = torch.tensor(M.value)

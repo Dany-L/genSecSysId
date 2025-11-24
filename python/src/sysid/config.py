@@ -83,6 +83,7 @@ class TrainingConfig:
     regularization_weight: float = 0.01
     decay_regularization_weight: bool = True  # Decay reg weight with learning rate
     regularization_decay_factor: float = 0.5  # Same as scheduler_factor by default
+    min_regularization_weight: float = 1e-7  # Early stopping threshold for reg weight
     
     # Gradient monitoring
     log_gradients: bool = True  # Log gradient statistics to MLflow

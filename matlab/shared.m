@@ -38,15 +38,16 @@ disp('| eig Ad |'); abs(eig(Ad))
 g = 1; % Set the bound for the deadzone
 sat = @(x) max(min(x, g), -g);
 dzn = @(x) x-sat(x);
-% x = -5:0.1:5;
-% figure(),plot(x, dzn(x), 'LineWidth',2.0);
-%     % , x, tanh(x), x, sat(x)
-% legend('dzn', 'tanh', 'sat', 'Interpreter', 'latex', 'Location', 'northeast', 'FontSize', 18);
-% xlabel('x');
-% ylabel('Function values');
-% title('Comparison of dzn, tanh, and sat functions');
-% grid on;
-% exportgraphics(gca, './matlab/plots/nonlinearities.png');
+x = -5:0.1:5;
+figure(),plot(x, dzn(x) , x, tanh(x), x, sat(x), 'LineWidth',2.0);
+   
+legend('dzn', 'tanh', 'sat', 'Interpreter', 'latex', 'Location', 'northeast', 'FontSize', 18);
+xlabel('x');
+ylabel('Function values');
+title('Comparison of dzn, tanh, and sat functions');
+grid on;
+exportgraphics(gca, './plots/nonlinearities.png');
+matlab2tikz('./plots/nonlinearities.tex')
 
 dsys_ = struct('Ad', Ad, 'Bd', Bd, 'B2d', B2d, ...
     'Cd', Cd, 'Dd', Dd, 'D12d', D12d, ...

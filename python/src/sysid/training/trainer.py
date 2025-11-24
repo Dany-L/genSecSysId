@@ -43,6 +43,7 @@ class Trainer:
         regularization_weight: float = 0.0,
         decay_regularization_weight: bool = False,
         regularization_decay_factor: float = 0.5,
+        min_regularization_weight: float = 1e-7,
         checkpoint_frequency: int = 10,
         early_stopping_patience: int = 50,
         mlflow_tracking: bool = True,
@@ -65,6 +66,7 @@ class Trainer:
             regularization_weight: Initial weight for custom regularization
             decay_regularization_weight: Whether to decay reg weight with LR
             regularization_decay_factor: Factor to decay reg weight (interior point method)
+            min_regularization_weight: Minimum threshold for reg weight early stopping (default: 1e-7)
             checkpoint_frequency: Save checkpoint every N epochs
             early_stopping_patience: Patience for early stopping
             mlflow_tracking: Whether to use MLflow tracking
@@ -92,8 +94,13 @@ class Trainer:
         self.initial_regularization_weight = regularization_weight  # Store initial value
         self.decay_regularization_weight = decay_regularization_weight
         self.regularization_decay_factor = regularization_decay_factor
+        self.min_regularization_weight = min_regularization_weight
         self.checkpoint_frequency = checkpoint_frequency
         self.early_stopping_patience = early_stopping_patience
+        
+        # Rollback tracking
+        self.rollback_count = 0
+        self.epoch_rollback_count = 0
         
         # Logging
         self.mlflow_tracking = mlflow_tracking
@@ -188,7 +195,7 @@ class Trainer:
         
         # Log to MLflow
         if self.mlflow_tracking:
-            mlflow.log_artifact(str(plot_path), name="predictions")
+            mlflow.log_artifact(str(plot_path), artifact_path="predictions")
             # print(f"✓ Trajectory plot logged to MLflow")
         
         # print(f"✓ Trajectory plot saved: {plot_path}")
@@ -208,7 +215,24 @@ class Trainer:
         if self.decay_regularization_weight and self.regularization_weight > 0:
             old_weight = self.regularization_weight
             self.regularization_weight *= self.regularization_decay_factor
+            # Ensure we don't go below minimum threshold
+            if self.regularization_weight < self.min_regularization_weight:
+                self.regularization_weight = self.min_regularization_weight
             print(f"  Regularization weight decayed: {old_weight:.6e} → {self.regularization_weight:.6e}")
+    
+    def reduce_lr_on_rollback(self, factor: float = 0.5):
+        """
+        Reduce learning rate when rollbacks occur frequently.
+        This helps when the optimizer step is too large for the constrained space.
+        
+        Args:
+            factor: Factor to multiply learning rate by (default: 0.5)
+        """
+        for param_group in self.optimizer.param_groups:
+            old_lr = param_group['lr']
+            param_group['lr'] *= factor
+            new_lr = param_group['lr']
+            print(f"  Learning rate reduced due to rollbacks: {old_lr:.6e} → {new_lr:.6e}")
     
     def train_epoch(self) -> Dict[str, float]:
         """
@@ -222,6 +246,9 @@ class Trainer:
         total_pred_loss = 0.0
         total_reg_loss = 0.0
         num_batches = 0
+        
+        # Reset epoch rollback counter
+        self.epoch_rollback_count = 0
         
         # Accumulate gradient stats over epoch
         epoch_grad_stats = {}
@@ -283,7 +310,7 @@ class Trainer:
             if isinstance(self.model, SimpleLure):
                 if not self.model.check_constraints():
                     # Constraints violated - try to solve feasibility SDP
-                    logging.info(f"Batch {batch_idx}: Constraints violated after parameter update, attempting feasibility SDP...")
+                    # logging.info(f"Batch {batch_idx}: Constraints violated after parameter update, attempting feasibility SDP...")
                     # if self.model.alpha > 1:
                     #     self.model.alpha.data = torch.tensor(0.99)
                     
@@ -300,7 +327,11 @@ class Trainer:
                                 if param.requires_grad and name in saved_state:
                                     param.data.copy_(saved_state[name])
                         
-                        logging.info(f"Batch {batch_idx}: Parameters rolled back successfully")
+                        # Track rollbacks
+                        self.rollback_count += 1
+                        self.epoch_rollback_count += 1
+                        
+                        logging.info(f"Batch {batch_idx}: Parameters rolled back successfully (total: {self.rollback_count})")
                     # else:
                         # logging.info(f"Batch {batch_idx}: Feasibility SDP succeeded, parameters updated")
 
@@ -322,13 +353,12 @@ class Trainer:
         avg_grad_stats = {
             key: np.mean(values) for key, values in epoch_grad_stats.items()
         }
-
-
         
         return {
             'loss': avg_loss,
             'pred_loss': avg_pred_loss,
             'reg_loss': avg_reg_loss,
+            'rollback_count': self.epoch_rollback_count,
             **avg_grad_stats
         }
     
@@ -390,7 +420,8 @@ class Trainer:
             train_loss = train_results['loss']
             train_pred_loss = train_results['pred_loss']
             train_reg_loss = train_results['reg_loss']
-            grad_stats = {k: v for k, v in train_results.items() if k not in ['loss', 'pred_loss', 'reg_loss']}
+            epoch_rollback_count = train_results.get('rollback_count', 0)
+            grad_stats = {k: v for k, v in train_results.items() if k not in ['loss', 'pred_loss', 'reg_loss', 'rollback_count']}
             
             self.train_losses.append(train_loss)
             self.train_pred_losses.append(train_pred_loss)
@@ -475,6 +506,21 @@ class Trainer:
             if current_lr < prev_lr:
                 self.decay_regularization()
             
+            # If ALL batches rolled back this epoch, reduce learning rate and regularization
+            if epoch_rollback_count >= len(self.train_loader):  # 100% of batches rolled back
+                pbar.write(f"\n⚠ All batches rolled back ({epoch_rollback_count}/{len(self.train_loader)}), reducing LR and regularization")
+                self.reduce_lr_on_rollback(factor=self.optimizer.param_groups[0].get('lr_reduction_factor', 0.5))
+                self.decay_regularization()
+                if isinstance(self.model, SimpleLure):
+                    self.model.reset_s()
+                    pbar.write(f"   Reset s escape local minimum")
+
+                
+            # Log rollback count to MLflow
+            if self.mlflow_tracking:
+                mlflow.log_metric("rollback_count", epoch_rollback_count, step=epoch)
+                mlflow.log_metric("total_rollbacks", self.rollback_count, step=epoch)
+            
             # Update dual penalty coefficient if using dual method
             if hasattr(self.model, 'update_dual_penalty') and hasattr(self.model, 'regularization_method'):
                 if self.model.regularization_method == "dual":
@@ -492,7 +538,7 @@ class Trainer:
             if (epoch + 1) % self.checkpoint_frequency == 0:
                 self.save_checkpoint(f"checkpoint_epoch_{epoch}.pt")
             
-            # Early stopping check
+            # Early stopping checks
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.best_epoch = epoch  # Track the best epoch
@@ -504,6 +550,12 @@ class Trainer:
                 # if self.patience_counter >= self.early_stopping_patience:
                     # pbar.write(f"\n⚠ Early stopping triggered after {epoch + 1} epochs")
                     # break
+            
+            # Early stopping based on regularization weight threshold
+            if self.decay_regularization_weight and self.regularization_weight <= self.min_regularization_weight:
+                pbar.write(f"\n⚠ Early stopping: Regularization weight reached minimum threshold ({self.min_regularization_weight:.2e})")
+                pbar.write(f"   Training has converged after {epoch + 1} epochs")
+                break
         
         # Close progress bar
         pbar.close()

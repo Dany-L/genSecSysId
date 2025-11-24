@@ -317,7 +317,7 @@ def main():
             try:
                 plot_path = run_output_dir / 'init_ellipse.png'
                 init_fig.savefig(plot_path, bbox_inches='tight')
-                mlflow.log_artifact(str(plot_path), name='plots')
+                mlflow.log_artifact(str(plot_path), artifact_path='plots')
                 logger.info(f"Logged initialization plot to MLflow artifacts")
             except Exception as e:
                 logger.warning(f"Failed to log initialization plot: {e}")
@@ -350,6 +350,7 @@ def main():
             regularization_weight=config.training.regularization_weight if config.training.use_custom_regularization else 0.0,
             decay_regularization_weight=getattr(config.training, 'decay_regularization_weight', False) if config.training.use_custom_regularization else False,
             regularization_decay_factor=getattr(config.training, 'regularization_decay_factor', 0.5),
+            min_regularization_weight=getattr(config.training, 'min_regularization_weight', 1e-7),
             checkpoint_frequency=config.training.checkpoint_frequency,
             early_stopping_patience=config.training.early_stopping_patience,
             mlflow_tracking=True,
@@ -372,6 +373,7 @@ def main():
             if getattr(config.training, 'decay_regularization_weight', False):
                 logger.info(f"  Decay with LR: enabled")
                 logger.info(f"  Decay factor: {getattr(config.training, 'regularization_decay_factor', 0.5)}")
+                logger.info(f"  Min threshold: {getattr(config.training, 'min_regularization_weight', 1e-7):.2e}")
             else:
                 logger.info(f"  Decay with LR: disabled")
         logger.info("=" * 70)
