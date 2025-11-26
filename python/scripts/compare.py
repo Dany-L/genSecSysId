@@ -40,6 +40,8 @@ from sysid.data.direct_loader import load_csv_folder, load_split_data
 from sysid.models import SimpleLure
 from sysid.evaluation import compute_metrics
 
+UNSTAB_STAB_ZERO = [93, 4, 122]
+
 torch.set_default_dtype(torch.float64)
 
 # Configure logging
@@ -400,11 +402,12 @@ class RunComparator:
         logger.info(f"Plotting trajectory comparison for {num_samples} random samples...")
         
         # Select random sample indices
-        num_sequences = test_inputs.shape[0]
-        if num_sequences < num_samples:
-            sample_indices = list(range(num_sequences))
-        else:
-            sample_indices = np.random.choice(num_sequences, size=num_samples, replace=False).tolist()
+        # num_sequences = test_inputs.shape[0]
+        # if num_sequences < num_samples:
+        #     sample_indices = list(range(num_sequences))
+        # else:
+        #     sample_indices = np.random.choice(num_sequences, size=num_samples, replace=False).tolist()
+        sample_indices = UNSTAB_STAB_ZERO
         
         # Get predictions from all models
         predictions_dict = {}

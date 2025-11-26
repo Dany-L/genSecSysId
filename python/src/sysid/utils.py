@@ -3,8 +3,10 @@
 import torch
 import numpy as np
 import random
+import mlflow
 from typing import List, Optional
 import logging
+import matplotlib.pyplot as plt
 
 
 def set_seed(seed: int):
@@ -205,3 +207,101 @@ def plot_ellipse(ax, X:np.array,s: float, linetype: str = 'b--', name: str=r"$\f
     else:
         ax.plot(ellipse[0, :], ellipse[1, :], linetype, linewidth=2, 
             label=name)
+        
+
+def plot_predictions(
+        output_dir: str,
+        e_hat: np.ndarray,  # predicted output
+        e: np.ndarray,      # output (target)
+        d: Optional[np.ndarray] = None,  # input
+        num_samples: int = 5,
+        sample_indices: Optional[list] = None,
+        save_path: Optional[str] = None,
+        ax: Optional[plt.Axes] = None,
+        return_axes: bool = False,
+    )-> plt.Axes:
+        """
+        Plot predictions vs targets and optionally inputs.
+        
+        Args:
+            e_hat: Predicted output values
+            e: Output (target) values
+            d: Input values (optional)
+            num_samples: Number of samples to plot (used if sample_indices is None)
+            sample_indices: Specific sample indices to plot (overrides num_samples)
+            save_path: Path to save figure
+        """
+        if sample_indices is not None:
+            indices = sample_indices
+            num_samples = len(indices)
+        else:
+            num_samples = min(num_samples, e_hat.shape[0])
+            indices = list(range(num_samples))
+        
+        # Determine number of subplots
+        num_plots = 2 if d is not None else 1
+        
+        if ax is None:
+            fig, axes = plt.subplots(num_samples, num_plots, figsize=(12 * num_plots, 3 * num_samples))
+        else:
+            axes = ax
+        
+        if num_samples == 1:
+            axes = axes.reshape(1, -1) if num_plots > 1 else [[axes]]
+        elif num_plots == 1:
+            axes = axes.reshape(-1, 1)
+        
+        for i in range(num_samples):
+            # Use the actual index from the indices list
+            idx = indices[i]
+            
+            # Plot predictions vs targets
+            ax_pred = axes[i, 0] if num_plots > 1 else axes[i, 0]
+            
+            if e_hat.ndim == 3:
+                # Sequence data
+                seq_len = e_hat.shape[1]
+                for feat in range(e_hat.shape[2]):
+                    ax_pred.plot(e_hat[idx, :, feat], label=f"e_hat (predicted output, feat {feat})", alpha=0.7)
+                    ax_pred.plot(e[idx, :, feat], label=f"e (output, feat {feat})", linestyle="--", alpha=0.7)
+            else:
+                # Single-step data
+                ax_pred.plot(e_hat[idx], label="e_hat (predicted output)", alpha=0.7)
+                ax_pred.plot(e[idx], label="e (output)", linestyle="--", alpha=0.7)
+            
+            ax_pred.set_xlabel("Time Step")
+            ax_pred.set_ylabel("Output (e)")
+            ax_pred.set_title(f"Sample {idx}: Output Prediction")
+            ax_pred.legend()
+            ax_pred.grid(True, alpha=0.3)
+            
+            # Plot inputs if provided
+            if d is not None:
+                ax_input = axes[i, 1]
+                
+                if d.ndim == 3:
+                    # Sequence data
+                    for feat in range(d.shape[2]):
+                        ax_input.plot(d[idx, :, feat], label=f"d (input, feat {feat})", alpha=0.7)
+                else:
+                    ax_input.plot(d[idx], label="d (input)", alpha=0.7)
+                
+                ax_input.set_xlabel("Time Step")
+                ax_input.set_ylabel("Input (d)")
+                ax_input.set_title(f"Sample {idx}: Input Signal")
+                ax_input.legend()
+                ax_input.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        if save_path is None:
+            save_path = output_dir / "predictions_plot.png"
+        
+        if return_axes :
+            return fig, axes
+        else :
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            plt.close()
+
+        
+        # print(f"Predictions plot saved to {save_path}")

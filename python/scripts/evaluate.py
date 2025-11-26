@@ -15,6 +15,7 @@ from sysid.data import create_dataloaders, DataLoader, DataNormalizer
 from sysid.data.direct_loader import load_csv_folder, load_split_data
 from sysid.models import load_model
 from sysid.evaluation import Evaluator
+from sysid.utils import plot_predictions
 
 
 def setup_console_logging() -> logging.Logger:
@@ -406,8 +407,9 @@ def main():
                         num_random = min(4, len(other_indices))
                         random_indices = np.random.choice(other_indices, size=num_random, replace=False).tolist()
                         sample_indices.extend(random_indices)
-                    
-                    evaluator.plot_predictions(e_hat, e, d, sample_indices=sample_indices)
+
+                    plot_predictions(evaluator.output_dir, e_hat, e, d, sample_indices=sample_indices)
+                    # evaluator.plot_predictions(e_hat, e, d, sample_indices=sample_indices)
                     evaluator.analyze_errors(e_hat, e)
                     logger.info("Plots generated successfully")
                 except Exception as e_err:

@@ -32,6 +32,7 @@ from sysid.models import SimpleLure
 from sysid.config import Config
 from sysid.data.direct_loader import load_csv_folder, load_split_data
 
+
 torch.set_default_dtype(torch.float64)
 
 # Configure logging
@@ -48,6 +49,8 @@ TRAJECTORY_LIST = [
     2, 25, 47, 97, 101, 161, 255
 ]
 CONFIG_FILE_PATH = '~/genSecSysId-Data/configs/crnn_gen-sec.yaml'
+
+
 
 X_H_MAT_PATH = '~/genSecSysId-Data/data/X_H-param_from_mat.mat'
 
@@ -68,6 +71,13 @@ def parse_args():
         required=True,
         help='MLflow run ID of the trained model'
     )
+
+    parser.add_argument(
+        '--config',
+        type=str,
+        default=CONFIG_FILE_PATH,
+        help='Path to configuration file (YAML or JSON)'
+    )
     
     parser.add_argument(
         '--eps',
@@ -79,8 +89,8 @@ def parse_args():
     parser.add_argument(
         '--output-dir',
         type=str,
-        default='post_processed',
-        help='Output directory for post-processed results (default: post_processed)'
+        default='post_processing',
+        help='Output directory for post-processed results (default: post_processing)'
     )
     
     parser.add_argument(
@@ -104,7 +114,8 @@ def main():
     logger.info(f"Using MLflow tracking URI: {mlflow.get_tracking_uri()}")
 
     # Load configuration early so we can derive directories from config.root_dir
-    config_path = Path(CONFIG_FILE_PATH)
+    config_path = Path(args.config)
+    # config_path = Path(CONFIG_FILE_PATH)
     if config_path.suffix == ".yaml" or config_path.suffix == ".yml":
         config = Config.from_yaml(os.path.expanduser(config_path))
     elif config_path.suffix == ".json":
@@ -171,14 +182,14 @@ def main():
         mlflow.log_metric("post_process/cond_P_optimized", summary['optimized']['cond_P'])
         
         # Log parameter
-        mlflow.log_param("post_processed", True)
+        mlflow.log_param("post_processing", True)
         mlflow.log_param("post_process_eps", args.eps)
         
         # Save results to file
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        results_path = output_dir / f"post_processed_{args.run_id[:8]}.npz"
+        results_path = output_dir / f"post_processing_{args.run_id[:8]}.npz"
         np.savez(
             results_path,
             P_original=model.P.cpu().detach().numpy(),
@@ -201,11 +212,13 @@ def main():
         
         # Log results file to MLflow
         mlflow.log_artifact(str(results_path), artifact_path="post_processing")
+
+
         
         # Save and log updated model with different name
-        # model_path = output_dir / f"post_processed_model_{args.run_id[:8]}.pt"
+        # model_path = output_dir / f"post_processing_model_{args.run_id[:8]}.pt"
         # torch.save(model.state_dict(), model_path)
-        # mlflow.pytorch.log_model(model, name="model_post_processed")
+        # mlflow.pytorch.log_model(model, name="model_post_processing")
         
         # Generate ellipse/polytope plot if model is 2D
         if model.nx == 2:
@@ -227,8 +240,12 @@ def main():
                 fig, ax = plt.subplots(figsize=(8, 8))
 
                 for x, x_hat in zip(test_states, xs):
-                    ax.plot(x[0,0], x[0,1], 'x')
-                    ax.plot(x[:,0], x[:,1], '--')
+                    if np.linalg.norm(x[-1,:], ord=2) > np.linalg.norm(x[0,:], ord=2) and not (np.linalg.norm(x[0,:], ord=2) == 0.0):
+                        # diverging trajectory
+                        ax.plot(x[0,0], x[0,1], 'rx')
+                    else:
+                        ax.plot(x[0,0], x[0,1], 'go')
+                    # ax.plot(x[:,0], x[:,1], '--')
                     ax.plot(x_hat[:,0], x_hat[:,1])
 
                 ellipse_plot_path = output_dir / f"ellipse_polytope_post_{args.run_id[:8]}.png"
@@ -257,11 +274,14 @@ def main():
                     logger.info(f"Ellipse/polytope plot saved to {ellipse_plot_path}")
                     
                     # Log to MLflow
-                    mlflow.log_figure(fig, "post_processing/ellipse_polytope.png")
+                    mlflow.log_figure(fig, str(ellipse_plot_path.with_suffix('.png')))
                     plt.close(fig)
                     logger.info("Ellipse/polytope plot logged to MLflow")
                 else:
-                    mlflow.log_figure(fig, "post_processing/phase-space.png")
+                    ax.grid(True, alpha=0.3)
+                    ax.set_xlabel(r"$x_1$", fontsize=12)
+                    ax.set_ylabel(r"$x_2$", fontsize=12)
+                    mlflow.log_figure(fig, str(ellipse_plot_path.with_suffix('.png')))
                     tikzplotlib.save(str(ellipse_plot_path.with_suffix('.tex')))
                     mlflow.log_artifact(str(ellipse_plot_path.with_suffix('.tex')), artifact_path="post_processing")
                     plt.close(fig)
@@ -270,6 +290,38 @@ def main():
             except Exception as e:
                 logger.warning(f"Failed to generate ellipse/polytope plot: {e}")
         
+        # plot some prediction for handpicked trajectories 
+        logger.info(f"Generating prediction plot for trajectory...")
+        try:
+            from sysid.utils import plot_predictions
+            import matplotlib.pyplot as plt
+            import tikzplotlib
+            
+            with torch.no_grad():
+                e_hat = model(torch.tensor(test_inputs), torch.tensor(test_states[:,0,:]))
+
+            pred_plot_path = output_dir / f"prediction_trajectory_post_{args.run_id[:8]}.png"
+
+            fig, axes = plot_predictions(
+                output_dir=output_dir,
+                e_hat = e_hat,
+                e = test_outputs,
+                num_samples=3,
+                sample_indices=UNSTAB_STAB_ZERO,
+                save_path=pred_plot_path,
+                return_axes=True
+            )
+            
+            try:
+                tikzplotlib.save(str(pred_plot_path.with_suffix('.tex')))
+                mlflow.log_artifact(str(pred_plot_path.with_suffix('.tex')), artifact_path="post_processing")
+            except Exception as e:
+                logger.warning(f"Failed to save TikZ plot: {e}")
+            plt.close(fig)
+            logger.info(f"Prediction plot saved to {pred_plot_path}")
+        except Exception as e:
+                logger.warning(f"Failed to generate prediction plot for trajectory")
+
         logger.info(f"✓ Post-processing complete! Results saved to run: {args.run_id}")
 
 

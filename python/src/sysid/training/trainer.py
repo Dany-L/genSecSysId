@@ -23,7 +23,7 @@ from .losses import get_loss_function
 from .optimizers import get_optimizer, get_scheduler
 from ..evaluation.evaluator import Evaluator
 from ..utils import plot_ellipse_and_parallelogram
-
+from ..utils import plot_predictions
 
 class Trainer:
     """Trainer for RNN models."""
@@ -185,7 +185,7 @@ class Trainer:
         
         # Generate plot
         plot_path = temp_output_dir / f'{name}.png'
-        evaluator.plot_predictions(
+        plot_predictions(output_dir=evaluator.output_dir,
             e_hat=e_hat,
             e=e,
             d=d,
@@ -552,7 +552,7 @@ class Trainer:
                     # break
             
             # Early stopping based on regularization weight threshold
-            if self.decay_regularization_weight and self.regularization_weight <= self.min_regularization_weight:
+            if self.decay_regularization_weight and self.min_regularization_weight > 0 and self.regularization_weight <= self.min_regularization_weight:
                 pbar.write(f"\n⚠ Early stopping: Regularization weight reached minimum threshold ({self.min_regularization_weight:.2e})")
                 pbar.write(f"   Training has converged after {epoch + 1} epochs")
                 break
