@@ -1,0 +1,75 @@
+# RNN Baseline Configuration - Direct CSV Loading
+# Loads directly from original CSV files in train/test/validation folders
+
+# Data configuration - Direct folder loading
+data:
+  train_path: "~/genSecSysId-Data/data/prepared"  # Base folder containing train/, test/, validation/
+  input_col: "d"     # List of column names for system inputs
+  output_col: "e"              # Column name for system output
+  state_col: ["x_1", "x_2"]    # List of column names for system states
+  pattern: "*.csv"             # File pattern to match
+  normalize: false
+  normalization_method: "standard"  # "minmax" or "standard"
+  batch_size: 64
+  sequence_length: null        # null = use full sequences
+  shuffle: true
+  num_workers: 0
+
+# Model configuration - Simple RNN baseline
+model:
+  model_type: "crnn"  # "rnn", "lstm", "gru"
+  nw: 2
+  nx: 2
+  activation: "dzn"
+  custom_params:
+    learn_L: true
+
+
+# Optimizer configuration
+optimizer:
+  optimizer_type: "adam"
+  learning_rate: 0.002
+  weight_decay: 1.0e-5
+  use_scheduler: true
+  scheduler_type: "reduce_on_plateau"
+  scheduler_patience: 50
+  scheduler_factor: 0.8
+
+# Training configuration
+training:
+  max_epochs: 4000
+  early_stopping_patience: 4000
+  checkpoint_frequency: 500
+  gradient_clip_value: 1.0e3
+  loss_type: "mse"
+  use_custom_regularization: false
+  regularization_weight: 0.1
+  decay_regularization_weight: true  # Decay reg weight with learning rate
+  regularization_decay_factor: 0.1
+  device: "cpu"  # Change to "cpu" if no GPU
+  log_interval: 100
+  log_gradients: true
+
+# MLflow configuration
+mlflow:
+  tracking_uri: null  # Use local file-based tracking (no server needed)
+  experiment_name: "crnn-unstable"
+  run_name: null
+  log_models: true
+  log_artifacts: true
+
+# Evaluation configuration
+evaluation:
+  # List of metrics to compute and log during evaluation
+  # Available base metrics: mse, rmse, mae, r2, nrmse, max_error
+  # For sequence predictions, also available: <metric>_avg, <metric>_final
+  # Set to null or omit to use all metrics (default)
+  metrics:
+    - rmse      # Root Mean Squared Error
+    - nrmse     # Normalized RMSE
+
+# Paths
+root_dir: "~/genSecSysId-Data"
+
+# Reproducibility
+seed: 41
