@@ -32,7 +32,7 @@ genSecSysId/
 The `python/` directory contains a complete PyTorch-based system identification package with:
 
 - **Constrained RNN architectures** (CRNN) with Lyapunov certificates
-- **SimpleLure models** with sector-bounded nonlinearities
+- **SimpleLure models** with (generalized) sector-bounded nonlinearities
 - **Post-processing optimization** via semidefinite programming (SDP)
 - **MLflow integration** for experiment tracking
 - **Comprehensive evaluation** with stability visualization
@@ -80,7 +80,7 @@ See [`python/README.md`](python/README.md) for comprehensive documentation.
 
 ## Development
 
-> **Note**: This project was developed with assistance from GitHub Copilot and Claude (Anthropic) AI coding assistants for architecture design, implementation, and documentation. The constraint RNN models including the constraints where implemented by the author.
+> **Note**: This project was developed with assistance from GitHub Copilot and Claude (Anthropic) AI coding assistants for architecture design, implementation, and documentation. The constrained RNN models that are based on Lur'e type systems where implemented by the author. This includes the LMIs that are used to verify feasibility of the learned parameters.
 
 ### Python Package Development
 ```bash
