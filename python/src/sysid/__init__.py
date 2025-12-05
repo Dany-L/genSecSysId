@@ -2,10 +2,10 @@
 
 __version__ = "0.1.0"
 
-from .models import BaseRNN
 from .data import DataLoader, DataNormalizer
-from .training import Trainer
 from .evaluation import Evaluator
+from .models import BaseRNN
+from .training import Trainer
 
 __all__ = [
     "BaseRNN",

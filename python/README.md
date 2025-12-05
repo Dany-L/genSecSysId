@@ -4,17 +4,20 @@ RNN-based identification of nonlinear dynamical systems from data using PyTorch.
 
 ## Features
 
-- **Flexible RNN architectures**: SimpleRNN, LSTM, GRU with customizable layers
-- **Custom regularization**: Support for parameter constraints (Lipschitz bounds, stability, bounded parameters)
-- **Data preprocessing**: Automatic normalization (min-max, standard)
-- **Training utilities**: Early stopping, learning rate scheduling, gradient clipping
+- **Flexible RNN architectures**: SimpleRNN, LSTM, GRU, and Constrained RNN (CRNN) with Lyapunov certificates
+- **Custom regularization**: Support for parameter constraints (Lipschitz bounds, stability, sector bounds)
+- **Lyapunov stability**: SimpleLure models with certified stability regions and post-processing optimization
+- **Data preprocessing**: Automatic normalization (min-max, standard) with direct CSV folder loading
+- **Training utilities**: Early stopping, learning rate scheduling, gradient clipping, adaptive regularization
 - **MLflow integration**: Automatic experiment tracking and model versioning
 - **Comprehensive logging**: Timestamped log files for all operations (see [LOGGING.md](LOGGING.md))
-- **Evaluation tools**: Comprehensive metrics and visualization
+- **Evaluation tools**: Comprehensive metrics and visualization including Lyapunov certificate plots
 - **Configurable metrics**: Choose which evaluation metrics to compute and log (see [docs/EVALUATION_METRICS.md](docs/EVALUATION_METRICS.md))
-- **Model analysis**: Parameter inspection, stability checks, bound verification
+- **Model comparison**: Compare multiple trained models with trajectory and error analysis
 - **GPU support**: Automatic CUDA/MPS detection
 - **Testing**: Comprehensive pytest suite
+
+> **Note**: This package was developed with assistance from GitHub Copilot and Claude (Anthropic) AI coding assistants.
 
 ## Installation
 
@@ -31,6 +34,16 @@ pip install -e .
 cd python
 pip install -e ".[dev]"
 ```
+
+### Additional dependencies for Constrained RNN
+
+For SimpleLure models with Lyapunov certificate optimization (post-processing):
+
+```bash
+pip install cvxpy mosek
+```
+
+MOSEK requires a license (free for academia). See https://www.mosek.com/products/academic-licenses/
 
 ## Quick Start
 
@@ -63,109 +76,134 @@ Use the direct loading config (recommended for simplicity):
 python scripts/train.py --config configs/rnn_direct.yaml
 ```
 
+**Example configuration (Constrained RNN with Lyapunov certificate):**
+
+```yaml
+# configs/crnn_gen-sec.yaml
+data:
+  train_path: "~/genSecSysId-Data/data/prepared"  # Folder with train/test/validation
+  input_col: "d"        # Input column name
+  output_col: "e"       # Output column name
+  state_col: ["x_1", "x_2"]  # State column names
+  pattern: "*.csv"
+  batch_size: 64
+  normalize: false
+
+model:
+  model_type: "crnn"    # Constrained RNN with Lyapunov certificate
+  nw: 2                 # Hidden state dimension
+  nx: 2                 # State dimension
+  activation: "dzn"     # Dead-zone nonlinearity
+  custom_params:
+    learn_L: true       # Learn sector bound matrix L
+
+optimizer:
+  optimizer_type: "adam"
+  learning_rate: 0.002
+  use_scheduler: true
+  scheduler_type: "reduce_on_plateau"
+
+training:
+  max_epochs: 4000
+  use_custom_regularization: true
+  regularization_weight: 0.1
+  decay_regularization_weight: true  # Interior point method
+  min_regularization_weight: 0       # Set to 0 to disable early stopping
+  device: "cpu"
+
+mlflow:
+  experiment_name: "crnn-generalized-sector"
+  log_models: true
+
+evaluation:
+  metrics:
+    - rmse
+    - nrmse
+```
+
 **That's it!** The script will:
 - ✅ Load all CSV files from folders
 - ✅ Normalize data during training
 - ✅ Track experiments with MLflow
 - ✅ Save best model automatically
+- ✅ Train with stability constraints (for CRNN models)
 
-### 3. Alternative: Single CSV files
+### 3. Evaluate and visualize
 
-If you prefer single-file datasets:
+Evaluate on test data:
 
-```yaml
-# configs/your_config.yaml
-data:
-  train_path: "data/prepared/train.csv"
-  val_path: "data/prepared/val.csv"
-  test_path: "data/prepared/test.csv"
-  batch_size: 32
-  normalize: true
-
-model:
-  model_type: "lstm"
-  input_size: 1
-  hidden_size: 64
-  output_size: 1
-  num_layers: 2
-
-training:
-  max_epochs: 500
-  early_stopping_patience: 30
-  learning_rate: 0.001
-```
-
-Then train:
-
-```bash
-python scripts/train.py --config configs/your_config.yaml
-```
-
-### 4. Evaluate the model
-
-**Folder path (recommended):**
 ```bash
 python scripts/evaluate.py \
-    --config configs/rnn_baseline.yaml \
-    --model models/rnn_baseline/best_model.pt \
-    --test-data data/prepared/test
+    --config configs/crnn_gen-sec.yaml \
+    --run-id <run_id_from_mlflow> \
+    --test-data ~/genSecSysId-Data/data/prepared/test
 ```
 
-**Or single CSV file:**
+For SimpleLure models (CRNN with nx=2), this automatically generates:
+- Performance metrics (RMSE, NRMSE, etc.)
+- Lyapunov ellipse and sector bound polytope visualization
+
+### 4. Post-process for optimal Lyapunov certificate (optional)
+
+For SimpleLure models, optimize P and L matrices via SDP:
+
 ```bash
-python scripts/evaluate.py \
-    --config configs/rnn_baseline.yaml \
-    --model models/rnn_baseline/best_model.pt \
-    --test-data data/test.csv
+# Feasibility: find valid P and L
+python scripts/post_process.py \
+    --run-id <run_id> \
+    --config configs/crnn_gen-sec.yaml
+
+# Optimization: minimize s for tightest certificate
+python scripts/post_process.py \
+    --run-id <run_id> \
+    --config configs/crnn_gen-sec.yaml \
+    --optimize-s
 ```
+
+This solves a semidefinite program to find the optimal Lyapunov certificate while keeping the trained dynamics (A, B, C, D) fixed.
 
 ### 5. Compare multiple models
 
 ```bash
 python scripts/compare.py \
     --run-ids <run_id_1> <run_id_2> <run_id_3> \
-    --test-data data/prepared/test \
+    --test-data ~/genSecSysId-Data/data/prepared/test \
     --output-dir comparisons/my_comparison
 ```
 
 This generates:
 - Summary table with parameters and metrics
 - Evaluation metrics comparison
-- Training curves for each run
-- Validation loss comparison plot
+- Training and validation loss curves
+- Trajectory comparison (ground truth vs predictions)
+- Absolute error plots over time
 
-### 6. Post-process a model (Optional)
+### 6. Additional utilities
 
-For SimpleLure models, you can solve an SDP to optimize P and L while keeping A, B, C, D fixed:
-
-**Using the script:**
+**Export models to MATLAB:**
 ```bash
-# Feasibility: find valid P and L
-python scripts/post_process.py --run-id <run_id>
-
-# Optimization: minimize s for tightest certificate
-python scripts/post_process.py --run-id <run_id> --optimize-s
+python scripts/export_for_matlab.py --run-id <run_id> --output models/model.mat
 ```
 
-**Or call the method directly:**
-```python
-model = mlflow.pytorch.load_model(f"runs:/{run_id}/model")
-result = model.post_process(optimize_s=True)
-# Model is automatically updated with optimized P, L
+**Generate pedagogical plots:**
+```bash
+# Local stability motivation (damped pendulum)
+python scripts/plot_local_stability_motivation.py --c 1.0 --output-dir figures
 ```
 
-## Data Loading Options
+## Data Loading
 
-The package supports two flexible loading methods:
+The package uses **direct CSV folder loading** (recommended):
 
-### 1. Direct Folder Loading (Recommended!)
 ```yaml
 data:
-  train_path: "data/prepared"  # Folder with train/test/validation subfolders
+  train_path: "~/genSecSysId-Data/data/prepared"  # Folder with train/test/validation subfolders
   input_col: "d"               # Column name for input
   output_col: "e"              # Column name for output
+  state_col: ["x_1", "x_2"]    # Optional: state column names (for evaluation)
   pattern: "*.csv"             # File pattern
 ```
+
 ✅ **No preprocessing** - loads directly from original CSV files  
 ✅ **No duplication** - uses original files only  
 ✅ **Simpler workflow** - one step  
@@ -173,58 +211,51 @@ data:
 
 See [docs/DIRECT_LOADING.md](docs/DIRECT_LOADING.md) for details.
 
-### 2. Single CSV Files
-```yaml
-data:
-  train_path: "data/prepared/train.csv"
-  val_path: "data/prepared/val.csv"
-  test_path: "data/prepared/test.csv"
-```
-✅ **Simple** - one file per split  
-⚠️ **Manual splitting** - need to combine sequences first  
-⚠️ **Manual paths** - need to specify train/val/test separately  
-
 ## Project Structure
 
 ```
 python/
 ├── src/sysid/              # Main package
 │   ├── config.py           # Configuration management
-│   ├── utils.py            # Utility functions
+│   ├── utils.py            # Utility functions (visualization, Lyapunov plots)
 │   ├── data/               # Data loading and preprocessing
 │   │   ├── dataset.py      # PyTorch Dataset
 │   │   ├── direct_loader.py # Direct CSV folder loading (recommended)
-│   │   ├── loader.py       # Legacy single-file CSV loader
 │   │   └── normalizer.py   # Data normalization
 │   ├── models/             # Model architectures
 │   │   ├── base.py         # Base RNN class
 │   │   ├── rnn.py          # RNN implementations (Simple/LSTM/GRU)
+│   │   ├── constrained_rnn.py  # SimpleLure with Lyapunov certificates
 │   │   └── regularization.py  # Custom regularization
 │   ├── training/           # Training utilities
-│   │   ├── trainer.py      # Main trainer class
+│   │   ├── trainer.py      # Main trainer class with adaptive mechanisms
 │   │   ├── losses.py       # Loss functions
 │   │   └── optimizers.py   # Optimizer setup
 │   └── evaluation/         # Evaluation utilities
 │       ├── evaluator.py    # Main evaluator class
 │       └── metrics.py      # Evaluation metrics
 ├── scripts/                # Main scripts
-│   ├── train.py           # Training script (auto-detects folder/CSV)
-│   ├── evaluate.py        # Evaluation script (supports folder/CSV)
+│   ├── train.py           # Training script
+│   ├── evaluate.py        # Evaluation script with Lyapunov visualization
 │   ├── compare.py         # Compare multiple MLflow runs
-│   ├── post_process.py    # Post-process models (optimize P/L only)
+│   ├── post_process.py    # Post-process models (SDP optimization for P/L)
 │   ├── export_for_matlab.py  # Export models to MATLAB .mat format
+│   ├── plot_local_stability_motivation.py  # Pedagogical phase portrait
 │   └── generate_sample_data.py  # Generate sample data for testing
 ├── tests/                 # Unit tests
 ├── configs/               # Example configurations
-│   ├── rnn_baseline.yaml  # Baseline config with direct folder loading
-│   ├── rnn_direct.yaml    # Alternative direct loading config
-│   └── lstm_baseline.yaml # LSTM example config
+│   ├── rnn_baseline.yaml  # Simple RNN baseline
+│   ├── lstm_baseline.yaml # LSTM baseline
+│   ├── constrained_rnn_lmi.yaml  # CRNN with LMI constraints
+│   └── constrained_rnn_dual.yaml # CRNN with dual regularization
 ├── docs/                  # Documentation
 │   ├── README.md          # Documentation index
 │   ├── DIRECT_LOADING.md  # Guide for direct CSV loading
-│   ├── CSV_VS_NPY.md      # Format comparison
-│   └── QUICKSTART_DIRECT.md # Quick start guide
-└── setup.py              # Package setup
+│   ├── REGULARIZATION_QUICK_START.md  # Regularization guide
+│   └── EVALUATION_METRICS.md  # Metrics documentation
+├── setup.py              # Package setup
+├── requirements.txt      # Python dependencies
+└── README.md            # This file
 ```
 
 ## Advanced Usage
@@ -373,15 +404,3 @@ See [LOGGING.md](LOGGING.md) for complete logging documentation and [FILE_ORGANI
 ## License
 
 See LICENSE file.
-
-## Citation
-
-If you use this package, please cite:
-
-```bibtex
-@software{sysid2025,
-  title = {System Identification with RNNs},
-  author = {Your Name},
-  year = {2025},
-}
-```

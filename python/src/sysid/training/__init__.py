@@ -1,8 +1,8 @@
 """Training utilities."""
 
-from .trainer import Trainer
 from .losses import get_loss_function
 from .optimizers import get_optimizer, get_scheduler
+from .trainer import Trainer
 
 __all__ = [
     "Trainer",

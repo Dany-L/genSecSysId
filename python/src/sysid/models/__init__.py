@@ -1,10 +1,10 @@
 """Neural network models for system identification."""
 
 from .base import BaseRNN
-from .rnn import SimpleRNN, LSTM, GRU
 from .constrained_rnn import SimpleLure
-from .regularization import parameter_regularization
 from .factory import create_model, load_model, save_model
+from .regularization import parameter_regularization
+from .rnn import GRU, LSTM, SimpleRNN
 
 __all__ = [
     "BaseRNN",

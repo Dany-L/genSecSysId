@@ -1,13 +1,14 @@
 """Optimizer and learning rate scheduler utilities."""
 
+from typing import Literal
+
 import torch.optim as optim
 from torch.optim.lr_scheduler import (
-    StepLR,
+    CosineAnnealingLR,
     ExponentialLR,
     ReduceLROnPlateau,
-    CosineAnnealingLR,
+    StepLR,
 )
-from typing import Literal
 
 
 def get_optimizer(
@@ -15,18 +16,18 @@ def get_optimizer(
     optimizer_type: Literal["adam", "sgd", "rmsprop", "adamw"] = "adam",
     learning_rate: float = 1e-3,
     weight_decay: float = 0.0,
-    **kwargs
+    **kwargs,
 ):
     """
     Get optimizer by name.
-    
+
     Args:
         parameters: Model parameters
         optimizer_type: Type of optimizer
         learning_rate: Learning rate
         weight_decay: Weight decay (L2 regularization)
         **kwargs: Additional optimizer-specific arguments
-        
+
     Returns:
         Optimizer instance
     """
@@ -64,17 +65,19 @@ def get_optimizer(
 
 def get_scheduler(
     optimizer,
-    scheduler_type: Literal["step", "exponential", "reduce_on_plateau", "cosine"] = "reduce_on_plateau",
-    **kwargs
+    scheduler_type: Literal[
+        "step", "exponential", "reduce_on_plateau", "cosine"
+    ] = "reduce_on_plateau",
+    **kwargs,
 ):
     """
     Get learning rate scheduler.
-    
+
     Args:
         optimizer: Optimizer instance
         scheduler_type: Type of scheduler
         **kwargs: Scheduler-specific arguments
-        
+
     Returns:
         Scheduler instance or None
     """
