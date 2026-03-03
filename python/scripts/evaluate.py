@@ -14,6 +14,7 @@ import torch
 from sysid.config import Config
 from sysid.data import DataLoader, DataNormalizer, create_dataloaders
 from sysid.data.direct_loader import load_csv_folder, load_split_data
+from sysid.data.loader import collate_with_optional_states
 from sysid.evaluation import Evaluator
 from sysid.models import load_model
 from sysid.utils import plot_predictions
@@ -316,7 +317,9 @@ def main():
     test_loader = TorchDataLoader(
         test_dataset,
         batch_size=config.data.batch_size,
+        # batch_size=1,
         shuffle=False,
+        collate_fn=collate_with_optional_states,
     )
 
     # Load model

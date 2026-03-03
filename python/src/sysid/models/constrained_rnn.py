@@ -1,4 +1,6 @@
 import logging
+import os
+from pathlib import Path
 from typing import Optional
 
 import cvxpy as cp
@@ -33,18 +35,26 @@ class SimpleLure(nn.Module):
         """
         super().__init__()
         nz = nw
-        self.nx = nx
+        
+        # Check if state padding is enabled (default: True)
+        pad_state = custom_params.get("pad_state", True) if custom_params is not None else True
+        
+        # Store original dataset state dimension
+        self.nx_data = nx
+        # Optionally pad state dimension to match nz
+        self.nx = nz if pad_state else nx
         self.nd = nd
         self.ne = ne
         self.nw = nw
         self.nz = nz
+        self.pad_state = pad_state
 
         # Register delta and max_norm_x0 as buffers (saved with model, not trainable)
         self.register_buffer("delta", torch.tensor(delta))
         self.register_buffer("max_norm_x0_buffer", torch.tensor(max_norm_x0))
         self.max_norm_x0 = max_norm_x0  # Keep as attribute for compatibility
 
-        self.P = nn.Parameter(torch.eye(nx))  # Lyapunov matrix
+        self.P = nn.Parameter(torch.eye(self.nx))  # Lyapunov matrix
         if custom_params is not None:
             learn_L = custom_params.get("learn_L", True)
             self.regularization_method = custom_params.get(
@@ -79,15 +89,15 @@ class SimpleLure(nn.Module):
         self.la = nn.Parameter(torch.ones(nz))
         self.M = torch.diag(self.la)
 
-        self.A = nn.Parameter(torch.zeros(nx, nx))
-        self.B = nn.Parameter(torch.zeros(nx, nd))
-        self.B2 = nn.Parameter(torch.zeros(nx, nw))
+        self.A = nn.Parameter(torch.zeros(self.nx, self.nx))
+        self.B = nn.Parameter(torch.zeros(self.nx, nd))
+        self.B2 = nn.Parameter(torch.zeros(self.nx, nw))
 
-        self.C = nn.Parameter(torch.zeros(ne, nx))
+        self.C = nn.Parameter(torch.zeros(ne, self.nx))
         self.D = nn.Parameter(torch.zeros(ne, nd))
         self.D12 = nn.Parameter(torch.zeros(ne, nw))
 
-        self.C2 = nn.Parameter(torch.zeros(nz, nx))
+        self.C2 = nn.Parameter(torch.zeros(nz, self.nx))
         self.D21 = nn.Parameter(torch.zeros(nz, nd))
         self.D22 = nn.Parameter(torch.zeros(nz, nw))
 
@@ -120,56 +130,243 @@ class SimpleLure(nn.Module):
     def reset_s(self):
         self.s.data = torch.sqrt(self.delta**2 / (1 - self.alpha**2)).squeeze()
 
-    def initialize_parameters(self, train_inputs, train_states, train_outputs):
-        """Initialize parameters with small random values."""
+    def initialize_parameters(self, train_inputs, train_states, train_outputs, n_restarts: int = 5, data_dir: Optional[str] = None):
+        """
+        Initialize parameters, preferring N4SID parameters if available.
 
-        # 1. extract delta from training data delta = max ||d|| and pick s
-        # actually this is done in the init already
+        If `data_dir` is provided and contains a file ``n4sid_params.mat``, the
+        A, B, C, D matrices are loaded from that file (MATLAB idss format) and
+        used directly — giving a linear initialization that exactly matches the
+        N4SID model.  B2 is kept zero so the model starts fully linear.
+        The SDP is then run (keeping A and B fixed) to obtain feasible P, L.
 
-        # 2. calculate s based on delta and alpha
-        # self.s.data = torch.sqrt(self.delta**2 /(1-self.alpha**2)).squeeze()
+        If no ``n4sid_params.mat`` is found, the method falls back to the
+        random Echo State Network (ESN) reservoir search:
+        1. Try `n_restarts` random reservoirs (A, C2) — cheap (no SDP).
+           For each, simulate and fit C, D, D12 via least squares. Keep the one
+           with the lowest training MSE.
+        2. Run the SDP exactly once on the best reservoir to obtain feasible
+           B, D21, P, L.
+        3. Re-simulate with the SDP-updated B, D21 and refit C, D, D12.
+        """
+        # ── 0. Compute s ────────────────────────────────────────────────────────
         self.s.data = torch.sqrt(self.delta**2 / (1 - self.alpha**2)).squeeze()
-        # self.s.data = torch.tensor(1.0)
 
-        # 3. choose A to be stable, C2 random but large and get B, D21, P, L and M from solving the analysis problem
-        self.A.data = 0.9 * torch.eye(self.nx)
-        min_val, max_val = -1, 1
-        nn.init.uniform_(self.C2, a=min_val, b=max_val)
-        self.analysis_problem_init(learn_B_and_D21=True)
+        Bs, N, _ = train_inputs.shape  # batch_size, seq_len, nd
 
-        # 5. set C, D, and D12 based on least squares
-        # turns out the fixed choice works just fine, so we switched the order to get some results such that we can check if the condition on the input is satisfied
-        self.D12.data = torch.zeros(self.ne, self.nw)
-        self.D.data = torch.zeros(self.ne, self.nd)
-        self.C.data = torch.zeros(self.ne, self.nx)
-        self.C.data[:, 0] = torch.ones(self.ne)
+        # ── Optional: load N4SID parameters from mat file ───────────────────────
+        n4sid_loaded = False
+        if data_dir is not None:
+            from scipy.io import loadmat
+            mat_path = Path(os.path.expanduser(data_dir)) / "n4sid_params.mat"
+            if mat_path.exists():
+                logger.info(f"Found n4sid_params.mat at {mat_path} — loading N4SID parameters")
+                try:
+                    mat = loadmat(str(mat_path), squeeze_me=True, struct_as_record=False)
 
-        # 4. simulate the system to get x and w
-        with torch.no_grad():
-            B, N, _ = train_inputs.shape
-            # x0_1 = torch.tensor(train_states[0,0,:].reshape(1,self.nx,1))
-            # d_1 = torch.tensor(train_inputs[0,:,:].reshape(1,N,self.nd,1))
-            x0s = torch.tensor(train_states[:, 0, :].reshape(B, self.nx, 1))
-            ds = torch.tensor(train_inputs.reshape(B, N, self.nd, 1))
-            xs, (xs, ws) = self.lure.forward(x0=x0s, d=ds, return_states=True)
+                    # Support both direct keys and a nested idss/struct object
+                    def _extract(key):
+                        if key in mat:
+                            return np.atleast_2d(np.array(mat[key], dtype=np.float64))
+                        # Search inside any top-level struct
+                        for v in mat.values():
+                            if hasattr(v, key):
+                                return np.atleast_2d(np.array(getattr(v, key), dtype=np.float64))
+                        raise KeyError(f"Key '{key}' not found in {mat_path}")
+
+                    A_n4 = _extract("A")
+                    B_n4 = _extract("B").T if self.nd == 1 else _extract("B")
+                    C_n4 = _extract("C")
+                    D_n4 = _extract("D")
+
+                    # Dimension checks
+                    if A_n4.shape != (self.nx, self.nx):
+                        raise ValueError(
+                            f"N4SID A has shape {A_n4.shape}, expected ({self.nx}, {self.nx}). "
+                            "Check that nw in the config matches the N4SID model order."
+                        )
+                    if B_n4.shape != (self.nx, self.nd):
+                        raise ValueError(
+                            f"N4SID B has shape {B_n4.shape}, expected ({self.nx}, {self.nd})."
+                        )
+                    if C_n4.shape != (self.ne, self.nx):
+                        raise ValueError(
+                            f"N4SID C has shape {C_n4.shape}, expected ({self.ne}, {self.nx})."
+                        )
+                    if D_n4.shape != (self.ne, self.nd):
+                        raise ValueError(
+                            f"N4SID D has shape {D_n4.shape}, expected ({self.ne}, {self.nd})."
+                        )
+
+                    # Set parameters from N4SID
+                    self.A.data  = torch.tensor(A_n4)
+                    self.B.data  = torch.tensor(B_n4)
+                    self.C.data  = torch.tensor(C_n4)
+                    self.D.data  = torch.tensor(D_n4)
+                    # self.B2.data = torch.zeros_like(self.B2)   # keep linear
+                    self.B2.data = torch.tensor(np.random.randn(self.nx, self.nw) * 0.01)  # small random B2 to break symmetry
+
+                    # Random C2 scaled to avoid saturation (needed for constraint structure)
+                    self.C2.data = torch.tensor(
+                        # np.random.randn(self.nz, self.nx) / np.sqrt(self.nx)
+                        np.random.randn(self.nz, self.nx)
+                    )
+
+                    self.D12.data = torch.tensor(
+                        np.random.randn(self.ne, self.nw)
+                    )
+                    logger.info(
+                        f"N4SID matrices loaded. "
+                        f"||A||={np.linalg.norm(A_n4):.4f}, "
+                        f"||B||={np.linalg.norm(B_n4):.4f}, "
+                        f"||C||={np.linalg.norm(C_n4):.4f}, "
+                        f"||D||={np.linalg.norm(D_n4):.4f}"
+                    )
+
+                    # Run SDP keeping A and B fixed
+                    constraints_ok = self.check_constraints()
+                    logger.info(f"N4SID initialization complete. Constraints satisfied: {constraints_ok}")
+                    n4sid_loaded = True
+
+                    self.analysis_problem_init(learn_B=True, learn_D21=True)
+
+                except (KeyError, ValueError) as e:
+                    logger.warning(f"Could not load N4SID parameters: {e} — falling back to ESN init")
+            else:
+                logger.info(f"No n4sid_params.mat found in {data_dir} — using ESN initialization")
+
+        # Prepare initial states and input tensor (always needed for final simulation / plotting)
+        x0s = torch.zeros(Bs, self.nx, 1)
+        if train_states is not None:
+            x0s_data = torch.tensor(train_states[:, 0, :].reshape(Bs, self.nx_data, 1))
+            x0s[:, :self.nx_data, :] = x0s_data
+        else:
+            x0s = torch.randn(Bs, self.nx, 1) * self.max_norm_x0
+
+        ds = torch.tensor(train_inputs.reshape(Bs, N, self.nd, 1))
+
+        if not n4sid_loaded:
+            # ── ESN reservoir search (no SDP) ────────────────────────────────────
+            y_target  = torch.tensor(train_outputs.reshape(Bs * N, self.ne))
+            alpha_val = float(self.alpha.item())
+            delta_val = float(self.delta.item())
+
+            best_mse = float("inf")
+            best_reservoir = None  # stores (A, B, B2, C2, D21) as numpy arrays
+
+            for trial in range(n_restarts):
+                # Random A with spectral radius = alpha_val (rich, diverse dynamics)
+                A_rand = np.random.randn(self.nx, self.nx)
+                rho = np.max(np.abs(np.linalg.eigvals(A_rand)))
+                A_rand = (alpha_val / max(rho, 1e-8)) * A_rand
+
+                # B2 = 0: keep initialization linear (nonlinearity feedback optimized during training)
+                B2_rand = np.zeros((self.nx, self.nw))
+
+                # Random B: scaled by input amplitude / sqrt(nx)
+                B_rand = np.random.randn(self.nx, self.nd) * (delta_val / max(np.sqrt(self.nx), 1.0))
+
+                # Random C2 scaled to avoid saturation (pre-activation ~ O(1))
+                C2_rand = np.random.randn(self.nz, self.nx) / np.sqrt(self.nx)
+
+                # Small D21
+                D21_rand = np.random.randn(self.nz, self.nd) * 0.01
+
+                # Temporarily set params
+                self.A.data   = torch.tensor(A_rand)
+                self.B.data   = torch.tensor(B_rand)
+                self.B2.data  = torch.tensor(B2_rand)
+                self.C2.data  = torch.tensor(C2_rand)
+                self.D21.data = torch.tensor(D21_rand)
+
+                # Simulate
+                with torch.no_grad():
+                    _, (xs, ws) = self.lure.forward(x0=x0s, d=ds, return_states=True)
+
+                # Least squares: fit C, D, D12
+                x_flat = xs[:, :N, :, :].squeeze(-1).reshape(Bs * N, self.nx)
+                w_flat = ws.squeeze(-1).reshape(Bs * N, self.nw)
+                u_flat = ds.squeeze(-1).reshape(Bs * N, self.nd)
+                regr   = torch.cat([x_flat, u_flat, w_flat], dim=1)
+                sol    = torch.linalg.lstsq(regr, y_target).solution
+                y_hat  = regr @ sol
+                mse    = float(torch.mean((y_hat - y_target) ** 2))
+
+                logger.info(f"  ESN init trial {trial + 1}/{n_restarts}: train MSE = {mse:.6e}")
+
+                if mse < best_mse:
+                    best_mse = mse
+                    best_reservoir = dict(
+                        A=A_rand.copy(), B=B_rand.copy(), B2=B2_rand.copy(),
+                        C2=C2_rand.copy(), D21=D21_rand.copy(),
+                    )
+
+            logger.info(f"Best reservoir MSE: {best_mse:.6e}. Running SDP for feasibility...")
+
+            # ── SDP: get feasible B, D21, P, L for best reservoir ────────────────
+            self.A.data   = torch.tensor(best_reservoir["A"])
+            self.B2.data  = torch.tensor(best_reservoir["B2"])
+            self.C2.data  = torch.tensor(best_reservoir["C2"])
+            self.B.data   = torch.tensor(best_reservoir["B"])
+            self.D21.data = torch.tensor(best_reservoir["D21"])
+
+            self.analysis_problem_init(learn_B=True, learn_D21=True)
+
+            # ── Re-simulate and refit C, D, D12 with SDP-updated B, D21 ─────────
+            with torch.no_grad():
+                _, (xs, ws) = self.lure.forward(x0=x0s, d=ds, return_states=True)
+
+                x_flat = xs[:, :N, :, :].squeeze(-1).reshape(Bs * N, self.nx)
+                w_flat = ws.squeeze(-1).reshape(Bs * N, self.nw)
+                u_flat = ds.squeeze(-1).reshape(Bs * N, self.nd)
+                y_flat = train_outputs.reshape(Bs * N, self.ne)
+
+                regression_matrix = torch.cat([x_flat, u_flat, w_flat], dim=1)
+                solution = torch.linalg.lstsq(
+                    regression_matrix, torch.tensor(y_flat)
+                ).solution
+
+                self.C.data   = solution[: self.nx, :].T
+                self.D.data   = solution[self.nx : self.nx + self.nd, :].T
+                self.D12.data = solution[self.nx + self.nd :, :].T
+
+                final_mse = float(
+                    torch.mean(
+                        (regression_matrix @ solution - torch.tensor(y_flat)) ** 2
+                    )
+                )
+                logger.info(f"Initialization complete. Final train MSE (with SDP B,D21): {final_mse:.6e}")
+                logger.info(f"  C norm: {torch.norm(self.C).item():.6f}")
+                logger.info(f"  D norm: {torch.norm(self.D).item():.6f}")
+                logger.info(f"  D12 norm: {torch.norm(self.D12).item():.6f}")
+        else:
+            # N4SID path: just simulate to get xs for visualization
+            with torch.no_grad():
+                _, (xs, ws) = self.lure.forward(x0=x0s, d=ds, return_states=True)
 
         X = np.linalg.inv(self.P.cpu().detach().numpy())
         H = self.L.cpu().detach().numpy() @ X
 
-        fig, ax = plot_ellipse_and_parallelogram(
-            X, H, self.s.cpu().detach().numpy(), self.max_norm_x0
-        )
-        for x0i in x0s:
-            ax.plot(
-                x0i[0].cpu().detach().numpy(),
-                x0i[1].cpu().detach().numpy(),
-                "x",
-                color="red",
-                markersize=2,
-            )
 
-        for xi in xs:
-            ax.plot(xi[:20, 0].cpu().detach().numpy(), xi[:20, 1].cpu().detach().numpy())
+        if self.nx ==2 :
+            fig, ax = plot_ellipse_and_parallelogram(
+                X, H, self.s.cpu().detach().numpy(), self.max_norm_x0
+            )
+            for x0i in x0s:
+                ax.plot(
+                    x0i[0].cpu().detach().numpy(),
+                    x0i[1].cpu().detach().numpy(),
+                    "x",
+                    color="red",
+                    markersize=2,
+                )
+
+            for xi in xs:
+                ax.plot(xi[:20, 0].cpu().detach().numpy(), xi[:20, 1].cpu().detach().numpy())
+        else:
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(figsize=(8, 8))
+            
 
         self.check_constraints()
 
@@ -177,7 +374,7 @@ class SimpleLure(nn.Module):
 
     def analysis_problem(self, learn_B_and_D21: bool = False) -> bool:
 
-        eps = 1e-3
+        eps = 1e-6
 
         P = cp.Variable((self.nx, self.nx), symmetric=True)
         la = cp.Variable((self.nz, 1))
@@ -253,9 +450,9 @@ class SimpleLure(nn.Module):
 
         return True  # SDP successfully found feasible solution
 
-    def analysis_problem_init(self, learn_B_and_D21: bool = False) -> bool:
+    def analysis_problem_init(self, learn_B: bool= False, learn_D21: bool = False) -> bool:
 
-        eps = 1e-3
+        eps = 1e-6
 
         P = cp.Variable((self.nx, self.nx), symmetric=True)
         la = cp.Variable((self.nz, 1))
@@ -263,11 +460,13 @@ class SimpleLure(nn.Module):
         A = self.A.cpu().detach().numpy()
         # s_hat = cp.Variable((1,1))
         # B = self.B.cpu().detach().numpy()
-        if learn_B_and_D21:
+        if learn_B:
             B = cp.Variable(self.B.shape)
-            D21 = cp.Variable(self.D21.shape)
         else:
             B = self.B.cpu().detach().numpy()
+        if learn_D21:
+            D21 = cp.Variable(self.D21.shape)
+        else:
             D21 = self.D21.cpu().detach().numpy()
         B2 = self.B2.cpu().detach().numpy()
         C2 = self.C2.cpu().detach().numpy()
@@ -280,6 +479,7 @@ class SimpleLure(nn.Module):
         #     s = np.sqrt(delta**2/(1-alpha**2)).squeeze()
 
         # D21 = self.D21.cpu().detach().numpy()
+        # s_tilde = cp.Variable((1,1))
 
         multiplier_constraints = []
         if self.learn_L:
@@ -295,6 +495,15 @@ class SimpleLure(nn.Module):
                     )
                     >> eps * np.eye(self.nx + 1)
                 )
+                # multiplier_constraints.append(
+                #     cp.bmat(
+                #         [
+                #             [s_tilde, li],
+                #             [li.T, P],
+                #         ]
+                #     )
+                #     >> eps * np.eye(self.nx + 1)
+                # )
         else:
             L = self.L.cpu().detach().numpy()
 
@@ -312,25 +521,33 @@ class SimpleLure(nn.Module):
         nF = F.shape[0]
         problem = cp.Problem(
             cp.Minimize([None]),
-            [F << -eps * np.eye(nF), *multiplier_constraints, *init_constraints],
+            # cp.Minimize(s_tilde),
+            [
+                F << -eps * np.eye(nF), 
+                *multiplier_constraints, 
+                # *init_constraints
+            ],
         )
         try:
             problem.solve(solver=cp.MOSEK)
         except Exception:
             return False  # SDP failed due to solver error
         if not problem.status == "optimal":
-            return False  # SDP failed to find feasible solution
+            return False  # SDP failed to find feasible solution    
         logger.info(f"SDP analysis problem solved: {problem.status}")
 
         self.P.data = torch.tensor(P.value)
         self.M.data = torch.tensor(M.value)
         if self.learn_L:
             self.L.data = torch.tensor(L.value)
-        if learn_B_and_D21:
+        if learn_B:
             self.B.data = torch.tensor(B.value)
+        if learn_D21:
             self.D21.data = torch.tensor(D21.value)
 
-        self.s.data = torch.tensor(s)
+        # self.s.data = torch.tensor(s)
+        # self.s.data = torch.tensor(np.sqrt(1 / s_tilde.value).squeeze())
+        # self.delta = torch.tensor(np.sqrt((1 - alpha**2) * s**2).squeeze())
 
         return True  # SDP successfully found feasible solution
 
@@ -415,6 +632,8 @@ class SimpleLure(nn.Module):
             d: Input tensor (batch, seq_len, input_size)
             w: Nonlinearity input tensor (batch, seq_len, nw)
             hidden_state: Hidden state (num_layers, batch, hidden_size)
+            x0: Initial state (batch, nx_data) or (batch, nx, 1). If nx_data dimension,
+                will be padded with zeros to nx dimension.
 
         Returns:
             e_hat: Predicted output (batch, seq_len, output_size)
@@ -423,7 +642,18 @@ class SimpleLure(nn.Module):
         B, N, nd = d.shape  # number of batches, length of sequence, input size
         assert self.lure._nd == nd
         if x0 is None:
-            x0 = torch.zeros(size=(B, self.nx))
+            x0 = torch.zeros(size=(B, self.nx, 1))
+            # x0 = torch.randn((B, self.nx, 1)) * 2 * self.max_norm_x0 - self.max_norm_x0
+            # x0 = torch.random.uniform(-self.max_norm_x0, self.max_norm_x0, size=(B, self.nx, 1))
+        else:
+            # Handle padding if pad_state is enabled and x0 comes from dataset (nx_data dimension)
+            if self.pad_state and x0.shape[1] == self.nx_data:
+                x0_padded = torch.zeros(B, self.nx, 1, device=x0.device, dtype=x0.dtype)
+                if x0.ndim == 2:
+                    x0_padded[:, :self.nx_data, 0] = x0
+                else:  # Already has shape (B, nx_data, 1)
+                    x0_padded[:, :self.nx_data, :] = x0
+                x0 = x0_padded
         ds = d.reshape(shape=(B, N, nd, 1))
         es_hat, x = self.lure.forward(x0=x0, d=ds, return_states=return_state)
         # return (
@@ -431,9 +661,9 @@ class SimpleLure(nn.Module):
         #     (x.reshape(B, self.nx),),
         # )
         if return_state:
-            return es_hat.reshape(B, N, self.lure._nd), x
+            return es_hat.reshape(B, N, self.lure._ne), x
         else:
-            return es_hat.reshape(B, N, self.lure._nd)
+            return es_hat.reshape(B, N, self.lure._ne)
 
     def count_parameters(self) -> int:
         """Count the number of trainable parameters."""
@@ -531,9 +761,11 @@ class SimpleLure(nn.Module):
         D21 = self.D21.cpu().detach().numpy()
         alpha = self.alpha.cpu().detach().numpy()
         s_original = self.s.cpu().detach().numpy()
+        # L_original = self.L.cpu().detach().numpy() if self.learn_L else None
 
         P_original = self.P.cpu().detach().numpy()
-        # L_original = self.L.cpu().detach().numpy() if self.learn_L else None  # Currently unused
+        L_original = self.L.cpu().detach().numpy() if self.learn_L else None  # Currently unused
+        H_original = L_original @ np.linalg.inv(P_original) if self.learn_L else None
 
         logger.info(f"Current alpha = {alpha:.6f}, s = {s_original:.6f}")
 
@@ -600,6 +832,12 @@ class SimpleLure(nn.Module):
         m_opt = m.value
         M_opt = np.diag(m_opt.flatten())
 
+
+        # norm H
+        H = L_opt @ np.linalg.inv(P_opt)
+        norm_H = np.linalg.norm(H, ord=2)
+        logger.info(f"Norm of H = {norm_H:.6f}")
+
         S_hat_opt = S_hat.value[0, 0] if hasattr(S_hat.value, "__len__") else S_hat.value
         s_opt = np.sqrt(1.0 / S_hat_opt)
 
@@ -634,14 +872,18 @@ class SimpleLure(nn.Module):
                 "s": float(s_original),
                 "max_eig_P": float(np.max(np.linalg.eigvals(P_original))),
                 "min_eig_P": float(np.min(np.linalg.eigvals(P_original))),
-                "cond_P": float(np.linalg.cond(P_original)),
+                "norm_P": float(np.linalg.norm(P_original, ord="fro")),
+                "norm_L": float(np.linalg.norm(L_original, ord="fro")) if L_original is not None else 0.0,
+                "norm_H": float(np.linalg.norm(H_original, ord="fro")) if H_original is not None else 0.0,
             },
             "optimized": {
                 "s": float(s_opt),
                 "max_eig_P": float(np.max(np.linalg.eigvals(P_opt))),
                 "min_eig_P": float(np.min(np.linalg.eigvals(P_opt))),
-                "cond_P": float(np.linalg.cond(P_opt)),
+                "norm_P": float(np.linalg.norm(P_opt, ord="fro")),
                 "max_eig_F": float(max_eig_F),
+                "norm_H": float(norm_H),
+                "norm_L": float(np.linalg.norm(L_opt, ord="fro")),
             },
         }
 
@@ -665,50 +907,74 @@ class SimpleLure(nn.Module):
             "summary": summary,
         }
 
-    def get_regularization_loss(self, method: Optional[str] = None) -> torch.Tensor:
+    def get_regularization_loss(self, method: Optional[str] = None, return_components: bool = False):
         """
         Compute custom regularization loss on model parameters.
 
         Args:
             method: Regularization method ('interior_point' or 'dual').
                    If None, uses self.regularization_method.
+            return_components: If True, returns a dict with loss breakdown.
+                             If False, returns total loss tensor.
 
         Returns:
-            Regularization loss tensor
+            If return_components=False: Regularization loss tensor
+            If return_components=True: Dict with keys:
+                - 'total': Total regularization loss
+                - 'feasibility': Feasibility regularization (barrier or dual)
+                - 'parametric': Parametric regularization (L nonzero, etc.)
         """
         if method is None:
             method = self.regularization_method
 
         if method == "interior_point":
-            return self._interior_point_regularization()
+            if return_components:
+                return self._interior_point_regularization(return_components=True)
+            else:
+                return self._interior_point_regularization()
         elif method == "dual":
-            return self._dual_regularization()
+            if return_components:
+                return self._dual_regularization(return_components=True)
+            else:
+                return self._dual_regularization()
         else:
             raise ValueError(f"Unknown regularization method: {method}")
 
         # add parameter regularization
 
-    def _interior_point_regularization(self) -> torch.Tensor:
+    def _interior_point_regularization(self, return_components: bool = False):
         """
         Interior point method: uses log-det barrier function.
         Requires strictly feasible parameters (all eigenvalues > 0).
         Gradients explode when constraints are violated.
 
+        Args:
+            return_components: If True, returns dict with breakdown
+
         Returns:
-            Regularization loss (sum of negative log-determinants)
+            If return_components=False: Regularization loss (sum of negative log-determinants)
+            If return_components=True: Dict with 'total', 'feasibility', 'parametric'
         """
-        reg_loss = torch.tensor(0.0, device=self.P.device)
+        feasibility_loss = torch.tensor(0.0, device=self.P.device)
         for f_i in self.get_lmis():
-            reg_loss += -torch.logdet(f_i())
+            feasibility_loss += -torch.logdet(f_i())
         for s_i in self.get_scalar_inequalities():
-            reg_loss += -torch.log(s_i()).squeeze()
+            feasibility_loss += -torch.log(s_i()).squeeze()
 
         # Add parametric regularization to encourage non-zero L
-        reg_loss += self._parametric_regularization()
+        parametric_loss = self._parametric_regularization()
+        total_loss = feasibility_loss + parametric_loss
 
-        return reg_loss
+        if return_components:
+            return {
+                'total': total_loss,
+                'feasibility': feasibility_loss,
+                'parametric': parametric_loss
+            }
+        else:
+            return total_loss
 
-    def _dual_regularization(self) -> torch.Tensor:
+    def _dual_regularization(self, return_components: bool = False):
         """
         Dual method: penalizes negative eigenvalues with adaptive penalty coefficient.
         Allows infeasible parameters during training.
@@ -718,10 +984,14 @@ class SimpleLure(nn.Module):
         - Penalize negative eigenvalues: sum(max(0, -λ)^2)
         - Scale by dual penalty coefficient
 
+        Args:
+            return_components: If True, returns dict with breakdown
+
         Returns:
-            Regularization loss (sum of negative eigenvalue penalties)
+            If return_components=False: Regularization loss (sum of negative eigenvalue penalties)
+            If return_components=True: Dict with 'total', 'feasibility', 'parametric'
         """
-        reg_loss = torch.tensor(0.0, device=self.P.device)
+        feasibility_loss = torch.tensor(0.0, device=self.P.device)
 
         for f_i in self.get_lmis():
             F = f_i()
@@ -733,20 +1003,29 @@ class SimpleLure(nn.Module):
             negative_eigs = torch.relu(-eigenvalues)
             violation = torch.sum(negative_eigs**2)
 
-            reg_loss += self.dual_penalty * violation
+            feasibility_loss += self.dual_penalty * violation
 
         # Add parametric regularization to encourage non-zero L
-        reg_loss += self._parametric_regularization()
+        parametric_loss = self._parametric_regularization()
+        total_loss = feasibility_loss + parametric_loss
 
-        return reg_loss
+        if return_components:
+            return {
+                'total': total_loss,
+                'feasibility': feasibility_loss,
+                'parametric': parametric_loss
+            }
+        else:
+            return total_loss
 
     def _parametric_regularization(self) -> torch.Tensor:
         """
         Parametric regularization to encourage specific parameter properties.
 
         Currently implements:
-        - Negative Frobenius norm penalty on L to encourage non-zero values
-          (penalizes small ||L||, encourages larger magnitude)
+        - Inverse Frobenius norm penalty on L to encourage non-zero values
+          (penalty increases as ||L|| → 0, encouraging larger magnitude)
+          Formula: weight / (||L||_F + eps)
 
         Returns:
             Parametric regularization loss
@@ -754,8 +1033,11 @@ class SimpleLure(nn.Module):
         param_loss = torch.tensor(0.0, device=self.P.device)
 
         if self.l_nonzero_weight > 0 and self.learn_L:
-            # param_loss = self.l_nonzero_weight * torch.max(torch.tensor(0.0, device=self.P.device), 1 - torch.linalg.norm(self.L)**2)
-            param_loss -= self.l_nonzero_weight * torch.norm(self.L, p="fro")
+            # Inverse norm penalty with numerical stability
+            param_loss += self.l_nonzero_weight / (torch.norm(self.L, p="fro") + 1e-6)
+
+        # minimize Frobenius norm of P to encourage smaller values (less conservative)
+        # param_loss += self.l_nonzero_weight * torch.norm(self.P, p="fro")
 
         return param_loss
 

@@ -40,39 +40,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TEST_DATA_PATH = "~/genSecSysId-Data/data/prepared/test"  # set this is hard coded but will later become a parameter
-TRAJECTORY_LIST = [
-    93,
-    16,
-    110,
-    106,
-    26,
-    40,
-    144,
-    62,
-    82,
-    4,
-    6,
-    9,
-    17,
-    32,
-    90,
-    91,
-    92,
-    2,
-    25,
-    47,
-    97,
-    101,
-    161,
-    255,
-]
+# TEST_DATA_PATH = "~/genSecSysId-Data/data/toy_example/prepared/test"  # set this is hard coded but will later become a parameter
+TEST_DATA_PATH = "/Users/jack/genSecSysId-Data/data/SilverboxFiles/prepared/test"
+TRAJECTORY_LIST = [0,1]
+# TRAJECTORY_LIST = [
+#     93,
+#     16,
+#     110,
+#     106,
+#     26,
+#     40,
+#     144,
+#     62,
+#     82,
+#     4,
+#     6,
+#     9,
+#     17,
+#     32,
+#     90,
+#     91,
+#     92,
+#     2,
+#     25,
+#     47,
+#     97,
+#     101,
+#     161,
+#     255,
+# ]
 CONFIG_FILE_PATH = "~/genSecSysId-Data/configs/crnn_gen-sec.yaml"
 
 
-X_H_MAT_PATH = "~/genSecSysId-Data/data/X_H-param_from_mat.mat"
+# X_H_MAT_PATH = "~/genSecSysId-Data/data/X_H-param_from_mat.mat"
 
-X_H_MAT = loadmat(os.path.expanduser(X_H_MAT_PATH))
+# X_H_MAT = loadmat(os.path.expanduser(X_H_MAT_PATH))
 
 
 def parse_args():
@@ -150,6 +152,21 @@ def main():
             )
             sys.exit(1)
 
+        # Load best model weights (overwrites final model weights with best checkpoint)
+        try:
+            best_model_path = mlflow.artifacts.download_artifacts(
+                run_id=args.run_id, artifact_path="models/best_model.pt"
+            )
+            checkpoint = torch.load(best_model_path, map_location="cpu")
+            model.load_state_dict(checkpoint["model_state_dict"])
+            best_epoch = checkpoint.get("best_epoch", "?")
+            best_val_loss = checkpoint.get("best_val_loss", float("nan"))
+            logger.info(
+                f"Best model weights loaded (best epoch: {best_epoch}, best val loss: {best_val_loss:.6f})"
+            )
+        except Exception as e:
+            logger.warning(f"Could not load best model weights, using final model: {e}")
+
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         sys.exit(1)
@@ -180,11 +197,18 @@ def main():
             pattern=getattr(config.data, "pattern", "*.csv"),
         )
 
-        test_inputs, test_outputs, test_states = (
-            np.stack(test_inputs[TRAJECTORY_LIST]),
-            np.stack(test_outputs[TRAJECTORY_LIST]),
-            np.stack(test_states[TRAJECTORY_LIST]),
-        )
+        if test_states is not None:
+            test_inputs, test_outputs, test_states = (
+                np.stack(test_inputs[TRAJECTORY_LIST]),
+                np.stack(test_outputs[TRAJECTORY_LIST]),
+                np.stack(test_states[TRAJECTORY_LIST]),
+            )
+        else:
+            test_inputs, test_outputs = (
+                np.stack(test_inputs[TRAJECTORY_LIST]),
+                np.stack(test_outputs[TRAJECTORY_LIST]),
+            )
+            
         result = model.post_process(eps=args.eps)
 
         if not result["success"]:
@@ -203,8 +227,12 @@ def main():
         mlflow.log_metric("post_process/s_original", summary["original"]["s"])
         mlflow.log_metric("post_process/s_optimized", summary["optimized"]["s"])
         mlflow.log_metric("post_process/max_eig_F", summary["optimized"]["max_eig_F"])
-        mlflow.log_metric("post_process/cond_P_original", summary["original"]["cond_P"])
-        mlflow.log_metric("post_process/cond_P_optimized", summary["optimized"]["cond_P"])
+        mlflow.log_metric("post_process/norm_P_original", summary["original"]["norm_P"])
+        mlflow.log_metric("post_process/norm_L_original", summary["original"]["norm_L"])
+        mlflow.log_metric("post_process/norm_H_original", summary["original"]["norm_H"])
+        mlflow.log_metric("post_process/norm_P_optimized", summary["optimized"]["norm_P"])
+        mlflow.log_metric("post_process/norm_L_optimized", summary["optimized"]["norm_L"])
+        mlflow.log_metric("post_process/norm_H_optimized", summary["optimized"]["norm_H"])
 
         # Log parameter
         mlflow.log_param("post_processing", True)
@@ -285,12 +313,12 @@ def main():
                     )
 
                     # plot ellipse and polytope from mat file for comparison
-                    X_mat = X_H_MAT["X"]
-                    H_mat = X_H_MAT["H"]
-                    s_mat = X_H_MAT["s"][0, 0]
+                    # X_mat = X_H_MAT["X"]
+                    # H_mat = X_H_MAT["H"]
+                    # s_mat = X_H_MAT["s"][0, 0]
 
-                    plot_ellipse(ax, X_mat, s_mat, linetype="b--")
-                    plot_polytope(ax, H_mat, fill=False, linetype="r--")
+                    # plot_ellipse(ax, X_mat, s_mat, linetype="b--")
+                    # plot_polytope(ax, H_mat, fill=False, linetype="r--")
 
                     # Save to output directory
 
@@ -333,7 +361,10 @@ def main():
             from sysid.utils import plot_predictions
 
             with torch.no_grad():
-                e_hat = model(torch.tensor(test_inputs), torch.tensor(test_states[:, 0, :]))
+                if test_states is not None:
+                    e_hat = model(torch.tensor(test_inputs), torch.tensor(test_states[:, 0, :]))
+                else:
+                    e_hat = model(torch.tensor(test_inputs), test_states)
 
             pred_plot_path = output_dir / f"prediction_trajectory_post_{args.run_id[:8]}.png"
 
@@ -342,7 +373,7 @@ def main():
                 e_hat=e_hat,
                 e=test_outputs,
                 num_samples=3,
-                sample_indices=UNSTAB_STAB_ZERO,
+                # sample_indices=UNSTAB_STAB_ZERO,
                 save_path=pred_plot_path,
                 return_axes=True,
             )

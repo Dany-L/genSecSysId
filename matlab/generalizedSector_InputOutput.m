@@ -1,6 +1,6 @@
 clc, clear, close all
 % load system
-run('shared.m')
+run('./systems/toy_example.m')
 
 % Same setup as proposition 2 LaBella, but with an input
 % analysis

@@ -138,8 +138,9 @@ class LureSystem(Linear):
             x = x0.reshape(n_batch, self._nx, 1)
             for k in range(N):
                 w = self.Delta(self.C2 @ x + self.D21 @ d[:, k, :, :])
-                x = super().state_dynamics(x=x, d=d[:, k, :, :]) + self.B2 @ w
                 e_hat[:, k, :, :] = super().output_dynamics(x=x, d=d[:, k, :, :]) + self.D12 @ w
+                x = super().state_dynamics(x=x, d=d[:, k, :, :]) + self.B2 @ w
+                
 
             return (e_hat, (x, w))
 

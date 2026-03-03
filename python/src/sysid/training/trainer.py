@@ -112,6 +112,8 @@ class Trainer:
         self.train_losses = []
         self.train_pred_losses = []
         self.train_reg_losses = []
+        self.train_reg_feasibility = []
+        self.train_reg_parametric = []
         self.val_losses = []
 
         # Scheduler (can be set later)
@@ -244,6 +246,8 @@ class Trainer:
         total_loss = 0.0
         total_pred_loss = 0.0
         total_reg_loss = 0.0
+        total_reg_feasibility = 0.0
+        total_reg_parametric = 0.0
         num_batches = 0
 
         # Reset epoch rollback counter
@@ -267,14 +271,20 @@ class Trainer:
             e_hat = self.model(d, x0=x0)  # e_hat: predicted output
 
             # Compute prediction loss
-            pred_loss = self.loss_fn(e_hat, e)
+            n = 50
+            pred_loss = self.loss_fn(e_hat[:,n:,:], e[:,n:,:])
             loss = pred_loss
 
             # Add custom regularization
             reg_loss_value = 0.0
+            reg_feasibility_value = 0.0
+            reg_parametric_value = 0.0
             if self.regularization_weight > 0:
-                reg_loss = self.model.get_regularization_loss()
+                reg_loss_dict = self.model.get_regularization_loss(return_components=True)
+                reg_loss = reg_loss_dict['total']
                 reg_loss_value = reg_loss.item()
+                reg_feasibility_value = reg_loss_dict['feasibility'].item()
+                reg_parametric_value = reg_loss_dict['parametric'].item()
                 loss = loss + self.regularization_weight * reg_loss
 
             # Backward pass
@@ -308,7 +318,7 @@ class Trainer:
 
             # Check if constraints are satisfied (for constrained models)
             if isinstance(self.model, SimpleLure):
-                if not self.model.check_constraints():
+                if not self.model.check_constraints() and self.regularization_weight > 0:
                     # Constraints violated - try to solve feasibility SDP
                     # logging.info(f"Batch {batch_idx}: Constraints violated after parameter update, attempting feasibility SDP...")
                     # if self.model.alpha > 1:
@@ -343,12 +353,16 @@ class Trainer:
             total_loss += loss.item()
             total_pred_loss += pred_loss.item()
             total_reg_loss += reg_loss_value
+            total_reg_feasibility += reg_feasibility_value
+            total_reg_parametric += reg_parametric_value
             num_batches += 1
 
         # Average loss
         avg_loss = total_loss / num_batches
         avg_pred_loss = total_pred_loss / num_batches
         avg_reg_loss = total_reg_loss / num_batches
+        avg_reg_feasibility = total_reg_feasibility / num_batches
+        avg_reg_parametric = total_reg_parametric / num_batches
 
         # Average gradient statistics over epoch
         avg_grad_stats = {key: np.mean(values) for key, values in epoch_grad_stats.items()}
@@ -357,6 +371,8 @@ class Trainer:
             "loss": avg_loss,
             "pred_loss": avg_pred_loss,
             "reg_loss": avg_reg_loss,
+            "reg_feasibility": avg_reg_feasibility,
+            "reg_parametric": avg_reg_parametric,
             "rollback_count": self.epoch_rollback_count,
             **avg_grad_stats,
         }
@@ -429,6 +445,8 @@ class Trainer:
             self.train_losses.append(train_loss)
             self.train_pred_losses.append(train_pred_loss)
             self.train_reg_losses.append(train_reg_loss)
+            self.train_reg_feasibility.append(train_results["reg_feasibility"])
+            self.train_reg_parametric.append(train_results["reg_parametric"])
 
             # Validate
             val_loss = self.validate()
@@ -468,6 +486,8 @@ class Trainer:
                 mlflow.log_metric("train_loss", train_loss, step=epoch)
                 mlflow.log_metric("train_pred_loss", train_pred_loss, step=epoch)
                 mlflow.log_metric("train_reg_loss", train_reg_loss, step=epoch)
+                mlflow.log_metric("train_reg_feasibility", train_results["reg_feasibility"], step=epoch)
+                mlflow.log_metric("train_reg_parametric", train_results["reg_parametric"], step=epoch)
                 mlflow.log_metric("val_loss", val_loss, step=epoch)
                 mlflow.log_metric("lr", self.optimizer.param_groups[0]["lr"], step=epoch)
                 if self.regularization_weight > 0:
@@ -488,20 +508,20 @@ class Trainer:
             if (epoch + 1) % self.checkpoint_frequency == 0:
                 self.plot_trajectories(name=f"epoch_{epoch}", normalizer=normalizer)
 
-                if isinstance(self.model, SimpleLure) and self.mlflow_tracking:
-                    X = np.linalg.inv(self.model.P.cpu().detach().numpy())
-                    H = self.model.L.cpu().detach().numpy() @ X
-                    s = self.model.s.cpu().detach().numpy()
-                    max_norm_x0 = self.model.max_norm_x0
-                    fig, ax = plot_ellipse_and_parallelogram(X, H, s, max_norm_x0)
+                # if isinstance(self.model, SimpleLure) and self.mlflow_tracking:
+                #     X = np.linalg.inv(self.model.P.cpu().detach().numpy())
+                #     H = self.model.L.cpu().detach().numpy() @ X
+                #     s = self.model.s.cpu().detach().numpy()
+                #     max_norm_x0 = self.model.max_norm_x0
+                #     fig, ax = plot_ellipse_and_parallelogram(X, H, s, max_norm_x0)
 
-                    try:
-                        # Log directly to MLflow without saving to output_dir
-                        mlflow.log_figure(fig, f"plots/ellipse_epoch_{epoch}.png")
-                    except Exception as e:
-                        logging.warning(f"Failed to log ellipse plot: {e}")
-                    finally:
-                        plt.close(fig)
+                #     try:
+                #         # Log directly to MLflow without saving to output_dir
+                #         mlflow.log_figure(fig, f"plots/ellipse_epoch_{epoch}.png")
+                #     except Exception as e:
+                #         logging.warning(f"Failed to log ellipse plot: {e}")
+                #     finally:
+                #         plt.close(fig)
 
             # Learning rate scheduling
             prev_lr = self.optimizer.param_groups[0]["lr"]
@@ -592,24 +612,26 @@ class Trainer:
             H = self.model.L.cpu().detach().numpy() @ X
             s = self.model.s.cpu().detach().numpy()
             max_norm_x0 = self.model.max_norm_x0
-            fig, ax = plot_ellipse_and_parallelogram(X, H, s, max_norm_x0)
+            # fig, ax = plot_ellipse_and_parallelogram(X, H, s, max_norm_x0)
 
             # Save and log to MLflow
-            if self.mlflow_tracking:
-                try:
-                    # Log directly to MLflow without saving to output_dir
-                    mlflow.log_figure(fig, "plots/final_ellipse.png")
-                    logging.info("Logged final ellipse plot to MLflow artifacts")
-                except Exception as e:
-                    logging.warning(f"Failed to log final ellipse plot: {e}")
-                finally:
-                    plt.close(fig)
+            # if self.mlflow_tracking:
+            #     try:
+            #         # Log directly to MLflow without saving to output_dir
+            #         mlflow.log_figure(fig, "plots/final_ellipse.png")
+            #         logging.info("Logged final ellipse plot to MLflow artifacts")
+            #     except Exception as e:
+            #         logging.warning(f"Failed to log final ellipse plot: {e}")
+            #     finally:
+            #         plt.close(fig)
 
         # Save training history
         history = {
             "train_losses": self.train_losses,
             "train_pred_losses": self.train_pred_losses,
             "train_reg_losses": self.train_reg_losses,
+            "train_reg_feasibility": self.train_reg_feasibility,
+            "train_reg_parametric": self.train_reg_parametric,
             "val_losses": self.val_losses,
             "best_val_loss": self.best_val_loss,
             "best_epoch": self.best_epoch,
@@ -634,6 +656,8 @@ class Trainer:
             "train_losses": self.train_losses,
             "train_pred_losses": self.train_pred_losses,
             "train_reg_losses": self.train_reg_losses,
+            "train_reg_feasibility": self.train_reg_feasibility,
+            "train_reg_parametric": self.train_reg_parametric,
             "val_losses": self.val_losses,
         }
 
@@ -648,6 +672,7 @@ class Trainer:
 
         # Only log model to MLflow for final model (not every best model update)
         # This avoids slowdown from logging the model every time validation improves
+        # The best model weights are available as artifacts/models/best_model.pt
         if self.mlflow_tracking and "final" in filename:
             try:
                 # Get a sample batch from train_loader for input example
@@ -714,6 +739,8 @@ class Trainer:
         self.train_losses = checkpoint.get("train_losses", [])
         self.train_pred_losses = checkpoint.get("train_pred_losses", [])
         self.train_reg_losses = checkpoint.get("train_reg_losses", [])
+        self.train_reg_feasibility = checkpoint.get("train_reg_feasibility", [])
+        self.train_reg_parametric = checkpoint.get("train_reg_parametric", [])
         self.val_losses = checkpoint.get("val_losses", [])
 
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:

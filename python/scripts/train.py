@@ -176,10 +176,16 @@ def main():
     print(f"Train data: {train_inputs.shape}, {train_outputs.shape}")
     print(f"Validation data: {val_inputs.shape}, {val_outputs.shape}")
 
-    max_norm_x0 = np.max(
-        np.linalg.norm(train_states[:, 0, :], 2, axis=1), axis=0
-    )  # only consider x0 not the trajectory
+    if train_states is not None:
+        max_norm_x0 = np.max(
+            np.linalg.norm(train_states[:, 0, :], 2, axis=1), axis=0
+        )  # only consider x0 not the trajectory
+    else:
+        max_norm_x0 = 0.1  # Default value if states are not provided
     delta = np.max(np.abs(train_inputs), axis=(0, 1))
+    # delta = 10
+
+    # delta = 2
 
     # Create data loaders
     logger.info("Creating data loaders...")
@@ -212,7 +218,7 @@ def main():
     model = create_model(config, delta, max_norm_x0)
     init_fig = None
     if isinstance(model, SimpleLure):
-        init_fig = model.initialize_parameters(train_inputs, train_states, train_outputs)
+        init_fig = model.initialize_parameters(train_inputs, train_states, train_outputs, data_dir=data_config.train_path)
     print_model_summary(model)
 
     # Count parameters
