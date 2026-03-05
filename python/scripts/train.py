@@ -57,6 +57,13 @@ def main():
     parser = argparse.ArgumentParser(description="Train RNN for system identification")
     parser.add_argument("--config", type=str, required=True, help="Path to config file")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility. If not set, uses seed from config. "
+        "Set to -1 to disable seeding (allows variance estimation across runs)",
+    )
     args = parser.parse_args()
 
     # Load configuration
@@ -67,6 +74,13 @@ def main():
         config = Config.from_json(args.config)
     else:
         raise ValueError(f"Unsupported config file format: {config_path.suffix}")
+
+    # Override seed from command line if provided
+    if args.seed is not None:
+        if args.seed == -1:
+            config.seed = None  # Disable seeding
+        else:
+            config.seed = args.seed
 
     # Derive directories. If config.root_dir is provided, derive model/output/log dirs
     # as: <root>/models/<model_type>, <root>/outputs/<model_type>, <root>/logs/<model_type>
@@ -92,8 +106,9 @@ def main():
     logger.info(f"Model directory: {model_dir}")
 
     # Set seed for reproducibility
-    set_seed(config.seed)
-    logger.info(f"Random seed: {config.seed}")
+    if config.seed is not None:
+        set_seed(config.seed)
+        logger.info(f"Random seed: {config.seed}")
 
     # Get device
     device = get_device(config.training.device)

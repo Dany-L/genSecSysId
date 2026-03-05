@@ -157,7 +157,9 @@ class Config:
     root_dir: Optional[str] = None
 
     # Reproducibility
-    seed: int = 42
+    # Set to None to disable seeding (allows getting different results on each run for variance estimation)
+    # Set to an integer (e.g., 42) for reproducible results
+    seed: Optional[int] = None
 
     def __post_init__(self):
         """Initialize evaluation config if not provided."""
@@ -197,7 +199,7 @@ class Config:
             model_dir=config_dict.get("model_dir", "models"),
             log_dir=config_dict.get("log_dir", "logs"),
             root_dir=config_dict.get("root_dir", None),
-            seed=config_dict.get("seed", 42),
+            seed=config_dict.get("seed", None),
         )
 
     def to_dict(self) -> Dict[str, Any]:

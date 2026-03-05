@@ -135,9 +135,12 @@ class SimpleLure(nn.Module):
         Initialize parameters, preferring N4SID parameters if available.
 
         If `data_dir` is provided and contains a file ``n4sid_params.mat``, the
-        A, B, C, D matrices are loaded from that file (MATLAB idss format) and
-        used directly — giving a linear initialization that exactly matches the
-        N4SID model.  B2 is kept zero so the model starts fully linear.
+        A, B, C, D matrices are loaded from that file (MATLAB idss format).
+        If the N4SID state order is smaller than the configured ``nx``, matrices
+        are zero-padded in the state dimension (top-left block for A, top rows
+        for B, left columns for C). This allows warm-starting larger models
+        from a lower-order N4SID initialization. B2 is kept zero so the model
+        starts fully linear.
         The SDP is then run (keeping A and B fixed) to obtain feasible P, L.
 
         If no ``n4sid_params.mat`` is found, the method falls back to the
@@ -175,36 +178,83 @@ class SimpleLure(nn.Module):
                         raise KeyError(f"Key '{key}' not found in {mat_path}")
 
                     A_n4 = _extract("A")
-                    B_n4 = _extract("B").T if self.nd == 1 else _extract("B")
+                    B_n4 = _extract("B")
                     C_n4 = _extract("C")
                     D_n4 = _extract("D")
 
-                    # Dimension checks
-                    if A_n4.shape != (self.nx, self.nx):
+                    def _maybe_transpose_to_match(mat: np.ndarray, target_shape: tuple, name: str) -> np.ndarray:
+                        if mat.shape == target_shape:
+                            return mat
+                        if mat.T.shape == target_shape:
+                            logger.info(
+                                f"Transposing N4SID {name} from shape {mat.shape} to {mat.T.shape}"
+                            )
+                            return mat.T
+                        return mat
+
+                    # Allow common MATLAB orientation differences
+                    B_n4 = _maybe_transpose_to_match(B_n4, (A_n4.shape[0], self.nd), "B")
+                    C_n4 = _maybe_transpose_to_match(C_n4, (self.ne, A_n4.shape[0]), "C")
+                    D_n4 = _maybe_transpose_to_match(D_n4, (self.ne, self.nd), "D")
+
+                    # Validate N4SID state dimension and allow padding to larger configured nx
+                    if A_n4.shape[0] != A_n4.shape[1]:
                         raise ValueError(
-                            f"N4SID A has shape {A_n4.shape}, expected ({self.nx}, {self.nx}). "
-                            "Check that nw in the config matches the N4SID model order."
+                            f"N4SID A must be square, got shape {A_n4.shape}."
                         )
-                    if B_n4.shape != (self.nx, self.nd):
+
+                    n4_nx = A_n4.shape[0]
+                    if n4_nx > self.nx:
                         raise ValueError(
-                            f"N4SID B has shape {B_n4.shape}, expected ({self.nx}, {self.nd})."
+                            f"N4SID state dimension ({n4_nx}) is larger than configured model nx ({self.nx})."
                         )
-                    if C_n4.shape != (self.ne, self.nx):
+
+                    if B_n4.shape[1] != self.nd:
                         raise ValueError(
-                            f"N4SID C has shape {C_n4.shape}, expected ({self.ne}, {self.nx})."
+                            f"N4SID B has incompatible input dimension: shape {B_n4.shape}, expected second dim {self.nd}."
                         )
+                    if B_n4.shape[0] > self.nx:
+                        raise ValueError(
+                            f"N4SID B has too many state rows: shape {B_n4.shape}, configured nx={self.nx}."
+                        )
+
+                    if C_n4.shape[0] != self.ne:
+                        raise ValueError(
+                            f"N4SID C has incompatible output dimension: shape {C_n4.shape}, expected first dim {self.ne}."
+                        )
+                    if C_n4.shape[1] > self.nx:
+                        raise ValueError(
+                            f"N4SID C has too many state columns: shape {C_n4.shape}, configured nx={self.nx}."
+                        )
+
                     if D_n4.shape != (self.ne, self.nd):
                         raise ValueError(
                             f"N4SID D has shape {D_n4.shape}, expected ({self.ne}, {self.nd})."
                         )
 
+                    # Pad state dimensions when N4SID order is smaller than configured nx
+                    A_init = np.zeros((self.nx, self.nx), dtype=np.float64)
+                    A_init[:n4_nx, :n4_nx] = A_n4
+
+                    B_init = np.zeros((self.nx, self.nd), dtype=np.float64)
+                    B_init[:B_n4.shape[0], :] = B_n4
+
+                    C_init = np.zeros((self.ne, self.nx), dtype=np.float64)
+                    C_init[:, :C_n4.shape[1]] = C_n4
+
+                    if n4_nx < self.nx:
+                        logger.info(
+                            f"Padding N4SID initialization from state dim {n4_nx} to model nx {self.nx} "
+                            "(A top-left block, B top rows, C left columns)."
+                        )
+
                     # Set parameters from N4SID
-                    self.A.data  = torch.tensor(A_n4)
-                    self.B.data  = torch.tensor(B_n4)
-                    self.C.data  = torch.tensor(C_n4)
+                    self.A.data  = torch.tensor(A_init)
+                    self.B.data  = torch.tensor(B_init)
+                    self.C.data  = torch.tensor(C_init)
                     self.D.data  = torch.tensor(D_n4)
-                    # self.B2.data = torch.zeros_like(self.B2)   # keep linear
-                    self.B2.data = torch.tensor(np.random.randn(self.nx, self.nw) * 0.01)  # small random B2 to break symmetry
+                    self.B2.data = torch.zeros_like(self.B2)   # keep linear
+                    # self.B2.data = torch.tensor(np.random.randn(self.nx, self.nw)) * 5*1e-3 # small random B2 to break symmetry
 
                     # Random C2 scaled to avoid saturation (needed for constraint structure)
                     self.C2.data = torch.tensor(
@@ -217,9 +267,9 @@ class SimpleLure(nn.Module):
                     )
                     logger.info(
                         f"N4SID matrices loaded. "
-                        f"||A||={np.linalg.norm(A_n4):.4f}, "
-                        f"||B||={np.linalg.norm(B_n4):.4f}, "
-                        f"||C||={np.linalg.norm(C_n4):.4f}, "
+                        f"||A||={np.linalg.norm(A_init):.4f}, "
+                        f"||B||={np.linalg.norm(B_init):.4f}, "
+                        f"||C||={np.linalg.norm(C_init):.4f}, "
                         f"||D||={np.linalg.norm(D_n4):.4f}"
                     )
 

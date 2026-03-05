@@ -209,6 +209,18 @@ def main():
     parser.add_argument("--study-name", type=str, default="crnn-optimization", help="Optuna study name")
     parser.add_argument("--storage", type=str, default=None, help="Optuna storage URL (e.g., sqlite:///optuna.db)")
     parser.add_argument("--timeout", type=int, default=None, help="Timeout in seconds")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility. If not set, uses seed from config. "
+        "Set to -1 to disable seeding (allows variance estimation across run sets)",
+    )
+    parser.add_argument(
+        "--no-seed",
+        action="store_true",
+        help="Disable random seeding for all trials (same as --seed -1)",
+    )
     args = parser.parse_args()
     
     logger.info("=" * 80)
@@ -224,12 +236,20 @@ def main():
     else:
         raise ValueError(f"Unsupported config file format: {config_path.suffix}")
     
+    # Override seed from command line if provided
+    if args.no_seed or args.seed == -1:
+        config.seed = None  # Disable seeding
+    elif args.seed is not None:
+        config.seed = args.seed
+    
     logger.info(f"Base config: {config_path}")
     logger.info(f"Number of trials: {args.n_trials}")
     logger.info(f"Device: {config.training.device}")
+    logger.info(f"Random seed: {config.seed if config.seed is not None else 'Disabled (different results each run)'}")
     
     # Set seed
-    set_seed(config.seed)
+    if config.seed is not None:
+        set_seed(config.seed)
     
     # Load data once (cached for all trials)
     logger.info("Loading data...")

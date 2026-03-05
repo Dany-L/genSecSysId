@@ -1,14 +1,15 @@
 #!/bin/bash
-#SBATCH --partition=dgx
-#SBATCH --time=02:00:00
-#SBATCH --ntasks=1
-#SBATCH --nodes=1
-#SBATCH --mem=16GB
-#SBATCH --gres=gpu:1
-#SBATCH --gpus=1
-#SBATCH --output=./logs/slurm/test_run_%j.out
-#SBATCH --error=./logs/slurm/test_run_%j.err
-#SBATCH --job-name=test_train
+#SBATCH --partition dgx
+#SBATCH --time 02:00:00
+#SBATCH --ntasks 1
+#SBATCH --nodes 1
+#SBATCH --mem 16GB
+#SBATCH --gres gpu:1
+#SBATCH --gpus 1
+#SBATCH --job-name test_train
+#SBATCH --chdir /home/ac137967/genSecSysId
+#SBATCH --output /home/ac137967/genSecSysId/logs/slurm/test_run_%j.out
+#SBATCH --error /home/ac137967/genSecSysId/logs/slurm/test_run_%j.err
 
 # ============================================================================
 # Test Single Training Run on SLURM
@@ -45,12 +46,25 @@ fi
 echo "Setting up environment..."
 
 # Load modules (adjust for your cluster)
-module purge
+# module purge
 # module load python/3.10  # Uncomment and adjust if needed
 # module load cuda/11.8     # Uncomment and adjust if needed
 
 # Activate virtual environment
-source /home/ac137967/genSecSysId/venv/bin/activate
+# First, try the standard location
+if [ -f "/home/ac137967/genSecSysId/venv/bin/activate" ]; then
+    echo "Using venv in /home/ac137967/genSecSysId/venv"
+    source /home/ac137967/genSecSysId/venv/bin/activate
+elif [ -f "/home/ac137967/venv/genSecSysId/bin/activate" ]; then
+    echo "Using venv in /home/ac137967/venv/genSecSysId"
+    source /home/ac137967/venv/genSecSysId/bin/activate
+else
+    echo "ERROR: Could not find virtual environment"
+    echo "Checked:"
+    echo "  - /home/ac137967/genSecSysId/venv/bin/activate"
+    echo "  - /home/ac137967/venv/genSecSysId/bin/activate"
+    exit 1
+fi
 
 # Verify Python and GPU
 echo "Python: $(which python)"
