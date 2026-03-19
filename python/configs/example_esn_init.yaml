@@ -1,0 +1,45 @@
+# Example: ESN Initialization (Echo State Network - robust general-purpose)
+data:
+  train_path: ~/genSecSysId-Data/data/Duffing/train
+  input_col: ["d"]
+  output_col: ["e"]
+  state_col: []
+  pattern: "*.csv"
+  normalize: true
+  batch_size: 32
+  sequence_length: 500
+  sequence_stride: 1
+
+model:
+  model_type: crnn
+  nw: 64
+  nx: 8
+  activation: sat
+  initialization:
+    method: esn              # Echo State Network: multiple random reservoirs
+    esn_n_restarts: 5        # Try 5 different random reservoirs, keep best
+
+optimizer:
+  optimizer_type: adam
+  learning_rate: 0.001
+  weight_decay: 1e-5
+  use_scheduler: true
+  scheduler_type: reduce_on_plateau
+  scheduler_patience: 10
+  scheduler_factor: 0.5
+
+training:
+  max_epochs: 500
+  early_stopping_patience: 50
+  gradient_clip_value: 1.0
+  loss_type: mse
+  use_custom_regularization: false
+
+mlflow:
+  experiment_name: sysid_esn_init
+  run_name: esn_robust
+  log_models: true
+  log_artifacts: true
+
+evaluation:
+  metrics: ["mse", "rmse", "mae", "r2"]

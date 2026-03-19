@@ -270,9 +270,12 @@ class Trainer:
             self.optimizer.zero_grad()
             e_hat = self.model(d, x0=x0)  # e_hat: predicted output
 
-            # Compute prediction loss
-            n = 50
-            pred_loss = self.loss_fn(e_hat[:,n:,:], e[:,n:,:])
+            # Compute prediction loss (skip warmup steps).
+            # NaN positions in e (padded trajectories) are already handled by
+            # MaskedLoss, so slicing [:, n:, :] is safe even when some sequences
+            # are shorter than n — those positions are NaN and get ignored.
+            n = 0
+            pred_loss = self.loss_fn(e_hat[:, n:, :], e[:, n:, :])
             loss = pred_loss
 
             # Add custom regularization

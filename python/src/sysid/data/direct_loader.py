@@ -18,7 +18,7 @@ def load_csv_folder(
     pattern: str = "*.csv",
 ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], List[str]]:
     """
-    Load all CSV files from a folder directly.
+    Load all CSV files from a folder as multiple trajectories.
 
     Supports MIMO (Multiple Input Multiple Output) systems by accepting lists of column names.
 
@@ -31,9 +31,9 @@ def load_csv_folder(
 
     Returns:
         Tuple of (inputs, outputs, states, filenames) where:
-        - inputs shape: (n_files, seq_len, n_inputs)
-        - outputs shape: (n_files, seq_len, n_outputs)
-        - states shape: (n_files, seq_len, n_states) or None if no state columns
+        - inputs shape: (n_files, max_seq_len, n_inputs)
+        - outputs shape: (n_files, max_seq_len, n_outputs)
+        - states shape: (n_files, max_seq_len, n_states) or None if no state columns
         - filenames: List of file names
     """
     folder = Path(folder_path)
@@ -62,10 +62,19 @@ def load_csv_folder(
     all_outputs = []
     all_states = [] if state_cols else None
     filenames = []
+    trimmed_rows_count = 0
 
     for csv_file in csv_files:
         try:
             df = pd.read_csv(csv_file)
+
+            # Coerce selected columns to numeric so blank cells (e.g. "0.0,,")
+            # become NaN and are handled consistently downstream.
+            for col in input_cols + output_cols:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            if state_cols:
+                for col in state_cols:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
 
             # Extract input columns (support MIMO)
             inputs = df[input_cols].values  # shape: (seq_len, n_inputs)
@@ -73,9 +82,26 @@ def load_csv_folder(
             # Extract output columns (support MIMO)
             outputs = df[output_cols].values  # shape: (seq_len, n_outputs)
 
+            # If the source CSV already contains padded tail rows (e.g. input=0,
+            # output blank), trim trailing rows where all outputs are NaN.
+            valid_output_rows = ~np.all(np.isnan(outputs), axis=1)
+            if np.any(valid_output_rows):
+                last_valid_idx = int(np.where(valid_output_rows)[0][-1])
+                effective_len = last_valid_idx + 1
+                if effective_len < outputs.shape[0]:
+                    trimmed_rows_count += outputs.shape[0] - effective_len
+                inputs = inputs[:effective_len]
+                outputs = outputs[:effective_len]
+            else:
+                logger.warning(
+                    f"Skipping {csv_file.name}: all rows have NaN outputs after parsing"
+                )
+                continue
+
             # Extract state columns if provided
             if state_cols:
                 states = df[state_cols].values  # shape: (seq_len, n_states)
+                states = states[: inputs.shape[0]]
                 all_states.append(states)
 
             all_inputs.append(inputs)
@@ -86,17 +112,43 @@ def load_csv_folder(
             logger.warning(f"Failed to load {csv_file.name}: {e}")
             continue
 
-    # Stack all sequences
-    all_inputs = np.array(all_inputs)  # shape: (n_files, seq_len, n_inputs)
-    all_outputs = np.array(all_outputs)  # shape: (n_files, seq_len, n_outputs)
+    if not all_inputs:
+        raise ValueError(f"No valid CSV files loaded from {folder_path}")
+
+    if trimmed_rows_count > 0:
+        logger.info(f"Trimmed {trimmed_rows_count} pre-padded tail rows across CSV files")
+
+    # Keep trajectories separate and pad to the longest sequence length.
+    # Inputs are padded with zeros; outputs/states with NaN to be ignored by masked loss.
+    max_len = max(arr.shape[0] for arr in all_inputs)
+    n_inputs = all_inputs[0].shape[1]
+    n_outputs = all_outputs[0].shape[1]
+
+    def _pad(arrays, pad_value, n_cols):
+        out = np.full((len(arrays), max_len, n_cols), pad_value)
+        for i, arr in enumerate(arrays):
+            out[i, : arr.shape[0], :] = arr
+        return out
+
+    lengths = [arr.shape[0] for arr in all_inputs]
+    if len(set(lengths)) > 1:
+        logger.info(
+            f"Variable-length trajectories detected (min={min(lengths)}, max={max_len}). "
+            f"Padding: inputs -> 0, outputs/states -> NaN."
+        )
+
+    all_inputs = _pad(all_inputs, 0.0, n_inputs)
+    all_outputs = _pad(all_outputs, np.nan, n_outputs)
+
 
     if state_cols:
-        all_states = np.array(all_states)  # shape: (n_files, seq_len, n_states)
+        n_states = all_states[0].shape[1]
+        all_states = _pad(all_states, np.nan, n_states)
         logger.info(
-            f"Loaded: inputs={all_inputs.shape}, outputs={all_outputs.shape}, states={all_states.shape}"
+            f"Loaded trajectories: inputs={all_inputs.shape}, outputs={all_outputs.shape}, states={all_states.shape}"
         )
     else:
-        logger.info(f"Loaded: inputs={all_inputs.shape}, outputs={all_outputs.shape}")
+        logger.info(f"Loaded trajectories: inputs={all_inputs.shape}, outputs={all_outputs.shape}")
 
     return all_inputs, all_outputs, all_states, filenames
 

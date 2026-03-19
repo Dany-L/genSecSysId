@@ -312,6 +312,7 @@ def main():
         test_outputs_norm,
         test_states,
         sequence_length=config.data.sequence_length,
+        sequence_stride=getattr(config.data, "sequence_stride", None),
     )
 
     test_loader = TorchDataLoader(

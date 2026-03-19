@@ -37,7 +37,7 @@ class SimpleLure(nn.Module):
         nz = nw
         
         # Check if state padding is enabled (default: True)
-        pad_state = custom_params.get("pad_state", True) if custom_params is not None else True
+        pad_state = custom_params.get("pad_state", False) if custom_params is not None else False
         
         # Store original dataset state dimension
         self.nx_data = nx
@@ -80,7 +80,7 @@ class SimpleLure(nn.Module):
         if learn_L:
             self.L = nn.Parameter(torch.zeros((nz, nx)))  # Coupling matrix
             self.alpha = nn.Parameter(torch.tensor(0.99), requires_grad=True)
-            self.s = nn.Parameter(torch.tensor(0.0), requires_grad=True)
+            self.s = nn.Parameter(torch.tensor(1.0), requires_grad=True)
         else:
             self.L = torch.zeros((nz, nx))  # Coupling matrix, not learnable
             self.alpha = nn.Parameter(torch.tensor(0.99), requires_grad=False)
@@ -95,7 +95,9 @@ class SimpleLure(nn.Module):
 
         self.C = nn.Parameter(torch.zeros(ne, self.nx))
         self.D = nn.Parameter(torch.zeros(ne, nd))
+        # self.D = nn.Parameter(torch.zeros(ne, nd), requires_grad=False)  # Keep D fixed to zero for simplicity (can be relaxed later)
         self.D12 = nn.Parameter(torch.zeros(ne, nw))
+        # self.D12 = nn.Parameter(torch.zeros(ne, nw), requires_grad=False)  # Keep D12 fixed to zero for simplicity (can be relaxed later)
 
         self.C2 = nn.Parameter(torch.zeros(nz, self.nx))
         self.D21 = nn.Parameter(torch.zeros(nz, nd))
@@ -130,162 +132,251 @@ class SimpleLure(nn.Module):
     def reset_s(self):
         self.s.data = torch.sqrt(self.delta**2 / (1 - self.alpha**2)).squeeze()
 
-    def initialize_parameters(self, train_inputs, train_states, train_outputs, n_restarts: int = 5, data_dir: Optional[str] = None):
+    def initialize_parameters(
+        self,
+        train_inputs,
+        train_states,
+        train_outputs,
+        init_config=None,
+        data_dir: Optional[str] = None,
+    ):
         """
-        Initialize parameters, preferring N4SID parameters if available.
+        Initialize model parameters using the specified method.
 
-        If `data_dir` is provided and contains a file ``n4sid_params.mat``, the
-        A, B, C, D matrices are loaded from that file (MATLAB idss format).
-        If the N4SID state order is smaller than the configured ``nx``, matrices
-        are zero-padded in the state dimension (top-left block for A, top rows
-        for B, left columns for C). This allows warm-starting larger models
-        from a lower-order N4SID initialization. B2 is kept zero so the model
-        starts fully linear.
-        The SDP is then run (keeping A and B fixed) to obtain feasible P, L.
+        Supports three initialization strategies:
+        1. ESN (Echo State Network): Random reservoirs with least-squares fitting
+        2. N4SID: Load from n4sid_params.mat file if available
+        3. Identity: Predefined diagonal A, random C2, identity-like C
 
-        If no ``n4sid_params.mat`` is found, the method falls back to the
-        random Echo State Network (ESN) reservoir search:
-        1. Try `n_restarts` random reservoirs (A, C2) — cheap (no SDP).
-           For each, simulate and fit C, D, D12 via least squares. Keep the one
-           with the lowest training MSE.
-        2. Run the SDP exactly once on the best reservoir to obtain feasible
-           B, D21, P, L.
-        3. Re-simulate with the SDP-updated B, D21 and refit C, D, D12.
+        Args:
+            train_inputs: Training input data (B, N, nd)
+            train_states: Training state data (B, N, nx) or None
+            train_outputs: Training output data (B, N, ne)
+            init_config: InitializationConfig object specifying the method.
+                        If None, defaults to ESN with 5 restarts.
+            data_dir: Directory to search for n4sid_params.mat
         """
-        # ── 0. Compute s ────────────────────────────────────────────────────────
+        # Set defaults
+        if init_config is None:
+            init_method = "esn"
+            n_restarts = 5
+        else:
+            init_method = getattr(init_config, "method", "esn").lower()
+            n_restarts = getattr(init_config, "esn_n_restarts", 5)
+
+        logger.info("=" * 80)
+        logger.info(f"INITIALIZATION: Using '{init_method}' method")
+        logger.info("=" * 80)
+
+        if init_method == "n4sid":
+            success = self._init_n4sid(train_inputs, train_states, train_outputs, data_dir)
+            if not success:
+                logger.warning("N4SID initialization failed or file not found. Falling back to ESN.")
+                self._init_esn(train_inputs, train_states, train_outputs, n_restarts)
+        elif init_method == "identity":
+            self._init_identity(train_inputs, train_states, train_outputs)
+        elif init_method == "esn":
+            self._init_esn(train_inputs, train_states, train_outputs, n_restarts)
+        else:
+            raise ValueError(f"Unknown initialization method: {init_method}")
+
+        # Common post-initialization
         self.s.data = torch.sqrt(self.delta**2 / (1 - self.alpha**2)).squeeze()
+        constraints_ok = self.check_constraints()
+        logger.info(f"Initialization complete. Constraints satisfied: {constraints_ok}")
+        logger.info("=" * 80)
+        if not constraints_ok:
+            self.analysis_problem_init(learn_B=False, learn_D21=True)
+        
 
-        Bs, N, _ = train_inputs.shape  # batch_size, seq_len, nd
+    def _init_identity(self, train_inputs, train_states, train_outputs):
+        """
+        Identity initialization: predefined simple linear system.
 
-        # ── Optional: load N4SID parameters from mat file ───────────────────────
-        n4sid_loaded = False
-        if data_dir is not None:
-            from scipy.io import loadmat
-            mat_path = Path(os.path.expanduser(data_dir)) / "n4sid_params.mat"
-            if mat_path.exists():
-                logger.info(f"Found n4sid_params.mat at {mat_path} — loading N4SID parameters")
-                try:
-                    mat = loadmat(str(mat_path), squeeze_me=True, struct_as_record=False)
+        Sets:
+        - α = 0.99
+        - A = 0.9I (stable, diagonal)
+        - C2 = Rand(-1,1) (random measurement matrix)
+        - C = [I, 0] (identity-like output matrix, padded if nx > ne)
+        - B2 = D = D12 = 0 (no direct feedthrough, all nonlinearity from C2)
+        - B = 0 (can be learned during training)
 
-                    # Support both direct keys and a nested idss/struct object
-                    def _extract(key):
-                        if key in mat:
-                            return np.atleast_2d(np.array(mat[key], dtype=np.float64))
-                        # Search inside any top-level struct
-                        for v in mat.values():
-                            if hasattr(v, key):
-                                return np.atleast_2d(np.array(getattr(v, key), dtype=np.float64))
-                        raise KeyError(f"Key '{key}' not found in {mat_path}")
+        This provides a simple stable starting point.
+        """
+        logger.info("Identity initialization: α=0.99, A=0.9I, random C2, identity-like C")
 
-                    A_n4 = _extract("A")
-                    B_n4 = _extract("B")
-                    C_n4 = _extract("C")
-                    D_n4 = _extract("D")
+        self.alpha.data = torch.tensor(0.99)
+        # self.A.data = torch.tensor(0.9 * np.eye(self.nx))
+        # self.A.data = torch.tensor([
+        #     [0.9284,   -0.2404],
+        #     [-0.0251,    0.8540]
+        # ])
+        self.A.data = torch.tensor([
+            [0.9558,    0.3215],
+            [0.0068,    0.8648]
+        ])
+        self.B.data = torch.zeros_like(self.B)
+        self.B2.data = torch.zeros_like(self.B2)
+        self.C2.data = torch.tensor(np.random.uniform(-1, 1, size=(self.nz, self.nx)))
 
-                    def _maybe_transpose_to_match(mat: np.ndarray, target_shape: tuple, name: str) -> np.ndarray:
-                        if mat.shape == target_shape:
-                            return mat
-                        if mat.T.shape == target_shape:
-                            logger.info(
-                                f"Transposing N4SID {name} from shape {mat.shape} to {mat.T.shape}"
-                            )
-                            return mat.T
-                        return mat
+        # C = [I, 0] (identity on first min(ne, nx) outputs, zeros on rest)
+        C_init = np.zeros((self.ne, self.nx))
+        min_dim = min(self.ne, self.nx)
+        C_init[:min_dim, :min_dim] = np.eye(min_dim)
+        self.C.data = torch.tensor(C_init)
 
-                    # Allow common MATLAB orientation differences
-                    B_n4 = _maybe_transpose_to_match(B_n4, (A_n4.shape[0], self.nd), "B")
-                    C_n4 = _maybe_transpose_to_match(C_n4, (self.ne, A_n4.shape[0]), "C")
-                    D_n4 = _maybe_transpose_to_match(D_n4, (self.ne, self.nd), "D")
+        self.D.data = torch.zeros_like(self.D)
+        self.D12.data = torch.zeros_like(self.D12)
 
-                    # Validate N4SID state dimension and allow padding to larger configured nx
-                    if A_n4.shape[0] != A_n4.shape[1]:
-                        raise ValueError(
-                            f"N4SID A must be square, got shape {A_n4.shape}."
-                        )
+        # Random D21 for measurement noise
+        self.D21.data = torch.tensor(np.random.randn(self.nz, self.nd) * 0.01)
 
-                    n4_nx = A_n4.shape[0]
-                    if n4_nx > self.nx:
-                        raise ValueError(
-                            f"N4SID state dimension ({n4_nx}) is larger than configured model nx ({self.nx})."
-                        )
+        logger.info(f"  ||A||={np.linalg.norm(self.A.detach().numpy()):.4f}")
+        logger.info(f"  ||C||={np.linalg.norm(self.C.detach().numpy()):.4f}")
+        logger.info(f"  ||C2||={np.linalg.norm(self.C2.detach().numpy()):.4f}")
 
-                    if B_n4.shape[1] != self.nd:
-                        raise ValueError(
-                            f"N4SID B has incompatible input dimension: shape {B_n4.shape}, expected second dim {self.nd}."
-                        )
-                    if B_n4.shape[0] > self.nx:
-                        raise ValueError(
-                            f"N4SID B has too many state rows: shape {B_n4.shape}, configured nx={self.nx}."
-                        )
+    def _init_n4sid(self, train_inputs, train_states, train_outputs, data_dir: Optional[str] = None) -> bool:
+        """
+        Initialize from N4SID system identification results.
 
-                    if C_n4.shape[0] != self.ne:
-                        raise ValueError(
-                            f"N4SID C has incompatible output dimension: shape {C_n4.shape}, expected first dim {self.ne}."
-                        )
-                    if C_n4.shape[1] > self.nx:
-                        raise ValueError(
-                            f"N4SID C has too many state columns: shape {C_n4.shape}, configured nx={self.nx}."
-                        )
+        Loads A, B, C, D from n4sid_params.mat. If N4SID state dimension < nx,
+        pads matrices (A top-left block, B top rows, C left columns).
+        Runs SDP to find feasible P and L.
 
-                    if D_n4.shape != (self.ne, self.nd):
-                        raise ValueError(
-                            f"N4SID D has shape {D_n4.shape}, expected ({self.ne}, {self.nd})."
-                        )
+        Args:
+            train_inputs: Training inputs (B, N, nd)
+            train_states: Training states (B, N, nx_data)
+            train_outputs: Training outputs (B, N, ne)
+            data_dir: Directory containing n4sid_params.mat
 
-                    # Pad state dimensions when N4SID order is smaller than configured nx
-                    A_init = np.zeros((self.nx, self.nx), dtype=np.float64)
-                    A_init[:n4_nx, :n4_nx] = A_n4
+        Returns:
+            True if successful, False otherwise
+        """
+        if data_dir is None:
+            return False
 
-                    B_init = np.zeros((self.nx, self.nd), dtype=np.float64)
-                    B_init[:B_n4.shape[0], :] = B_n4
+        from scipy.io import loadmat
 
-                    C_init = np.zeros((self.ne, self.nx), dtype=np.float64)
-                    C_init[:, :C_n4.shape[1]] = C_n4
+        mat_path = Path(os.path.expanduser(data_dir)) / "n4sid_params.mat"
+        if not mat_path.exists():
+            logger.info(f"N4SID file not found at {mat_path}")
+            return False
 
-                    if n4_nx < self.nx:
-                        logger.info(
-                            f"Padding N4SID initialization from state dim {n4_nx} to model nx {self.nx} "
-                            "(A top-left block, B top rows, C left columns)."
-                        )
+        logger.info(f"Loading N4SID parameters from {mat_path}")
 
-                    # Set parameters from N4SID
-                    self.A.data  = torch.tensor(A_init)
-                    self.B.data  = torch.tensor(B_init)
-                    self.C.data  = torch.tensor(C_init)
-                    self.D.data  = torch.tensor(D_n4)
-                    self.B2.data = torch.zeros_like(self.B2)   # keep linear
-                    # self.B2.data = torch.tensor(np.random.randn(self.nx, self.nw)) * 5*1e-3 # small random B2 to break symmetry
+        try:
+            mat = loadmat(str(mat_path), squeeze_me=True, struct_as_record=False)
 
-                    # Random C2 scaled to avoid saturation (needed for constraint structure)
-                    self.C2.data = torch.tensor(
-                        # np.random.randn(self.nz, self.nx) / np.sqrt(self.nx)
-                        np.random.randn(self.nz, self.nx)
-                    )
+            # Support both direct keys and nested struct
+            def _extract(key):
+                if key in mat:
+                    return np.atleast_2d(np.array(mat[key], dtype=np.float64))
+                for v in mat.values():
+                    if hasattr(v, key):
+                        return np.atleast_2d(np.array(getattr(v, key), dtype=np.float64))
+                raise KeyError(f"Key '{key}' not found in {mat_path}")
 
-                    self.D12.data = torch.tensor(
-                        np.random.randn(self.ne, self.nw)
-                    )
-                    logger.info(
-                        f"N4SID matrices loaded. "
-                        f"||A||={np.linalg.norm(A_init):.4f}, "
-                        f"||B||={np.linalg.norm(B_init):.4f}, "
-                        f"||C||={np.linalg.norm(C_init):.4f}, "
-                        f"||D||={np.linalg.norm(D_n4):.4f}"
-                    )
+            A_n4 = _extract("A")
+            B_n4 = _extract("B")
+            C_n4 = _extract("C")
+            D_n4 = _extract("D")
 
-                    # Run SDP keeping A and B fixed
-                    constraints_ok = self.check_constraints()
-                    logger.info(f"N4SID initialization complete. Constraints satisfied: {constraints_ok}")
-                    n4sid_loaded = True
+            def _maybe_transpose_to_match(mat: np.ndarray, target_shape: tuple, name: str) -> np.ndarray:
+                if mat.shape == target_shape:
+                    return mat
+                if mat.T.shape == target_shape:
+                    logger.info(f"Transposing N4SID {name} from {mat.shape} to {mat.T.shape}")
+                    return mat.T
+                return mat
 
-                    self.analysis_problem_init(learn_B=True, learn_D21=True)
+            B_n4 = _maybe_transpose_to_match(B_n4, (A_n4.shape[0], self.nd), "B")
+            C_n4 = _maybe_transpose_to_match(C_n4, (self.ne, A_n4.shape[0]), "C")
+            D_n4 = _maybe_transpose_to_match(D_n4, (self.ne, self.nd), "D")
 
-                except (KeyError, ValueError) as e:
-                    logger.warning(f"Could not load N4SID parameters: {e} — falling back to ESN init")
-            else:
-                logger.info(f"No n4sid_params.mat found in {data_dir} — using ESN initialization")
+            # Validate
+            if A_n4.shape[0] != A_n4.shape[1]:
+                raise ValueError(f"N4SID A must be square, got {A_n4.shape}")
+            if A_n4.shape[0] > self.nx:
+                raise ValueError(
+                    f"N4SID state dim ({A_n4.shape[0]}) > model nx ({self.nx})"
+                )
+            if B_n4.shape[1] != self.nd or C_n4.shape[0] != self.ne:
+                raise ValueError("N4SID input/output dimensions mismatch")
+            if D_n4.shape != (self.ne, self.nd):
+                raise ValueError(f"N4SID D has wrong shape: {D_n4.shape}")
 
-        # Prepare initial states and input tensor (always needed for final simulation / plotting)
+            # Pad if needed
+            n4_nx = A_n4.shape[0]
+            A_init = np.zeros((self.nx, self.nx), dtype=np.float64)
+            A_init[:n4_nx, :n4_nx] = A_n4
+
+            B_init = np.zeros((self.nx, self.nd), dtype=np.float64)
+            B_init[:B_n4.shape[0], :] = B_n4
+
+            C_init = np.zeros((self.ne, self.nx), dtype=np.float64)
+            C_init[:, :C_n4.shape[1]] = C_n4
+
+            if n4_nx < self.nx:
+                logger.info(
+                    f"Padding N4SID state dim {n4_nx} → {self.nx} "
+                    "(A top-left, B top rows, C left cols)"
+                )
+
+            # Set parameters
+            self.A.data = torch.tensor(A_init)
+            self.B.data = torch.tensor(B_init)
+            self.C.data = torch.tensor(C_init)
+            self.B2.data = torch.zeros_like(self.B2)
+            self.C2.data = torch.tensor(np.random.randn(self.nz, self.nx))
+            self.D21.data = torch.tensor(np.random.randn(self.nz, self.nd) * 0.01)
+
+            logger.info(f"N4SID loaded: ||A||={np.linalg.norm(A_init):.4f}, "
+                       f"||B||={np.linalg.norm(B_init):.4f}, "
+                       f"||C||={np.linalg.norm(C_init):.4f}")
+
+            # Run SDP for feasibility
+            self.analysis_problem_init(learn_B=False, learn_D21=True)
+
+            # Refit C, D, D12 with new B, D21
+            self._refit_output_matrices(train_inputs, train_states, train_outputs)
+            return True
+
+        except Exception as e:
+            logger.warning(f"N4SID initialization failed: {e}")
+            return False
+
+    def _init_esn(
+        self,
+        train_inputs,
+        train_states,
+        train_outputs,
+        n_restarts: int = 5,
+    ):
+        """
+        Echo State Network initialization: Random reservoirs + Least Squares.
+
+        For each restart:
+        1. Sample random A (spectral radius ≈ α), B, C2, D21
+        2. Simulate to get x, w states
+        3. Fit C, D, D12 via least squares (masking NaN-padded rows)
+        4. Keep the best (lowest training MSE on valid entries)
+
+        Then run SDP once on the best reservoir to find feasible B, D21, P, L.
+        Finally, refit C, D, D12 with the SDP-updated B, D21.
+
+        Args:
+            train_inputs: (B, N, nd)
+            train_states: (B, N, nx_data) or None
+            train_outputs: (B, N, ne)
+            n_restarts: Number of random reservoirs to try
+        """
+        logger.info(f"ESN initialization with {n_restarts} random restarts")
+
+        Bs, N, _ = train_inputs.shape
+        alpha_val = 0.9
+        delta_val = float(self.delta.item())
+
+        # Prepare data
         x0s = torch.zeros(Bs, self.nx, 1)
         if train_states is not None:
             x0s_data = torch.tensor(train_states[:, 0, :].reshape(Bs, self.nx_data, 1))
@@ -294,133 +385,142 @@ class SimpleLure(nn.Module):
             x0s = torch.randn(Bs, self.nx, 1) * self.max_norm_x0
 
         ds = torch.tensor(train_inputs.reshape(Bs, N, self.nd, 1))
+        y_target = torch.tensor(train_outputs.reshape(Bs * N, self.ne))
+        valid_target_rows = torch.isfinite(y_target).all(dim=1)
 
-        if not n4sid_loaded:
-            # ── ESN reservoir search (no SDP) ────────────────────────────────────
-            y_target  = torch.tensor(train_outputs.reshape(Bs * N, self.ne))
-            alpha_val = float(self.alpha.item())
-            delta_val = float(self.delta.item())
+        best_mse = float("inf")
+        best_reservoir = None
 
-            best_mse = float("inf")
-            best_reservoir = None  # stores (A, B, B2, C2, D21) as numpy arrays
+        for trial in range(n_restarts):
+            # Random A: spectral radius = alpha_val
+            A_rand = np.random.randn(self.nx, self.nx)
+            rho = np.max(np.abs(np.linalg.eigvals(A_rand)))
+            A_rand = (alpha_val / max(rho, 1e-8)) * A_rand
 
-            for trial in range(n_restarts):
-                # Random A with spectral radius = alpha_val (rich, diverse dynamics)
-                A_rand = np.random.randn(self.nx, self.nx)
-                rho = np.max(np.abs(np.linalg.eigvals(A_rand)))
-                A_rand = (alpha_val / max(rho, 1e-8)) * A_rand
+            # B2 = 0: keep linear (nonlinearity optimized during training)
+            B2_rand = np.zeros((self.nx, self.nw))
 
-                # B2 = 0: keep initialization linear (nonlinearity feedback optimized during training)
-                B2_rand = np.zeros((self.nx, self.nw))
+            # Random B: scaled by input amplitude
+            B_rand = np.random.randn(self.nx, self.nd) * (delta_val / max(np.sqrt(self.nx), 1.0))
 
-                # Random B: scaled by input amplitude / sqrt(nx)
-                B_rand = np.random.randn(self.nx, self.nd) * (delta_val / max(np.sqrt(self.nx), 1.0))
+            # Random C2: scaled to keep pre-activation ~ O(1)
+            C2_rand = np.random.randn(self.nz, self.nx) / np.sqrt(self.nx)
 
-                # Random C2 scaled to avoid saturation (pre-activation ~ O(1))
-                C2_rand = np.random.randn(self.nz, self.nx) / np.sqrt(self.nx)
+            # Small D21
+            D21_rand = np.random.randn(self.nz, self.nd) * 0.01
 
-                # Small D21
-                D21_rand = np.random.randn(self.nz, self.nd) * 0.01
+            # Set temporarily
+            self.A.data = torch.tensor(A_rand)
+            self.B.data = torch.tensor(B_rand)
+            self.B2.data = torch.tensor(B2_rand)
+            self.C2.data = torch.tensor(C2_rand)
+            self.D21.data = torch.tensor(D21_rand)
 
-                # Temporarily set params
-                self.A.data   = torch.tensor(A_rand)
-                self.B.data   = torch.tensor(B_rand)
-                self.B2.data  = torch.tensor(B2_rand)
-                self.C2.data  = torch.tensor(C2_rand)
-                self.D21.data = torch.tensor(D21_rand)
-
-                # Simulate
-                with torch.no_grad():
-                    _, (xs, ws) = self.lure.forward(x0=x0s, d=ds, return_states=True)
-
-                # Least squares: fit C, D, D12
-                x_flat = xs[:, :N, :, :].squeeze(-1).reshape(Bs * N, self.nx)
-                w_flat = ws.squeeze(-1).reshape(Bs * N, self.nw)
-                u_flat = ds.squeeze(-1).reshape(Bs * N, self.nd)
-                regr   = torch.cat([x_flat, u_flat, w_flat], dim=1)
-                sol    = torch.linalg.lstsq(regr, y_target).solution
-                y_hat  = regr @ sol
-                mse    = float(torch.mean((y_hat - y_target) ** 2))
-
-                logger.info(f"  ESN init trial {trial + 1}/{n_restarts}: train MSE = {mse:.6e}")
-
-                if mse < best_mse:
-                    best_mse = mse
-                    best_reservoir = dict(
-                        A=A_rand.copy(), B=B_rand.copy(), B2=B2_rand.copy(),
-                        C2=C2_rand.copy(), D21=D21_rand.copy(),
-                    )
-
-            logger.info(f"Best reservoir MSE: {best_mse:.6e}. Running SDP for feasibility...")
-
-            # ── SDP: get feasible B, D21, P, L for best reservoir ────────────────
-            self.A.data   = torch.tensor(best_reservoir["A"])
-            self.B2.data  = torch.tensor(best_reservoir["B2"])
-            self.C2.data  = torch.tensor(best_reservoir["C2"])
-            self.B.data   = torch.tensor(best_reservoir["B"])
-            self.D21.data = torch.tensor(best_reservoir["D21"])
-
-            self.analysis_problem_init(learn_B=True, learn_D21=True)
-
-            # ── Re-simulate and refit C, D, D12 with SDP-updated B, D21 ─────────
+            # Simulate
             with torch.no_grad():
                 _, (xs, ws) = self.lure.forward(x0=x0s, d=ds, return_states=True)
 
-                x_flat = xs[:, :N, :, :].squeeze(-1).reshape(Bs * N, self.nx)
-                w_flat = ws.squeeze(-1).reshape(Bs * N, self.nw)
-                u_flat = ds.squeeze(-1).reshape(Bs * N, self.nd)
-                y_flat = train_outputs.reshape(Bs * N, self.ne)
+            # Least squares: fit C, D, D12 on valid rows only
+            x_flat = xs[:, :N, :, :].squeeze(-1).reshape(Bs * N, self.nx)
+            w_flat = ws.squeeze(-1).reshape(Bs * N, self.nw)
+            u_flat = ds.squeeze(-1).reshape(Bs * N, self.nd)
+            regr = torch.cat([x_flat, u_flat, w_flat], dim=1)
+            valid_rows = valid_target_rows & torch.isfinite(regr).all(dim=1)
 
-                regression_matrix = torch.cat([x_flat, u_flat, w_flat], dim=1)
-                solution = torch.linalg.lstsq(
-                    regression_matrix, torch.tensor(y_flat)
-                ).solution
+            if int(valid_rows.sum()) <= regr.shape[1]:
+                logger.info(f"  Trial {trial + 1}/{n_restarts}: skipped (not enough valid rows)")
+                continue
 
-                self.C.data   = solution[: self.nx, :].T
-                self.D.data   = solution[self.nx : self.nx + self.nd, :].T
-                self.D12.data = solution[self.nx + self.nd :, :].T
+            regr_valid = regr[valid_rows]
+            y_valid = y_target[valid_rows]
+            sol = torch.linalg.lstsq(regr_valid, y_valid).solution
+            y_hat = regr_valid @ sol
+            mse = float(torch.mean((y_hat - y_valid) ** 2))
 
-                final_mse = float(
-                    torch.mean(
-                        (regression_matrix @ solution - torch.tensor(y_flat)) ** 2
-                    )
+            logger.info(f"  Trial {trial + 1}/{n_restarts}: MSE = {mse:.6e}")
+
+            if mse < best_mse:
+                best_mse = mse
+                best_reservoir = dict(
+                    A=A_rand.copy(),
+                    B=B_rand.copy(),
+                    B2=B2_rand.copy(),
+                    C2=C2_rand.copy(),
+                    D21=D21_rand.copy(),
                 )
-                logger.info(f"Initialization complete. Final train MSE (with SDP B,D21): {final_mse:.6e}")
-                logger.info(f"  C norm: {torch.norm(self.C).item():.6f}")
-                logger.info(f"  D norm: {torch.norm(self.D).item():.6f}")
-                logger.info(f"  D12 norm: {torch.norm(self.D12).item():.6f}")
-        else:
-            # N4SID path: just simulate to get xs for visualization
-            with torch.no_grad():
-                _, (xs, ws) = self.lure.forward(x0=x0s, d=ds, return_states=True)
 
-        X = np.linalg.inv(self.P.cpu().detach().numpy())
-        H = self.L.cpu().detach().numpy() @ X
-
-
-        if self.nx ==2 :
-            fig, ax = plot_ellipse_and_parallelogram(
-                X, H, self.s.cpu().detach().numpy(), self.max_norm_x0
+        if best_reservoir is None:
+            raise ValueError(
+                "ESN initialization failed: no trial had enough finite rows for least squares"
             )
-            for x0i in x0s:
-                ax.plot(
-                    x0i[0].cpu().detach().numpy(),
-                    x0i[1].cpu().detach().numpy(),
-                    "x",
-                    color="red",
-                    markersize=2,
+
+        logger.info(f"Best reservoir MSE: {best_mse:.6e}")
+
+        # Set best reservoir
+        self.A.data = torch.tensor(best_reservoir["A"])
+        self.B.data = torch.tensor(best_reservoir["B"])
+        self.B2.data = torch.tensor(best_reservoir["B2"])
+        self.C2.data = torch.tensor(best_reservoir["C2"])
+        self.D21.data = torch.tensor(best_reservoir["D21"])
+
+        # Run SDP for feasibility
+        logger.info("Running SDP for feasibility...")
+        self.analysis_problem_init(learn_B=True, learn_D21=True)
+
+        # Refit C, D, D12
+        self._refit_output_matrices(train_inputs, train_states, train_outputs)
+
+    def _refit_output_matrices(self, train_inputs, train_states, train_outputs):
+        """
+        Re-simulate with current A, B, B2, C2, D21 and fit output matrices C, D, D12.
+
+        This is called after SDP initialization to refine output matrices with
+        the updated system matrices.
+        """
+        Bs, N, _ = train_inputs.shape
+
+        # Prepare data
+        x0s = torch.zeros(Bs, self.nx, 1)
+        if train_states is not None:
+            x0s_data = torch.tensor(train_states[:, 0, :].reshape(Bs, self.nx_data, 1))
+            x0s[:, :self.nx_data, :] = x0s_data
+        else:
+            x0s = torch.randn(Bs, self.nx, 1) * self.max_norm_x0
+
+        ds = torch.tensor(train_inputs.reshape(Bs, N, self.nd, 1))
+        y_flat = torch.tensor(train_outputs.reshape(Bs * N, self.ne))
+
+        # Simulate
+        with torch.no_grad():
+            _, (xs, ws) = self.lure.forward(x0=x0s, d=ds, return_states=True)
+
+            x_flat = xs[:, :N, :, :].squeeze(-1).reshape(Bs * N, self.nx)
+            w_flat = ws.squeeze(-1).reshape(Bs * N, self.nw)
+            u_flat = ds.squeeze(-1).reshape(Bs * N, self.nd)
+            regression_matrix = torch.cat([x_flat, u_flat, w_flat], dim=1)
+            valid_rows = torch.isfinite(y_flat).all(dim=1) & torch.isfinite(
+                regression_matrix
+            ).all(dim=1)
+
+            if int(valid_rows.sum()) <= regression_matrix.shape[1]:
+                raise ValueError(
+                    "Refit failed: not enough valid rows for least squares"
                 )
 
-            for xi in xs:
-                ax.plot(xi[:20, 0].cpu().detach().numpy(), xi[:20, 1].cpu().detach().numpy())
-        else:
-            import matplotlib.pyplot as plt
-            fig, ax = plt.subplots(figsize=(8, 8))
-            
+            regression_valid = regression_matrix[valid_rows]
+            y_valid = y_flat[valid_rows]
+            solution = torch.linalg.lstsq(regression_valid, y_valid).solution
 
-        self.check_constraints()
+            self.C.data = solution[: self.nx, :].T
+            self.D.data = solution[self.nx : self.nx + self.nd, :].T
+            self.D12.data = solution[self.nx + self.nd :, :].T
 
-        return fig
+            final_mse = float(torch.mean((regression_valid @ solution - y_valid) ** 2))
+            logger.info(f"Output matrix refit MSE: {final_mse:.6e}")
+            logger.info(f"  ||C||={torch.norm(self.C).item():.6f}")
+            logger.info(f"  ||D||={torch.norm(self.D).item():.6f}")
+            logger.info(f"  ||D12||={torch.norm(self.D12).item():.6f}")
+
 
     def analysis_problem(self, learn_B_and_D21: bool = False) -> bool:
 
@@ -453,19 +553,24 @@ class SimpleLure(nn.Module):
         multiplier_constraints = []
         if self.learn_L:
             L = cp.Variable((self.nz, self.nx))
-            for li in L:
-                li = li.reshape((1, -1), "C")
-                multiplier_constraints.append(
-                    cp.bmat(
-                        [
-                            [np.array([[1 / s**2]]), li],
-                            [li.T, P],
-                        ]
-                    )
-                    >> eps * np.eye(self.nx + 1)
-                )
         else:
             L = self.L.cpu().detach().numpy()
+
+        for li in L:
+            if self.learn_L:
+                li = li.reshape((1, -1), "C")
+            else:
+                li = li.reshape((1, -1))
+            multiplier_constraints.append(
+                cp.bmat(
+                    [
+                        [np.array([[1 / s**2]]), li],
+                        [li.T, P],
+                    ]
+                )
+                >> eps * np.eye(self.nx + 1)
+            )
+
 
         F = cp.bmat(
             [
@@ -534,28 +639,23 @@ class SimpleLure(nn.Module):
         multiplier_constraints = []
         if self.learn_L:
             L = cp.Variable((self.nz, self.nx))
-            for li in L:
-                li = li.reshape((1, -1), "C")
-                multiplier_constraints.append(
-                    cp.bmat(
-                        [
-                            [np.array([[1 / s**2]]), li],
-                            [li.T, P],
-                        ]
-                    )
-                    >> eps * np.eye(self.nx + 1)
-                )
-                # multiplier_constraints.append(
-                #     cp.bmat(
-                #         [
-                #             [s_tilde, li],
-                #             [li.T, P],
-                #         ]
-                #     )
-                #     >> eps * np.eye(self.nx + 1)
-                # )
         else:
             L = self.L.cpu().detach().numpy()
+
+        for li in L:
+            if self.learn_L:
+                li = li.reshape((1, -1), "C")
+            else:
+                li = li.reshape((1, -1))
+            multiplier_constraints.append(
+                cp.bmat(
+                    [
+                        [np.array([[1 / s**2]]), li],
+                        [li.T, P],
+                    ]
+                )
+                >> eps * np.eye(self.nx + 1)
+            )
 
         F = cp.bmat(
             [
@@ -579,10 +679,10 @@ class SimpleLure(nn.Module):
             ],
         )
         try:
-            problem.solve(solver=cp.MOSEK)
+            problem.solve(solver=cp.MOSEK, verbose=False, accept_unknown=True)
         except Exception:
             return False  # SDP failed due to solver error
-        if not problem.status == "optimal":
+        if not problem.status == "optimal" and not problem.status == "optimal_inaccurate":
             return False  # SDP failed to find feasible solution    
         logger.info(f"SDP analysis problem solved: {problem.status}")
 

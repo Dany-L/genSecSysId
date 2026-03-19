@@ -1,10 +1,11 @@
 clear all, close all
 
 % data_folder_path = '/Users/jack/genSecSysId-Data/data/forced_pendulum/prepared/train';
-data_folder_path = '/Users/jack/genSecSysId-Data/data/SilverboxFiles/prepared/train';
+% data_folder_path = '/Users/jack/genSecSysId-Data/data/SilverboxFiles/prepared/train';
+data_folder_path = '/Users/jack/genSecSysId-Data/data/Duffing/train';
 % Get a list of all CSV files in the specified folder
-inputs_name = {'V1'};
-output_name = {'V2'};
+inputs_name = {'u'};
+output_name = {'q'};
 
 csv_files = dir(fullfile(data_folder_path, '*.csv'));
 % Initialize a cell array to hold the input and output data
@@ -28,22 +29,26 @@ outputs = vertcat(outputs_data{:});
 m_u = mean(inputs); std_u = std(inputs);
 m_y = mean(outputs); std_y = std(outputs);
 
-u_n = (inputs-m_u)/std_u;
-y_n = (outputs-m_y)/std_y;
+% u_n = (inputs-m_u)/std_u;
+% y_n = (outputs-m_y)/std_y;
+
+u_n = inputs;
+y_n = outputs;
 
 % sampling time
-f_max = 200;
-odd_harmonics = 1342;
-l_max = 2*odd_harmonics - 1;
+% f_max = 200;
+% odd_harmonics = 1342;
+% l_max = 2*odd_harmonics - 1;
 % f_max = l_max * f_0
-f0 = f_max/l_max;
-fs = f0 * 8192;
-Ts = 1/fs;
+% f0 = f_max/l_max;
+% fs = f0 * 8192;
+% Ts = 1/fs;
+Ts = 0.05;
 
 % Run n4sid to identify a linear state-space model
 tt1 = iddata(y_n, u_n, Ts);
 opt = n4sidOptions('Focus', 'simulation', 'EnforceStability', true);
-nx = 10;
+nx = 2;
 sys = n4sid(tt1, nx, opt); 
 compare(tt1,sys)
 

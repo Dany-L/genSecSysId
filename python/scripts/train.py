@@ -213,6 +213,7 @@ def main():
         val_states=val_states,
         batch_size=data_config.batch_size,
         sequence_length=data_config.sequence_length,
+        sequence_stride=getattr(data_config, "sequence_stride", None),
         normalize=data_config.normalize,
         normalization_method=data_config.normalization_method,
         shuffle=data_config.shuffle,
@@ -231,9 +232,14 @@ def main():
     logger.info("Creating model...")
     print("Creating model...")
     model = create_model(config, delta, max_norm_x0)
-    init_fig = None
     if isinstance(model, SimpleLure):
-        init_fig = model.initialize_parameters(train_inputs, train_states, train_outputs, data_dir=data_config.train_path)
+        model.initialize_parameters(
+            train_inputs,
+            train_states,
+            train_outputs,
+            init_config=config.model.initialization,
+            data_dir=data_config.train_path,
+        )
     print_model_summary(model)
 
     # Count parameters
@@ -339,18 +345,6 @@ def main():
         config.save_yaml(str(config_save_path))
         mlflow.log_artifact(str(config_save_path))
         logger.info(f"Config saved to {config_save_path}")
-
-        # Log initialization plot if available
-        if init_fig is not None:
-            try:
-                plot_path = run_output_dir / "init_ellipse.png"
-                init_fig.savefig(plot_path, bbox_inches="tight")
-                mlflow.log_artifact(str(plot_path), artifact_path="plots")
-                logger.info(f"Logged initialization plot to MLflow artifacts")
-            except Exception as e:
-                logger.warning(f"Failed to log initialization plot: {e}")
-            finally:
-                plt.close(init_fig)
 
         # Save run_id for later use (evaluation/analysis)
         run_info_path = run_model_dir / "run_info.json"

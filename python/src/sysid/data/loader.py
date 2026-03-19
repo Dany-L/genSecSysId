@@ -107,6 +107,7 @@ def create_dataloaders(
     test_states: Optional[np.ndarray] = None,
     batch_size: int = 32,
     sequence_length: Optional[int] = None,
+    sequence_stride: Optional[int] = None,
     normalize: bool = True,
     normalization_method: str = "minmax",
     shuffle: bool = True,
@@ -124,6 +125,8 @@ def create_dataloaders(
         test_outputs: Test output data (optional)
         batch_size: Batch size
         sequence_length: Sequence length for sliding window
+        sequence_stride: Stride between windows. If None and data is one long
+            concatenated sequence, defaults to sequence_length (non-overlapping windows).
         normalize: Whether to normalize data
         normalization_method: Normalization method
         shuffle: Whether to shuffle training data
@@ -147,9 +150,26 @@ def create_dataloaders(
             test_inputs = normalizer.transform_inputs(test_inputs)
             test_outputs = normalizer.transform_outputs(test_outputs)
 
+    # For concatenated loading (shape: (1, total_len, n_features)), default to
+    # non-overlapping windows unless explicitly configured.
+    if sequence_length is not None and sequence_stride is None and train_inputs.shape[0] == 1:
+        sequence_stride = sequence_length
+
     # Create datasets
-    train_dataset = TimeSeriesDataset(train_inputs, train_outputs, train_states, sequence_length)
-    val_dataset = TimeSeriesDataset(val_inputs, val_outputs, val_states, sequence_length)
+    train_dataset = TimeSeriesDataset(
+        train_inputs,
+        train_outputs,
+        train_states,
+        sequence_length,
+        sequence_stride,
+    )
+    val_dataset = TimeSeriesDataset(
+        val_inputs,
+        val_outputs,
+        val_states,
+        sequence_length,
+        sequence_stride,
+    )
 
     # Create data loaders
     train_loader = TorchDataLoader(
@@ -170,7 +190,13 @@ def create_dataloaders(
 
     test_loader = None
     if test_inputs is not None:
-        test_dataset = TimeSeriesDataset(test_inputs, test_outputs, test_states, sequence_length)
+        test_dataset = TimeSeriesDataset(
+            test_inputs,
+            test_outputs,
+            test_states,
+            sequence_length,
+            sequence_stride,
+        )
         test_loader = TorchDataLoader(
             test_dataset,
             batch_size=batch_size,

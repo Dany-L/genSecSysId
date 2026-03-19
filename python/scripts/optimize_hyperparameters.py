@@ -99,6 +99,7 @@ def objective(trial: optuna.Trial, base_config: Config, data_cache: Dict[str, An
             val_states=None,  # Skip states during trials
             batch_size=batch_size,
             sequence_length=config.data.sequence_length,
+            sequence_stride=getattr(config.data, 'sequence_stride', None),
             normalize=config.data.normalize,
             normalization_method=config.data.normalization_method,
             shuffle=config.data.shuffle,
@@ -128,13 +129,15 @@ def objective(trial: optuna.Trial, base_config: Config, data_cache: Dict[str, An
         # Initialize model parameters (lightweight version)
         if hasattr(model, 'initialize_parameters'):
             logger.info("Initializing model parameters...")
-            # Don't pass states during trials to avoid dimension mismatches
-            # The model will use default initialization values
+            from sysid.config import InitializationConfig
+            
+            # Use lightweight ESN initialization for trials
+            trial_init_config = InitializationConfig(method="esn", esn_n_restarts=1)
             model.initialize_parameters(
                 train_inputs=data_cache['train_inputs'][:2],  # Use subset for speed
                 train_states=None,  # Skip states during trial initialization
                 train_outputs=data_cache['train_outputs'][:2],
-                n_restarts=1,  # Reduced for speed
+                init_config=trial_init_config,
                 data_dir=None,  # Skip N4SID loading for trials
             )
         

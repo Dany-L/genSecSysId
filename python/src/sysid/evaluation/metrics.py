@@ -7,34 +7,52 @@ import numpy as np
 
 def compute_metrics(e_hat: np.ndarray, e: np.ndarray) -> Dict[str, float]:
     """
-    Compute various evaluation metrics.
+    Compute various evaluation metrics, ignoring NaN values.
 
     Args:
-        e_hat: Predicted output values
-        e: Output (target) values
+        e_hat: Predicted output values (may contain NaN for invalid regions)
+        e: Output (target) values (may contain NaN for invalid regions)
 
     Returns:
-        Dictionary of metrics
+        Dictionary of metrics (computed only on finite values)
     """
+    # Identify valid (finite) entries
+    valid = np.isfinite(e) & np.isfinite(e_hat)
+    
+    if not valid.any():
+        # No valid values to compute metrics on
+        return {
+            "mse": float('nan'),
+            "rmse": float('nan'),
+            "mae": float('nan'),
+            "r2": float('nan'),
+            "nrmse": float('nan'),
+            "max_error": float('nan'),
+        }
+    
+    # Extract valid entries only
+    e_hat_valid = e_hat[valid]
+    e_valid = e[valid]
+
     # Mean Squared Error
-    mse = np.mean((e_hat - e) ** 2)
+    mse = np.mean((e_hat_valid - e_valid) ** 2)
 
     # Root Mean Squared Error
     rmse = np.sqrt(mse)
 
     # Mean Absolute Error
-    mae = np.mean(np.abs(e_hat - e))
+    mae = np.mean(np.abs(e_hat_valid - e_valid))
 
     # R-squared score
-    ss_res = np.sum((e - e_hat) ** 2)
-    ss_tot = np.sum((e - np.mean(e)) ** 2)
+    ss_res = np.sum((e_valid - e_hat_valid) ** 2)
+    ss_tot = np.sum((e_valid - np.mean(e_valid)) ** 2)
     r2 = 1 - (ss_res / (ss_tot + 1e-10))
 
     # Normalized RMSE (NRMSE)
-    nrmse = rmse / (np.max(e) - np.min(e) + 1e-10)
+    nrmse = rmse / (np.max(e_valid) - np.min(e_valid) + 1e-10)
 
     # Max error
-    max_error = np.max(np.abs(e_hat - e))
+    max_error = np.max(np.abs(e_hat_valid - e_valid))
 
     return {
         "mse": float(mse),

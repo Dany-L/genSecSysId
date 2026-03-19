@@ -16,6 +16,7 @@ class TimeSeriesDataset(Dataset):
         outputs: np.ndarray,
         states: Optional[np.ndarray] = None,
         sequence_length: Optional[int] = None,
+        sequence_stride: Optional[int] = None,
     ):
         """
         Initialize the dataset.
@@ -25,11 +26,14 @@ class TimeSeriesDataset(Dataset):
             outputs: Output data of shape (n_samples, n_timesteps, n_outputs) or (n_samples, n_outputs)
             states: Optional state data of shape (n_samples, n_timesteps, n_states) or (n_samples, n_states)
             sequence_length: Length of sequences to extract (for sliding window). If None, use full sequences.
+            sequence_stride: Step size between consecutive sequence windows. If None,
+                defaults to 1 in sliding-window mode.
         """
         self.inputs = torch.Tensor(inputs)
         self.outputs = torch.Tensor(outputs)
         self.states = torch.Tensor(states) if states is not None else None
         self.sequence_length = sequence_length
+        self.sequence_stride = sequence_stride
 
         # Ensure 3D shape (n_samples, n_timesteps, n_features)
         if self.inputs.ndim == 2:
@@ -55,10 +59,16 @@ class TimeSeriesDataset(Dataset):
 
         self.n_samples = self.inputs.shape[0]
         self.n_timesteps = self.inputs.shape[1]
+        self.windows_per_sample = 1
 
         # Calculate number of sequences if using sliding window
         if self.sequence_length is not None and self.sequence_length < self.n_timesteps:
-            self.n_sequences = self.n_samples * (self.n_timesteps - self.sequence_length + 1)
+            stride = self.sequence_stride if self.sequence_stride is not None else 1
+            if stride <= 0:
+                raise ValueError("sequence_stride must be a positive integer")
+
+            self.windows_per_sample = ((self.n_timesteps - self.sequence_length) // stride) + 1
+            self.n_sequences = self.n_samples * self.windows_per_sample
             self.use_sliding_window = True
         else:
             self.n_sequences = self.n_samples
@@ -81,8 +91,10 @@ class TimeSeriesDataset(Dataset):
         """
         if self.use_sliding_window:
             # Convert flat index to (sample_idx, start_idx)
-            sample_idx = idx // (self.n_timesteps - self.sequence_length + 1)
-            start_idx = idx % (self.n_timesteps - self.sequence_length + 1)
+            stride = self.sequence_stride if self.sequence_stride is not None else 1
+            sample_idx = idx // self.windows_per_sample
+            window_idx = idx % self.windows_per_sample
+            start_idx = window_idx * stride
             end_idx = start_idx + self.sequence_length
 
             input_seq = self.inputs[sample_idx, start_idx:end_idx]

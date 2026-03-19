@@ -46,10 +46,18 @@ class DataNormalizer:
             outputs: Output data
         """
         if self.method == "minmax":
-            self.input_min = np.min(inputs, axis=(0, 1), keepdims=True)
-            self.input_max = np.max(inputs, axis=(0, 1), keepdims=True)
-            self.output_min = np.min(outputs, axis=(0, 1), keepdims=True)
-            self.output_max = np.max(outputs, axis=(0, 1), keepdims=True)
+            self.input_min = np.nanmin(inputs, axis=(0, 1), keepdims=True)
+            self.input_max = np.nanmax(inputs, axis=(0, 1), keepdims=True)
+            self.output_min = np.nanmin(outputs, axis=(0, 1), keepdims=True)
+            self.output_max = np.nanmax(outputs, axis=(0, 1), keepdims=True)
+
+            if not np.isfinite(self.input_min).all() or not np.isfinite(self.input_max).all():
+                raise ValueError("Cannot fit input min/max: input data contains no finite values")
+            if not np.isfinite(self.output_min).all() or not np.isfinite(self.output_max).all():
+                raise ValueError(
+                    "Cannot fit output min/max: output data contains no finite values. "
+                    "Check CSV parsing and padded targets."
+                )
 
             # Avoid division by zero
             self.input_max = np.where(
@@ -60,10 +68,18 @@ class DataNormalizer:
             )
 
         elif self.method == "standard":
-            self.input_mean = np.mean(inputs, axis=(0, 1), keepdims=True)
-            self.input_std = np.std(inputs, axis=(0, 1), keepdims=True)
-            self.output_mean = np.mean(outputs, axis=(0, 1), keepdims=True)
-            self.output_std = np.std(outputs, axis=(0, 1), keepdims=True)
+            self.input_mean = np.nanmean(inputs, axis=(0, 1), keepdims=True)
+            self.input_std = np.nanstd(inputs, axis=(0, 1), keepdims=True)
+            self.output_mean = np.nanmean(outputs, axis=(0, 1), keepdims=True)
+            self.output_std = np.nanstd(outputs, axis=(0, 1), keepdims=True)
+
+            if not np.isfinite(self.input_mean).all() or not np.isfinite(self.input_std).all():
+                raise ValueError("Cannot fit input mean/std: input data contains no finite values")
+            if not np.isfinite(self.output_mean).all() or not np.isfinite(self.output_std).all():
+                raise ValueError(
+                    "Cannot fit output mean/std: output data contains no finite values. "
+                    "Check CSV parsing and padded targets."
+                )
 
             # Avoid division by zero
             self.input_std = np.where(self.input_std == 0, 1.0, self.input_std)

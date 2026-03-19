@@ -41,7 +41,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # TEST_DATA_PATH = "~/genSecSysId-Data/data/toy_example/prepared/test"  # set this is hard coded but will later become a parameter
-TEST_DATA_PATH = "/Users/jack/genSecSysId-Data/data/SilverboxFiles/prepared/test"
+# TEST_DATA_PATH = "/Users/jack/genSecSysId-Data/data/SilverboxFiles/prepared/test"
+TEST_DATA_PATH = "/Users/jack/genSecSysId-Data/data/Duffing/test"
 TRAJECTORY_LIST = [0,1]
 # TRAJECTORY_LIST = [
 #     93,

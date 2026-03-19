@@ -1,0 +1,51 @@
+# Example: N4SID Initialization (Physics-informed warm-start)
+#
+# Requires: n4sid_params.mat file in the data train directory
+# File should contain MATLAB matrices: A, B, C, D from system identification
+#
+# If file not found, automatically falls back to ESN with esn_n_restarts restarts
+
+data:
+  train_path: ~/genSecSysId-Data/data/Duffing/train  # Must contain n4sid_params.mat
+  input_col: ["d"]
+  output_col: ["e"]
+  state_col: []
+  pattern: "*.csv"
+  normalize: true
+  batch_size: 32
+  sequence_length: 500
+  sequence_stride: 1
+
+model:
+  model_type: crnn
+  nw: 64
+  nx: 8
+  activation: sat
+  initialization:
+    method: n4sid             # Primary: load from n4sid_params.mat
+    esn_n_restarts: 3         # Fallback to ESN with 3 restarts if N4SID file missing
+
+optimizer:
+  optimizer_type: adam
+  learning_rate: 0.001
+  weight_decay: 1e-5
+  use_scheduler: true
+  scheduler_type: reduce_on_plateau
+  scheduler_patience: 10
+  scheduler_factor: 0.5
+
+training:
+  max_epochs: 500
+  early_stopping_patience: 50
+  gradient_clip_value: 1.0
+  loss_type: mse
+  use_custom_regularization: false
+
+mlflow:
+  experiment_name: sysid_n4sid_init
+  run_name: n4sid_physics_informed
+  log_models: true
+  log_artifacts: true
+
+evaluation:
+  metrics: ["mse", "rmse", "mae", "r2"]

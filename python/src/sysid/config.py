@@ -15,18 +15,23 @@ class DataConfig:
     train_path: str
     val_path: Optional[str] = None  # Not required for folder loading
     test_path: Optional[str] = None  # Not required for folder loading
+    root_dir: Optional[str] = None  # Root directory for relative paths
 
     # Direct folder loading parameters
     input_col: list = None  # Column name(s) for input - supports MIMO
+    input_cols: list = None  # Alias for input_col
     output_col: list = None  # Column name(s) for output - supports MIMO
+    output_cols: list = None  # Alias for output_col
     state_col: list = None  # Column name(s) for state (optional)
     pattern: str = "*.csv"  # File pattern for folder loading
 
     # Preprocessing
     normalize: bool = True
+    normalization: Optional[str] = None  # Alias for normalize (if "minmax" or "standard")
     normalization_method: str = "minmax"  # or "standard"
     batch_size: int = 32
     sequence_length: Optional[int] = None  # None = use full sequences
+    sequence_stride: Optional[int] = None  # None = auto (non-overlap for concatenated data)
     shuffle: bool = True
     num_workers: int = 0
 
@@ -41,17 +46,55 @@ class DataConfig:
 
 
 @dataclass
+class InitializationConfig:
+    """Configuration for model parameter initialization."""
+
+    method: str = "esn"  # "esn", "n4sid", or "identity"
+    # ESN-specific parameters
+    esn_n_restarts: int = 5  # Number of random reservoirs to try
+    # Identity initialization uses α=0.99, A=0.9I, C2=Rand(-1,1), C=[I,0], B2=D=D12=0
+
+
+@dataclass
 class ModelConfig:
     """Configuration for model architecture."""
 
     model_type: str = "rnn"  # "rnn", "lstm", "gru", or custom
-    nw: int = 64
-    nx: int = 64
+    type: Optional[str] = None  # Alias for model_type
+    input_size: int = 1
+    output_size: int = 1
+    hidden_size: int = 64
     num_layers: int = 2
     dropout: float = 0.0
     activation: str = "tanh"
+    # Legacy aliases for backward compatibility
+    nw: Optional[int] = None  # alias for hidden_size
+    nx: Optional[int] = None  # alias for input_size (unused, kept for compatibility)
+    nd: Optional[int] = None  # input dimension (constrained models)
+    ne: Optional[int] = None  # output dimension (constrained models)
     # Custom parameters for specific models
     custom_params: Optional[Dict[str, Any]] = None
+    # Initialization configuration
+    initialization: InitializationConfig = None
+
+    def __post_init__(self):
+        """Set default initialization if none provided."""
+        if self.initialization is None:
+            self.initialization = InitializationConfig()
+        # Support type as alias for model_type
+        if self.type is not None:
+            self.model_type = self.type
+        # Support legacy nw/nx parameters
+        if self.nw is not None:
+            self.hidden_size = self.nw
+        if self.nx is not None and self.nx != self.input_size:
+            # nx was previously used differently, log warning if differs
+            pass
+        # Support constrained model dimensions
+        if self.nd is not None and self.input_size == 1:  # Only override if not explicitly set
+            self.input_size = self.nd
+        if self.ne is not None and self.output_size == 1:  # Only override if not explicitly set
+            self.output_size = self.ne
 
 
 @dataclass
@@ -116,8 +159,9 @@ class EvaluationConfig:
     """Configuration for evaluation metrics."""
 
     # Base metrics (always computed, but can be excluded from logging)
-    metrics: list = None  # List of metrics to compute and log
-
+    metrics: Optional[list] = None  # List of metrics to compute and log
+    metrics_to_log: Optional[list] = None  # Alias for metrics
+    
     # Available metrics:
     # - mse: Mean Squared Error
     # - rmse: Root Mean Squared Error
@@ -129,6 +173,13 @@ class EvaluationConfig:
     # For sequence predictions, also available:
     # - <metric>_avg: Average over all time steps
     # - <metric>_final: Metric at final time step
+    
+    def __post_init__(self):
+        """Handle both metrics and metrics_to_log field names."""
+        if self.metrics_to_log is not None and self.metrics is None:
+            self.metrics = self.metrics_to_log
+        elif self.metrics_to_log is None and self.metrics is not None:
+            self.metrics_to_log = self.metrics
 
     def __post_init__(self):
         """Set default metrics if none provided."""
@@ -182,17 +233,52 @@ class Config:
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "Config":
-        """Create Config from dictionary."""
+        """Create Config from dictionary, properly instantiating nested dataclasses."""
+        # Normalize field names for each config section
+        
+        # Handle data config with field name mappings
+        data_dict = config_dict.get("data", {}).copy()
+        if "input_cols" in data_dict and "input_col" not in data_dict:
+            data_dict["input_col"] = data_dict.pop("input_cols")
+        if "output_cols" in data_dict and "output_col" not in data_dict:
+            data_dict["output_col"] = data_dict.pop("output_cols")
+        if "normalization" in data_dict and "normalize" not in data_dict:
+            # Map normalization value to normalize if it's a boolean indicator
+            norm_val = data_dict.pop("normalization")
+            if isinstance(norm_val, bool):
+                data_dict["normalize"] = norm_val
+        
+        # Handle model config with nested initialization config
+        model_dict = config_dict.get("model", {}).copy()
+        if "initialization" in model_dict and isinstance(model_dict["initialization"], dict):
+            model_dict["initialization"] = InitializationConfig(**model_dict["initialization"])
+        
+        # Handle optimizer config with field name mappings
+        optimizer_dict = config_dict.get("optimizer", {}).copy()
+        # Training config often contains optimizer settings, so merge them
+        training_dict = config_dict.get("training", {}).copy()
+        if "learning_rate" in training_dict and "learning_rate" not in optimizer_dict:
+            optimizer_dict["learning_rate"] = training_dict.pop("learning_rate")
+        if "optimizer" in training_dict and "optimizer_type" not in optimizer_dict:
+            optimizer_dict["optimizer_type"] = training_dict.pop("optimizer")
+        
+        # Handle training config with field name mappings
+        if "epochs" in training_dict:
+            training_dict["max_epochs"] = training_dict.pop("epochs")
+        if "loss_function" in training_dict and "loss_type" not in training_dict:
+            training_dict["loss_type"] = training_dict.pop("loss_function")
+        
         # Handle evaluation config
         eval_config = None
         if "evaluation" in config_dict:
-            eval_config = EvaluationConfig(**config_dict["evaluation"])
+            eval_dict = config_dict["evaluation"].copy()
+            eval_config = EvaluationConfig(**eval_dict)
 
         return cls(
-            data=DataConfig(**config_dict.get("data", {})),
-            model=ModelConfig(**config_dict.get("model", {})),
-            optimizer=OptimizerConfig(**config_dict.get("optimizer", {})),
-            training=TrainingConfig(**config_dict.get("training", {})),
+            data=DataConfig(**data_dict),
+            model=ModelConfig(**model_dict),
+            optimizer=OptimizerConfig(**optimizer_dict),
+            training=TrainingConfig(**training_dict),
             mlflow=MLflowConfig(**config_dict.get("mlflow", {})),
             evaluation=eval_config,
             output_dir=config_dict.get("output_dir", "outputs"),

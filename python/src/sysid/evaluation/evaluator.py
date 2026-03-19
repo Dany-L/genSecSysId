@@ -73,7 +73,7 @@ class Evaluator:
                 e = e.to(self.device)
 
                 # Forward pass
-                e_hat = self.model(d, x)  # e_hat: predicted output
+                e_hat, (x,w) = self.model(d, x, return_state=True)  # e_hat: predicted output
 
                 all_predictions.append(e_hat.cpu().numpy())
                 all_targets.append(e.cpu().numpy())
