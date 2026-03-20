@@ -340,6 +340,27 @@ def main():
             }
         )
 
+        # Log structural constraints info if present
+        if hasattr(model, "structural_constraints") and model.structural_constraints:
+            mlflow.log_param("has_structural_constraints", True)
+            constrained_params = list(model.structural_constraints.keys())
+            mlflow.log_param("constrained_parameters", ",".join(constrained_params))
+            
+            # Log details for each constraint
+            for param_name, constraint in model.structural_constraints.items():
+                if constraint.get("fixed", False):
+                    mlflow.log_param(f"constraint_{param_name}", "fully_fixed")
+                elif "learnable_rows" in constraint:
+                    learnable_str = ",".join(map(str, constraint["learnable_rows"]))
+                    mlflow.log_param(f"constraint_{param_name}", f"learnable_rows_{learnable_str}")
+                elif "learnable_cols" in constraint:
+                    learnable_str = ",".join(map(str, constraint["learnable_cols"]))
+                    mlflow.log_param(f"constraint_{param_name}", f"learnable_cols_{learnable_str}")
+            
+            logger.info(f"Structural constraints applied to: {', '.join(constrained_params)}")
+        else:
+            mlflow.log_param("has_structural_constraints", False)
+
         # Save config
         config_save_path = run_output_dir / "config.yaml"
         config.save_yaml(str(config_save_path))

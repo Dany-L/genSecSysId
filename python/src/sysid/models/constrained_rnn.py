@@ -77,6 +77,9 @@ class SimpleLure(nn.Module):
         # Dual penalty coefficient (not a parameter, updated manually)
         self.register_buffer("dual_penalty", torch.tensor(self.dual_penalty_init))
 
+        # Parse structural constraints
+        self.structural_constraints = self._parse_structural_constraints(custom_params)
+
         if learn_L:
             self.L = nn.Parameter(torch.zeros((nz, nx)))  # Coupling matrix
             self.alpha = nn.Parameter(torch.tensor(0.99), requires_grad=True)
@@ -89,19 +92,45 @@ class SimpleLure(nn.Module):
         self.la = nn.Parameter(torch.ones(nz))
         self.M = torch.diag(self.la)
 
-        self.A = nn.Parameter(torch.zeros(self.nx, self.nx))
-        self.B = nn.Parameter(torch.zeros(self.nx, nd))
-        self.B2 = nn.Parameter(torch.zeros(self.nx, nw))
+        # Create system matrices with structural constraints
+        self.A = self._create_constrained_parameter(
+            'A', (self.nx, self.nx), 
+            self.structural_constraints.get('A')
+        )
+        self.B = self._create_constrained_parameter(
+            'B', (self.nx, nd),
+            self.structural_constraints.get('B')
+        )
+        self.B2 = self._create_constrained_parameter(
+            'B2', (self.nx, nw),
+            self.structural_constraints.get('B2')
+        )
 
-        self.C = nn.Parameter(torch.zeros(ne, self.nx))
-        self.D = nn.Parameter(torch.zeros(ne, nd))
-        # self.D = nn.Parameter(torch.zeros(ne, nd), requires_grad=False)  # Keep D fixed to zero for simplicity (can be relaxed later)
-        self.D12 = nn.Parameter(torch.zeros(ne, nw))
-        # self.D12 = nn.Parameter(torch.zeros(ne, nw), requires_grad=False)  # Keep D12 fixed to zero for simplicity (can be relaxed later)
+        self.C = self._create_constrained_parameter(
+            'C', (ne, self.nx),
+            self.structural_constraints.get('C')
+        )
+        self.D = self._create_constrained_parameter(
+            'D', (ne, nd),
+            self.structural_constraints.get('D')
+        )
+        self.D12 = self._create_constrained_parameter(
+            'D12', (ne, nw),
+            self.structural_constraints.get('D12')
+        )
 
-        self.C2 = nn.Parameter(torch.zeros(nz, self.nx))
-        self.D21 = nn.Parameter(torch.zeros(nz, nd))
-        self.D22 = nn.Parameter(torch.zeros(nz, nw))
+        self.C2 = self._create_constrained_parameter(
+            'C2', (nz, self.nx),
+            self.structural_constraints.get('C2')
+        )
+        self.D21 = self._create_constrained_parameter(
+            'D21', (nz, nd),
+            self.structural_constraints.get('D21')
+        )
+        self.D22 = self._create_constrained_parameter(
+            'D22', (nz, nw),
+            self.structural_constraints.get('D22')
+        )
 
         if activation == "sat":
             Delta = nn.Hardtanh(min_val=-1.0, max_val=1.0)
@@ -127,7 +156,366 @@ class SimpleLure(nn.Module):
             )
         )
 
+        # Register gradient masks for partially constrained parameters
+        self._register_gradient_masks()
+        
+        # Log structural constraints information
+        self._log_structural_constraints()
+
         # self.initialize_parameters()
+
+    def _parse_structural_constraints(self, custom_params: dict) -> dict:
+        """
+        Parse and validate structural constraints from custom_params.
+        
+        Args:
+            custom_params: Dictionary containing model-specific parameters
+            
+        Returns:
+            dict: Validated constraint specifications mapping {param_name: constraint_spec}
+                  constraint_spec can be:
+                  - {'fixed': True, 'value': <value>}
+                  - {'learnable_rows': [...], 'fixed_value': <val>}
+                  - {'learnable_cols': [...], 'fixed_value': <val>}
+                  - None (fully learnable)
+        
+        Raises:
+            ValueError: If constraints are invalid
+        """
+        if custom_params is None:
+            return {}
+        
+        constraints = custom_params.get('structural_constraints', {})
+        if not constraints:
+            return {}
+        
+        # Validate each constraint spec
+        valid_params = ['A', 'B', 'B2', 'C', 'D', 'D12', 'C2', 'D21', 'D22']
+        validated_constraints = {}
+        
+        for param_name, spec in constraints.items():
+            # Check if it's a valid parameter name
+            if param_name not in valid_params:
+                logger.warning(
+                    f"Unknown parameter '{param_name}' in structural_constraints - ignoring"
+                )
+                continue
+            
+            # Validate fixed parameters
+            if spec.get('fixed', False):
+                if 'value' not in spec:
+                    raise ValueError(
+                        f"Parameter '{param_name}' marked as fixed but no value provided. "
+                        f"Please specify 'value' in the constraint."
+                    )
+            
+            # Validate learnable_rows/cols
+            if 'learnable_rows' in spec and 'learnable_cols' in spec:
+                raise ValueError(
+                    f"Parameter '{param_name}' cannot have both 'learnable_rows' and "
+                    f"'learnable_cols'. Please specify only one."
+                )
+            
+            validated_constraints[param_name] = spec
+        
+        return validated_constraints
+    
+    def _create_constrained_parameter(
+        self, 
+        name: str, 
+        shape: tuple, 
+        constraint_spec: Optional[dict]
+    ) -> nn.Parameter:
+        """
+        Create a parameter with structural constraints applied.
+        
+        Args:
+            name: Parameter name (e.g., 'A', 'B2', 'C')
+            shape: Parameter shape tuple
+            constraint_spec: Constraint specification from config
+        
+        Returns:
+            nn.Parameter with appropriate requires_grad and initial value
+            
+        Raises:
+            ValueError: If constraint specification is invalid
+        """
+        if constraint_spec is None:
+            # Fully learnable (default behavior)
+            return nn.Parameter(torch.zeros(shape, dtype=torch.float64))
+        
+        if constraint_spec.get('fixed', False):
+            # Fully fixed parameter
+            value = constraint_spec['value']
+            
+            # Convert value to tensor of correct shape
+            if isinstance(value, (int, float)):
+                # Scalar: broadcast to full shape
+                tensor = torch.full(shape, float(value), dtype=torch.float64)
+            elif isinstance(value, list):
+                # List or nested list: convert to tensor
+                tensor = torch.tensor(value, dtype=torch.float64)
+                if tensor.shape != shape:
+                    raise ValueError(
+                        f"Shape mismatch for fixed parameter '{name}': "
+                        f"expected {shape}, got {tensor.shape}. "
+                        f"Please check the 'value' specification in your config."
+                    )
+            else:
+                raise ValueError(
+                    f"Invalid value type for parameter '{name}': {type(value)}. "
+                    f"Expected scalar or list."
+                )
+            
+            # Create non-trainable parameter
+            return nn.Parameter(tensor, requires_grad=False)
+        
+        # Partially learnable: validate indices
+        if 'learnable_rows' in constraint_spec:
+            learnable_rows = constraint_spec['learnable_rows']
+            max_row = shape[0] - 1
+            
+            for row_idx in learnable_rows:
+                if row_idx < 0 or row_idx > max_row:
+                    raise ValueError(
+                        f"Invalid row index {row_idx} for parameter '{name}' "
+                        f"with shape {shape}. Valid range: [0, {max_row}]"
+                    )
+        
+        if 'learnable_cols' in constraint_spec:
+            learnable_cols = constraint_spec['learnable_cols']
+            max_col = shape[1] - 1 if len(shape) > 1 else 0
+            
+            for col_idx in learnable_cols:
+                if col_idx < 0 or col_idx > max_col:
+                    raise ValueError(
+                        f"Invalid column index {col_idx} for parameter '{name}' "
+                        f"with shape {shape}. Valid range: [0, {max_col}]"
+                    )
+        
+        # Create parameter initialized to fixed_value
+        fixed_value = constraint_spec.get('fixed_value', 0.0)
+        param = nn.Parameter(torch.full(shape, float(fixed_value), dtype=torch.float64))
+        
+        # Store constraint info for gradient masking
+        if not hasattr(self, '_parameter_constraints'):
+            self._parameter_constraints = {}
+        self._parameter_constraints[name] = constraint_spec
+        
+        return param
+    
+    def _create_gradient_mask(
+        self, 
+        name: str, 
+        shape: tuple, 
+        constraint_spec: dict
+    ) -> Optional[torch.Tensor]:
+        """
+        Create gradient mask tensor from constraint specification.
+        
+        Args:
+            name: Parameter name
+            shape: Parameter shape
+            constraint_spec: Constraint specification
+            
+        Returns:
+            Mask tensor (0 for fixed elements, 1 for learnable) or None if no masking needed
+        """
+        if constraint_spec.get('fixed', False):
+            return None  # Fully fixed, no gradient anyway
+        
+        mask = torch.ones(shape, dtype=torch.float64)
+        
+        if 'learnable_rows' in constraint_spec:
+            learnable_rows = constraint_spec['learnable_rows']
+            # Zero out all rows first
+            mask.zero_()
+            # Enable learnable rows
+            for row_idx in learnable_rows:
+                mask[row_idx, :] = 1.0
+        
+        elif 'learnable_cols' in constraint_spec:
+            learnable_cols = constraint_spec['learnable_cols']
+            # Zero out all columns first
+            mask.zero_()
+            # Enable learnable columns
+            for col_idx in learnable_cols:
+                mask[:, col_idx] = 1.0
+        
+        elif 'learnable_elements' in constraint_spec:
+            learnable_elements = constraint_spec['learnable_elements']
+            mask.zero_()
+            for (i, j) in learnable_elements:
+                mask[i, j] = 1.0
+        
+        else:
+            return None  # No masking needed
+        
+        return mask
+    
+    def _register_gradient_masks(self):
+        """
+        Register gradient hooks for partially constrained parameters.
+        
+        For each parameter with partial constraints (learnable_rows/cols), 
+        registers a hook that zeros out gradients for non-learnable elements.
+        """
+        if not hasattr(self, '_parameter_constraints') or not self._parameter_constraints:
+            return
+        
+        param_map = {
+            'A': self.A, 'B': self.B, 'B2': self.B2,
+            'C': self.C, 'D': self.D, 'D12': self.D12,
+            'C2': self.C2, 'D21': self.D21, 'D22': self.D22,
+        }
+        
+        for name, constraint_spec in self._parameter_constraints.items():
+            if name not in param_map:
+                continue
+            
+            param = param_map[name]
+            
+            # Skip fully fixed parameters
+            if not param.requires_grad:
+                continue
+            
+            # Create gradient mask
+            mask = self._create_gradient_mask(name, param.shape, constraint_spec)
+            
+            if mask is None:
+                continue  # No masking needed
+            
+            # Register hook
+            def make_hook(mask_tensor):
+                def hook(grad):
+                    if grad is None:
+                        return None
+                    return grad * mask_tensor
+                return hook
+            
+            param.register_hook(make_hook(mask))
+            
+            # Log mask info
+            num_learnable = int(mask.sum().item())
+            num_total = int(mask.numel())
+            logger.info(
+                f"  Registered gradient mask for '{name}': "
+                f"{num_learnable}/{num_total} elements learnable "
+                f"({100*num_learnable/num_total:.1f}%)"
+            )
+    
+    def _is_parameter_fixed(self, name: str) -> bool:
+        """
+        Check if a parameter is fully fixed (not trainable at all).
+        
+        Args:
+            name: Parameter name
+            
+        Returns:
+            True if parameter is fully fixed, False otherwise
+        """
+        if not hasattr(self, 'structural_constraints'):
+            return False
+        
+        if name not in self.structural_constraints:
+            return False
+        
+        return self.structural_constraints[name].get('fixed', False)
+    
+    def _should_skip_initialization(self, name: str) -> bool:
+        """
+        Check if parameter initialization should be skipped.
+        
+        Args:
+            name: Parameter name
+            
+        Returns:
+            True for fully fixed parameters (they keep their fixed values),
+            False for partially or fully learnable parameters
+        """
+        return self._is_parameter_fixed(name)
+    
+    def _apply_partial_initialization(self, name: str, init_data: torch.Tensor):
+        """
+        Apply initialization data to a partially constrained parameter.
+        
+        Only updates the learnable portions, keeps fixed portions at fixed_value.
+        
+        Args:
+            name: Parameter name
+            init_data: Initialization data tensor
+        """
+        if not hasattr(self, 'structural_constraints'):
+            # No constraints, apply directly
+            param = getattr(self, name)
+            param.data = init_data
+            return
+        
+        if name not in self.structural_constraints:
+            # No constraints on this parameter, apply directly
+            param = getattr(self, name)
+            param.data = init_data
+            return
+        
+        constraint_spec = self.structural_constraints[name]
+        param = getattr(self, name)
+        
+        if 'learnable_rows' in constraint_spec:
+            # Update only learnable rows
+            learnable_rows = constraint_spec['learnable_rows']
+            for row_idx in learnable_rows:
+                param.data[row_idx, :] = init_data[row_idx, :]
+        
+        elif 'learnable_cols' in constraint_spec:
+            # Update only learnable columns
+            learnable_cols = constraint_spec['learnable_cols']
+            for col_idx in learnable_cols:
+                param.data[:, col_idx] = init_data[:, col_idx]
+        
+        elif 'learnable_elements' in constraint_spec:
+            # Update only specific elements
+            learnable_elements = constraint_spec['learnable_elements']
+            for (i, j) in learnable_elements:
+                param.data[i, j] = init_data[i, j]
+        else:
+            # No partial constraint, apply directly
+            param.data = init_data
+    
+    def _log_structural_constraints(self):
+        """Log structural constraints information."""
+        if not hasattr(self, 'structural_constraints') or not self.structural_constraints:
+            logger.info("No structural constraints specified - all parameters fully learnable")
+            return
+        
+        logger.info("=" * 80)
+        logger.info("STRUCTURAL CONSTRAINTS ACTIVE")
+        logger.info("=" * 80)
+        
+        for name, spec in self.structural_constraints.items():
+            if spec.get('fixed', False):
+                value_str = str(spec['value'])
+                if len(value_str) > 50:
+                    value_str = value_str[:47] + "..."
+                logger.info(f"  {name}: FULLY FIXED to {value_str}")
+            elif 'learnable_rows' in spec:
+                rows = spec['learnable_rows']
+                fixed_val = spec.get('fixed_value', 0.0)
+                logger.info(
+                    f"  {name}: Partially learnable - only rows {rows} "
+                    f"(fixed rows set to {fixed_val})"
+                )
+            elif 'learnable_cols' in spec:
+                cols = spec['learnable_cols']
+                fixed_val = spec.get('fixed_value', 0.0)
+                logger.info(
+                    f"  {name}: Partially learnable - only cols {cols} "
+                    f"(fixed cols set to {fixed_val})"
+                )
+            elif 'learnable_elements' in spec:
+                elements = spec['learnable_elements']
+                logger.info(f"  {name}: Partially learnable - specific elements {elements}")
+        
+        logger.info("=" * 80)
 
     def reset_s(self):
         self.s.data = torch.sqrt(self.delta**2 / (1 - self.alpha**2)).squeeze()
@@ -202,34 +590,71 @@ class SimpleLure(nn.Module):
         - B = 0 (can be learned during training)
 
         This provides a simple stable starting point.
+        
+        Respects structural constraints: only updates learnable parameters/elements.
         """
         logger.info("Identity initialization: α=0.99, A=0.9I, random C2, identity-like C")
 
         self.alpha.data = torch.tensor(0.99)
-        # self.A.data = torch.tensor(0.9 * np.eye(self.nx))
-        # self.A.data = torch.tensor([
-        #     [0.9284,   -0.2404],
-        #     [-0.0251,    0.8540]
-        # ])
-        self.A.data = torch.tensor([
-            [0.9558,    0.3215],
-            [0.0068,    0.8648]
-        ])
-        self.B.data = torch.zeros_like(self.B)
-        self.B2.data = torch.zeros_like(self.B2)
-        self.C2.data = torch.tensor(np.random.uniform(-1, 1, size=(self.nz, self.nx)))
+        
+        # A matrix - only update if not fully fixed
+        if not self._should_skip_initialization('A'):
+            # self.A.data = torch.tensor(0.9 * np.eye(self.nx))
+            # self.A.data = torch.tensor([
+            #     [0.9284,   -0.2404],
+            #     [-0.0251,    0.8540]
+            # ])
+            A_init = torch.tensor([
+                [0.9558,    0.3215],
+                [0.0068,    0.8648]
+            ])
+            if 'A' in self.structural_constraints:
+                self._apply_partial_initialization('A', A_init)
+            else:
+                self.A.data = A_init
+        
+        # B matrix - initialize to zeros (only update learnable portions)
+        if not self._should_skip_initialization('B'):
+            self.B.data = torch.zeros_like(self.B)
+        
+        # B2 matrix - ALWAYS initialize to zeros (per requirement)
+        if not self._should_skip_initialization('B2'):
+            self.B2.data = torch.zeros_like(self.B2)
+        
+        # C2 matrix - random initialization
+        if not self._should_skip_initialization('C2'):
+            C2_init = torch.tensor(np.random.uniform(-1, 1, size=(self.nz, self.nx)))
+            if 'C2' in self.structural_constraints:
+                self._apply_partial_initialization('C2', C2_init)
+            else:
+                self.C2.data = C2_init
 
         # C = [I, 0] (identity on first min(ne, nx) outputs, zeros on rest)
-        C_init = np.zeros((self.ne, self.nx))
-        min_dim = min(self.ne, self.nx)
-        C_init[:min_dim, :min_dim] = np.eye(min_dim)
-        self.C.data = torch.tensor(C_init)
+        if not self._should_skip_initialization('C'):
+            C_init = np.zeros((self.ne, self.nx))
+            min_dim = min(self.ne, self.nx)
+            C_init[:min_dim, :min_dim] = np.eye(min_dim)
+            C_init_tensor = torch.tensor(C_init)
+            if 'C' in self.structural_constraints:
+                self._apply_partial_initialization('C', C_init_tensor)
+            else:
+                self.C.data = C_init_tensor
 
-        self.D.data = torch.zeros_like(self.D)
-        self.D12.data = torch.zeros_like(self.D12)
+        # D matrix - initialize to zeros
+        if not self._should_skip_initialization('D'):
+            self.D.data = torch.zeros_like(self.D)
+        
+        # D12 matrix - initialize to zeros
+        if not self._should_skip_initialization('D12'):
+            self.D12.data = torch.zeros_like(self.D12)
 
         # Random D21 for measurement noise
-        self.D21.data = torch.tensor(np.random.randn(self.nz, self.nd) * 0.01)
+        if not self._should_skip_initialization('D21'):
+            D21_init = torch.tensor(np.random.randn(self.nz, self.nd) * 0.01)
+            if 'D21' in self.structural_constraints:
+                self._apply_partial_initialization('D21', D21_init)
+            else:
+                self.D21.data = D21_init
 
         logger.info(f"  ||A||={np.linalg.norm(self.A.detach().numpy()):.4f}")
         logger.info(f"  ||C||={np.linalg.norm(self.C.detach().numpy()):.4f}")
@@ -242,6 +667,8 @@ class SimpleLure(nn.Module):
         Loads A, B, C, D from n4sid_params.mat. If N4SID state dimension < nx,
         pads matrices (A top-left block, B top rows, C left columns).
         Runs SDP to find feasible P and L.
+
+        Note: Respects structural constraints - fixed parameters are not modified.
 
         Args:
             train_inputs: Training inputs (B, N, nd)
@@ -322,13 +749,19 @@ class SimpleLure(nn.Module):
                     "(A top-left, B top rows, C left cols)"
                 )
 
-            # Set parameters
-            self.A.data = torch.tensor(A_init)
-            self.B.data = torch.tensor(B_init)
-            self.C.data = torch.tensor(C_init)
-            self.B2.data = torch.zeros_like(self.B2)
-            self.C2.data = torch.tensor(np.random.randn(self.nz, self.nx))
-            self.D21.data = torch.tensor(np.random.randn(self.nz, self.nd) * 0.01)
+            # Set parameters (skip fixed parameters)
+            if not self._should_skip_initialization('A'):
+                self.A.data = torch.tensor(A_init)
+            if not self._should_skip_initialization('B'):
+                self.B.data = torch.tensor(B_init)
+            if not self._should_skip_initialization('C'):
+                self.C.data = torch.tensor(C_init)
+            if not self._should_skip_initialization('B2'):
+                self.B2.data = torch.zeros_like(self.B2)
+            if not self._should_skip_initialization('C2'):
+                self.C2.data = torch.tensor(np.random.randn(self.nz, self.nx))
+            if not self._should_skip_initialization('D21'):
+                self.D21.data = torch.tensor(np.random.randn(self.nz, self.nd) * 0.01)
 
             logger.info(f"N4SID loaded: ||A||={np.linalg.norm(A_init):.4f}, "
                        f"||B||={np.linalg.norm(B_init):.4f}, "
@@ -363,6 +796,8 @@ class SimpleLure(nn.Module):
 
         Then run SDP once on the best reservoir to find feasible B, D21, P, L.
         Finally, refit C, D, D12 with the SDP-updated B, D21.
+
+        Note: Respects structural constraints - fixed parameters are not modified.
 
         Args:
             train_inputs: (B, N, nd)
@@ -409,12 +844,17 @@ class SimpleLure(nn.Module):
             # Small D21
             D21_rand = np.random.randn(self.nz, self.nd) * 0.01
 
-            # Set temporarily
-            self.A.data = torch.tensor(A_rand)
-            self.B.data = torch.tensor(B_rand)
-            self.B2.data = torch.tensor(B2_rand)
-            self.C2.data = torch.tensor(C2_rand)
-            self.D21.data = torch.tensor(D21_rand)
+            # Set temporarily (skip fixed parameters)
+            if not self._is_parameter_fixed('A'):
+                self.A.data = torch.tensor(A_rand)
+            if not self._is_parameter_fixed('B'):
+                self.B.data = torch.tensor(B_rand)
+            if not self._is_parameter_fixed('B2'):
+                self.B2.data = torch.tensor(B2_rand)
+            if not self._is_parameter_fixed('C2'):
+                self.C2.data = torch.tensor(C2_rand)
+            if not self._is_parameter_fixed('D21'):
+                self.D21.data = torch.tensor(D21_rand)
 
             # Simulate
             with torch.no_grad():
@@ -456,12 +896,17 @@ class SimpleLure(nn.Module):
 
         logger.info(f"Best reservoir MSE: {best_mse:.6e}")
 
-        # Set best reservoir
-        self.A.data = torch.tensor(best_reservoir["A"])
-        self.B.data = torch.tensor(best_reservoir["B"])
-        self.B2.data = torch.tensor(best_reservoir["B2"])
-        self.C2.data = torch.tensor(best_reservoir["C2"])
-        self.D21.data = torch.tensor(best_reservoir["D21"])
+        # Set best reservoir (skip fixed parameters)
+        if not self._is_parameter_fixed('A'):
+            self.A.data = torch.tensor(best_reservoir["A"])
+        if not self._is_parameter_fixed('B'):
+            self.B.data = torch.tensor(best_reservoir["B"])
+        if not self._is_parameter_fixed('B2'):
+            self.B2.data = torch.tensor(best_reservoir["B2"])
+        if not self._is_parameter_fixed('C2'):
+            self.C2.data = torch.tensor(best_reservoir["C2"])
+        if not self._is_parameter_fixed('D21'):
+            self.D21.data = torch.tensor(best_reservoir["D21"])
 
         # Run SDP for feasibility
         logger.info("Running SDP for feasibility...")
@@ -476,6 +921,8 @@ class SimpleLure(nn.Module):
 
         This is called after SDP initialization to refine output matrices with
         the updated system matrices.
+
+        Note: Respects structural constraints - fixed output matrices are not modified.
         """
         Bs, N, _ = train_inputs.shape
 
@@ -511,9 +958,13 @@ class SimpleLure(nn.Module):
             y_valid = y_flat[valid_rows]
             solution = torch.linalg.lstsq(regression_valid, y_valid).solution
 
-            self.C.data = solution[: self.nx, :].T
-            self.D.data = solution[self.nx : self.nx + self.nd, :].T
-            self.D12.data = solution[self.nx + self.nd :, :].T
+            # Only update learnable output matrices
+            if not self._should_skip_initialization('C'):
+                self.C.data = solution[: self.nx, :].T
+            if not self._should_skip_initialization('D'):
+                self.D.data = solution[self.nx : self.nx + self.nd, :].T
+            if not self._should_skip_initialization('D12'):
+                self.D12.data = solution[self.nx + self.nd :, :].T
 
             final_mse = float(torch.mean((regression_valid @ solution - y_valid) ** 2))
             logger.info(f"Output matrix refit MSE: {final_mse:.6e}")

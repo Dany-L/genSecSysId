@@ -73,6 +73,22 @@ class ModelConfig:
     nd: Optional[int] = None  # input dimension (constrained models)
     ne: Optional[int] = None  # output dimension (constrained models)
     # Custom parameters for specific models
+    # For SimpleLure models, supports:
+    #   - structural_constraints: dict specifying fixed or partially learnable parameters
+    #     Format: {param_name: constraint_spec}
+    #     Where param_name is one of: A, B, B2, C, D, D12, C2, D21, D22
+    #     And constraint_spec is either:
+    #       1. Fully fixed: {fixed: true, value: <scalar or array>}
+    #          Example: {fixed: true, value: [[1, 0]]}
+    #       2. Partially learnable rows: {learnable_rows: [indices], fixed_value: <scalar>}
+    #          Example: {learnable_rows: [1], fixed_value: 0.0}  # Only row 1 learnable
+    #       3. Partially learnable cols: {learnable_cols: [indices], fixed_value: <scalar>}
+    #          Example: {learnable_cols: [0, 2], fixed_value: 0.0}  # Only cols 0,2 learnable
+    #     Notes:
+    #       - Fixed parameters have requires_grad=False and keep their fixed value
+    #       - Partially learnable parameters use gradient masking to zero non-learnable elements
+    #       - Initialization methods respect constraints (fixed params not modified)
+    #       - Fully backward compatible (configs without constraints work unchanged)
     custom_params: Optional[Dict[str, Any]] = None
     # Initialization configuration
     initialization: InitializationConfig = None
