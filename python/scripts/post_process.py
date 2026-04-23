@@ -26,11 +26,13 @@ from pathlib import Path
 import mlflow
 import numpy as np
 import torch
-from scipy.io import loadmat
+import matplotlib.pyplot as plt
 
 from sysid.config import Config
-from sysid.data.direct_loader import load_csv_folder, load_split_data
+from sysid.data import DataNormalizer
+from sysid.data.direct_loader import load_csv_folder
 from sysid.models import SimpleLure
+from sysid.utils import plot_ellipse, plot_ellipse_and_parallelogram, plot_polytope
 
 torch.set_default_dtype(torch.float64)
 
@@ -40,42 +42,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# TEST_DATA_PATH = "~/genSecSysId-Data/data/toy_example/prepared/test"  # set this is hard coded but will later become a parameter
-# TEST_DATA_PATH = "/Users/jack/genSecSysId-Data/data/SilverboxFiles/prepared/test"
-TEST_DATA_PATH = "/Users/jack/genSecSysId-Data/data/Duffing/test"
-TRAJECTORY_LIST = [0,1]
-# TRAJECTORY_LIST = [
-#     93,
-#     16,
-#     110,
-#     106,
-#     26,
-#     40,
-#     144,
-#     62,
-#     82,
-#     4,
-#     6,
-#     9,
-#     17,
-#     32,
-#     90,
-#     91,
-#     92,
-#     2,
-#     25,
-#     47,
-#     97,
-#     101,
-#     161,
-#     255,
-# ]
-CONFIG_FILE_PATH = "~/genSecSysId-Data/configs/crnn_gen-sec.yaml"
+# Default configuration values (can be overridden via command line)
+DEFAULT_TEST_DATA_PATH = "/Users/jack/genSecSysId-Data/data/Duffing/test"
+DEFAULT_TRAIN_DATA_PATH = "/Users/jack/genSecSysId-Data/data/Duffing/train"
+# DEFAULT_TRAJECTORY_LIST = [0, 1]
+DEFAULT_CONFIG_PATH = "~/genSecSysId-Data/configs/crnn_gen-sec.yaml"
 
 
-# X_H_MAT_PATH = "~/genSecSysId-Data/data/X_H-param_from_mat.mat"
+def check_input_condition(c: np.ndarray) -> (int, int):
+    count_stable, count_unstable = 0,0
+    for c_i in c:
+        if np.any(c_i>0):
+            count_unstable+=1
+        else:
+            count_stable+=1
 
-# X_H_MAT = loadmat(os.path.expanduser(X_H_MAT_PATH))
+    return count_stable, count_unstable
 
 
 def parse_args():
@@ -93,7 +75,7 @@ def parse_args():
     parser.add_argument(
         "--config",
         type=str,
-        default=CONFIG_FILE_PATH,
+        default=DEFAULT_CONFIG_PATH,
         help="Path to configuration file (YAML or JSON)",
     )
 
@@ -133,7 +115,6 @@ def main():
 
     # Load configuration early so we can derive directories from config.root_dir
     config_path = Path(args.config)
-    # config_path = Path(CONFIG_FILE_PATH)
     if config_path.suffix == ".yaml" or config_path.suffix == ".yml":
         config = Config.from_yaml(os.path.expanduser(config_path))
     elif config_path.suffix == ".json":
@@ -159,14 +140,28 @@ def main():
                 run_id=args.run_id, artifact_path="models/best_model.pt"
             )
             checkpoint = torch.load(best_model_path, map_location="cpu")
+            # model.check_constraints()
             model.load_state_dict(checkpoint["model_state_dict"])
+            constraints_satisfied = model.check_constraints()
+            # model.check_constraints()
             best_epoch = checkpoint.get("best_epoch", "?")
             best_val_loss = checkpoint.get("best_val_loss", float("nan"))
             logger.info(
-                f"Best model weights loaded (best epoch: {best_epoch}, best val loss: {best_val_loss:.6f})"
+                f"Best model weights loaded (best epoch: {best_epoch}, best val loss: {best_val_loss:.6f} constraints satisfied? {constraints_satisfied})"
             )
         except Exception as e:
             logger.warning(f"Could not load best model weights, using final model: {e}")
+
+        # Load normalizer from MLflow
+        normalizer = None
+        try:
+            normalizer_path = mlflow.artifacts.download_artifacts(
+                run_id=args.run_id, artifact_path="models/normalizer.json"
+            )
+            normalizer = DataNormalizer.load(normalizer_path)
+            logger.info(f"Normalizer loaded from MLflow")
+        except Exception as e:
+            logger.warning(f"Could not load normalizer from MLflow: {e}")
 
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
@@ -188,7 +183,8 @@ def main():
         if state_col and len(state_col) == 0:  # Empty list means no state
             state_col = None
 
-        test_path = Path(os.path.expanduser(TEST_DATA_PATH))
+        test_path = Path(os.path.expanduser(DEFAULT_TEST_DATA_PATH))
+        train_path = Path(os.path.expanduser(DEFAULT_TRAIN_DATA_PATH))
 
         test_inputs, test_outputs, test_states, filenames = load_csv_folder(
             folder_path=str(test_path),
@@ -197,21 +193,81 @@ def main():
             state_col=state_col,
             pattern=getattr(config.data, "pattern", "*.csv"),
         )
+        train_inputs, train_outputs, train_states, _ = load_csv_folder(
+            folder_path=str(train_path),
+            input_col=getattr(config.data, "input_col", ["d"]),
+            output_col=getattr(config.data, "output_col", ["e"]),
+            state_col=state_col,
+            pattern=getattr(config.data, "pattern", "*.csv"),
+        )
 
         if test_states is not None:
             test_inputs, test_outputs, test_states = (
-                np.stack(test_inputs[TRAJECTORY_LIST]),
-                np.stack(test_outputs[TRAJECTORY_LIST]),
-                np.stack(test_states[TRAJECTORY_LIST]),
+                np.stack(test_inputs),
+                np.stack(test_outputs),
+                np.stack(test_states),
             )
         else:
             test_inputs, test_outputs = (
-                np.stack(test_inputs[TRAJECTORY_LIST]),
-                np.stack(test_outputs[TRAJECTORY_LIST]),
+                np.stack(test_inputs),
+                np.stack(test_outputs),
             )
-            
-        result = model.post_process(eps=args.eps)
 
+        if train_states is not None:
+            train_inputs, train_outputs, train_states = (
+                np.stack(train_inputs),
+                np.stack(train_outputs),
+                np.stack(train_states),
+            )
+        else:
+            train_inputs, train_outputs = (
+                np.stack(train_inputs),
+                np.stack(train_outputs),
+            )
+
+        # output dir
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        u_train_n = torch.tensor(normalizer.transform_inputs(train_inputs))
+        b, N, _ = u_train_n.shape
+        x0_train = torch.zeros((b, model.nx))  # Start from origin
+
+        # check input condition on training trajectories before post-processing
+        with torch.no_grad():
+            _, (x_hat_train, _) = model(u_train_n, x0_train, return_state=True)
+            _, c_train = model.get_regularization_input(u_train_n, x_hat_train, return_c=True)
+
+        count_stable_orig, count_unstable_orig = check_input_condition(c_train.cpu().detach().numpy())
+
+        warmup_steps = config.training.warmup_steps if hasattr(config.training, "warmup_steps") else 0
+
+        fix, ax = plt.subplots(figsize=(10,6))
+        for c_i, x_hat_i in zip(c_train.cpu().detach().numpy(), x_hat_train.cpu().detach().numpy()):
+            M = warmup_steps+200
+            if np.any(c_i>0):
+                ax.plot(x_hat_i[warmup_steps, 0], x_hat_i[warmup_steps, 1], "rx")
+                ax.plot(x_hat_i[warmup_steps:M, 0], x_hat_i[warmup_steps:M, 1], '--')
+            else:
+                ax.plot(x_hat_i[warmup_steps, 0], x_hat_i[warmup_steps, 1], "go")
+                ax.plot(x_hat_i[warmup_steps:M, 0], x_hat_i[warmup_steps:M, 1])
+
+        X = np.linalg.inv(model.P.cpu().detach().numpy())
+        H = model.L.cpu().detach().numpy() @ X
+        s = model.s.cpu().detach().numpy()
+
+        fig, ax = plot_ellipse_and_parallelogram(
+            X, H, s, None, ax=ax, show=False, fill_polytope=True
+        )
+        ellipse_plot_path = output_dir / f"ellipse_polytope_post_train_orig_{args.run_id[:8]}.png"
+        fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
+
+        mlflow.log_figure(fig, str(ellipse_plot_path.with_suffix(".png")))
+
+        logger.info(f"Original training trajectories: total={b}, stable={count_stable_orig}, unstable={count_unstable_orig}")
+        
+        result = model.post_process()
+        
         if not result["success"]:
             logger.error(
                 f"Post-processing failed: {result.get('error', result.get('status', 'unknown'))}"
@@ -227,35 +283,68 @@ def main():
         )
         mlflow.log_metric("post_process/s_original", summary["original"]["s"])
         mlflow.log_metric("post_process/s_optimized", summary["optimized"]["s"])
-        mlflow.log_metric("post_process/max_eig_F", summary["optimized"]["max_eig_F"])
+        # mlflow.log_metric("post_process/max_eig_F", summary["optimized"]["max_eig_F"])
         mlflow.log_metric("post_process/norm_P_original", summary["original"]["norm_P"])
         mlflow.log_metric("post_process/norm_L_original", summary["original"]["norm_L"])
         mlflow.log_metric("post_process/norm_H_original", summary["original"]["norm_H"])
-        mlflow.log_metric("post_process/norm_P_optimized", summary["optimized"]["norm_P"])
-        mlflow.log_metric("post_process/norm_L_optimized", summary["optimized"]["norm_L"])
-        mlflow.log_metric("post_process/norm_H_optimized", summary["optimized"]["norm_H"])
+        # mlflow.log_metric("post_process/norm_P_optimized", summary["optimized"]["norm_P"])
+        # mlflow.log_metric("post_process/norm_L_optimized", summary["optimized"]["norm_L"])
+        # mlflow.log_metric("post_process/norm_H_optimized", summary["optimized"]["norm_H"])
+        # y_bar = summary["optimized"]["output_range"] * normalizer.output_std
+        # mlflow.log_metric("post_process/y_bar", y_bar)
+
+        # logger.info(f"Maximum output range (y_bar) after post-processing: {y_bar}")
+
+        # check how many training trajectories satisfy the input condition after post-processing
+        with torch.no_grad():
+            _, (x_hat_train, _) = model(u_train_n, x0_train, return_state=True)
+            _, c_train = model.get_regularization_input(u_train_n, x_hat_train, return_c=True)
+        count_stable_post, count_unstable_post = check_input_condition(c_train.cpu().detach().numpy())
+        logger.info(f"Post-processed training trajectories: total={b}, stable={count_stable_post}, unstable={count_unstable_post}")
+
+        X = np.linalg.inv(model.P.cpu().detach().numpy())
+        H = model.L.cpu().detach().numpy() @ X
+        s = model.s.cpu().detach().numpy()
+        
+        fix, ax = plt.subplots(figsize=(10,6))
+        for c_i, x_hat_i in zip(c_train.cpu().detach().numpy(), x_hat_train.cpu().detach().numpy()):
+            M = warmup_steps+100
+            if np.any(c_i>0):
+                ax.plot(x_hat_i[warmup_steps, 0], x_hat_i[warmup_steps, 1], "rx")
+                ax.plot(x_hat_i[warmup_steps:M, 0], x_hat_i[warmup_steps:M, 1], '--')
+            else:
+                ax.plot(x_hat_i[warmup_steps, 0], x_hat_i[warmup_steps, 1], "go")
+                ax.plot(x_hat_i[warmup_steps:M, 0], x_hat_i[warmup_steps:M, 1])
+
+        fig, ax = plot_ellipse_and_parallelogram(
+            X, H, s, None, ax=ax, show=False, fill_polytope=True
+        )
+
+        ellipse_plot_path = output_dir / f"ellipse_polytope_post_train_opt_{args.run_id[:8]}.png"
+        fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
+
+        mlflow.log_figure(fig, str(ellipse_plot_path.with_suffix(".png")))
 
         # Log parameter
         mlflow.log_param("post_processing", True)
         mlflow.log_param("post_process_eps", args.eps)
 
         # Save results to file
-        output_dir = Path(args.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        alpha = 1/(1 + np.exp(-model.tau.cpu().detach().numpy()))  # Sigmoid of tau
 
         results_path = output_dir / f"post_processing_{args.run_id[:8]}.npz"
         np.savez(
             results_path,
             P_original=model.P.cpu().detach().numpy(),
-            P_opt=result["P_opt"],
+            # P_opt=result["P_opt"],
             L_original=model.L.cpu().detach().numpy() if model.learn_L else None,
-            L_opt=result["L_opt"],
-            m_opt=result["m_opt"],
+            # L_opt=result["L_opt"],
+            # m_opt=result["m_opt"],
             s_original=summary["original"]["s"],
-            s_opt=result["s_opt"],
-            S_hat_opt=result["S_hat_opt"],
-            max_eig_F=result["max_eig_F"],
-            alpha=model.alpha.cpu().detach().numpy(),
+            # s_opt=result["s_opt"],
+            # S_hat_opt=result["S_hat_opt"],
+            # max_eig_F=result["max_eig_F"],
+            alpha=alpha,
             A=model.A.cpu().detach().numpy(),
             B=model.B.cpu().detach().numpy(),
             B2=model.B2.cpu().detach().numpy(),
@@ -278,51 +367,65 @@ def main():
 
             # generate trajectories
             with torch.no_grad():
-                e_hat, (xs, ws) = model(
-                    torch.tensor(test_inputs), torch.tensor(test_states[:, 0, :]), return_state=True
+                b, N, _ = test_inputs.shape
+                x0= torch.zeros((b, model.nx))  # Start from origin for visualization
+                u_n = torch.tensor(normalizer.transform_inputs(test_inputs))
+                e_hat_n, (xs, ws) = model(
+                    u_n, x0, return_state=True
                 )
+                e_hat = normalizer.inverse_transform_outputs(e_hat_n.cpu().detach().numpy())
+                xs = xs[:,:N] # strip last state
 
             try:
-                import matplotlib.pyplot as plt
+                
                 import tikzplotlib
-
-                from sysid.utils import plot_ellipse, plot_ellipse_and_parallelogram, plot_polytope
 
                 X = np.linalg.inv(model.P.cpu().detach().numpy())
                 H = model.L.cpu().detach().numpy() @ X
                 s = model.s.cpu().detach().numpy()
+                warmup_steps = config.training.warmup_steps if hasattr(config.training, "warmup_steps") else 0
+
+                # check if (u^k)^T u^k <= s^2 - alpha^2 (x^k)^T X x^k holds for all test trajectories
+                # c = (u^k)^T u^k - s^2 + alpha^2 (x^k)^T X x^k
+                _, cs = model.get_regularization_input(u_n, xs, return_c=True)
+                cs = cs.cpu().detach().numpy()
+                
+                # pos_c = np.where(c>0,True, False)
 
                 fig, ax = plt.subplots(figsize=(8, 8))
 
-                for x, x_hat in zip(test_states, xs):
-                    if np.linalg.norm(x[-1, :], ord=2) > np.linalg.norm(x[0, :], ord=2) and not (
-                        np.linalg.norm(x[0, :], ord=2) == 0.0
-                    ):
-                        # diverging trajectory
-                        ax.plot(x[0, 0], x[0, 1], "rx")
-                    else:
-                        ax.plot(x[0, 0], x[0, 1], "go")
+                count_stable, count_unstable = 0,0
+                for x, x_hat, c in zip(test_states, xs, cs):
+                    # if np.linalg.norm(x[-1, :], ord=2) > np.linalg.norm(x[0, :], ord=2) and not (
+                    #     np.linalg.norm(x[0, :], ord=2) == 0.0
+                    # ):
+                    #     # diverging trajectory
+                    #     ax.plot(x[0, 0], x[0, 1], "rx")
+                    # else:
+                    #     ax.plot(x[0, 0], x[0, 1], "go")
                     # ax.plot(x[:,0], x[:,1], '--')
-                    ax.plot(x_hat[:, 0], x_hat[:, 1])
 
+                    M = warmup_steps+100
+                    if np.any(c>0):
+                        ax.plot(x_hat[warmup_steps, 0], x_hat[warmup_steps, 1], "rx")
+                        ax.plot(x_hat[warmup_steps:M, 0], x_hat[warmup_steps:M, 1], '--')
+                        # ax.plot(x_hat[c>0,0], x_hat[c>0,1])
+                        count_unstable+=1
+                    else:
+                        ax.plot(x_hat[warmup_steps, 0], x_hat[warmup_steps, 1], "go")
+                        ax.plot(x_hat[warmup_steps:M, 0], x_hat[warmup_steps:M, 1])
+                        count_stable +=1
+
+                logger.info(f'total:{b}, stable: {count_stable}, count unstable: {count_unstable}')
                 ellipse_plot_path = output_dir / f"ellipse_polytope_post_{args.run_id[:8]}.png"
-
+ 
                 if model.learn_L and config.training.use_custom_regularization:
 
                     fig, ax = plot_ellipse_and_parallelogram(
                         X, H, s, None, ax=ax, show=False, fill_polytope=True
                     )
 
-                    # plot ellipse and polytope from mat file for comparison
-                    # X_mat = X_H_MAT["X"]
-                    # H_mat = X_H_MAT["H"]
-                    # s_mat = X_H_MAT["s"][0, 0]
-
-                    # plot_ellipse(ax, X_mat, s_mat, linetype="b--")
-                    # plot_polytope(ax, H_mat, fill=False, linetype="r--")
-
                     # Save to output directory
-
                     fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
 
                     try:
@@ -356,16 +459,10 @@ def main():
         # plot some prediction for handpicked trajectories
         logger.info(f"Generating prediction plot for trajectory...")
         try:
-            import matplotlib.pyplot as plt
+            # import matplotlib.pyplot as plt
             import tikzplotlib
 
             from sysid.utils import plot_predictions
-
-            with torch.no_grad():
-                if test_states is not None:
-                    e_hat = model(torch.tensor(test_inputs), torch.tensor(test_states[:, 0, :]))
-                else:
-                    e_hat = model(torch.tensor(test_inputs), test_states)
 
             pred_plot_path = output_dir / f"prediction_trajectory_post_{args.run_id[:8]}.png"
 
@@ -377,9 +474,11 @@ def main():
                 # sample_indices=UNSTAB_STAB_ZERO,
                 save_path=pred_plot_path,
                 return_axes=True,
+                warmup_steps=warmup_steps,
             )
 
             try:
+                mlflow.log_figure(fig, str(pred_plot_path.with_suffix(".png")))
                 tikzplotlib.save(str(pred_plot_path.with_suffix(".tex")))
                 mlflow.log_artifact(
                     str(pred_plot_path.with_suffix(".tex")), artifact_path="post_processing"

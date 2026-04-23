@@ -19,9 +19,6 @@ from ..models.base import BaseRNN
 from ..models.constrained_rnn import SimpleLure
 from ..utils import plot_ellipse_and_parallelogram, plot_predictions
 
-# Set default dtype to float64 to match numpy's default and avoid type clashes
-# torch.set_default_dtype(torch.float64)
-
 
 class Trainer:
     """Trainer for RNN models."""
@@ -46,6 +43,8 @@ class Trainer:
         early_stopping_patience: int = 50,
         mlflow_tracking: bool = True,
         log_gradients: bool = True,
+        warmup_steps: int = 0,
+        input_regularization_weight: float = 0.01,
     ):
         """
         Initialize trainer.
@@ -95,6 +94,8 @@ class Trainer:
         self.min_regularization_weight = min_regularization_weight
         self.checkpoint_frequency = checkpoint_frequency
         self.early_stopping_patience = early_stopping_patience
+        self.warmup_steps = warmup_steps  # Number of steps to skip before computing loss
+        self.input_regularization_weight = input_regularization_weight  # Weight for input constraint regularization
 
         # Rollback tracking
         self.rollback_count = 0
@@ -111,9 +112,8 @@ class Trainer:
         self.patience_counter = 0
         self.train_losses = []
         self.train_pred_losses = []
-        self.train_reg_losses = []
         self.train_reg_feasibility = []
-        self.train_reg_parametric = []
+        self.train_reg_inputs = []
         self.val_losses = []
 
         # Scheduler (can be set later)
@@ -156,7 +156,6 @@ class Trainer:
         evaluator = Evaluator(model=self.model, device=self.device, output_dir=str(temp_output_dir))
 
         # Evaluate on validation set
-        # try:
         results = evaluator.evaluate(
             test_loader=self.val_loader,
             normalizer=normalizer,
@@ -190,18 +189,12 @@ class Trainer:
             d=d,
             sample_indices=sample_indices,
             save_path=str(plot_path),
+            warmup_steps=self.warmup_steps,
         )
 
         # Log to MLflow
         if self.mlflow_tracking:
             mlflow.log_artifact(str(plot_path), artifact_path="predictions")
-            # print(f"✓ Trajectory plot logged to MLflow")
-
-        # print(f"✓ Trajectory plot saved: {plot_path}")
-
-        # except Exception as e:
-        #     print(f"⚠ Failed to generate initial trajectory plot: {e}")
-        #     logging.warning(f"Failed to generate initial trajectory plot: {e}")
 
     def decay_regularization(self):
         """
@@ -248,6 +241,7 @@ class Trainer:
         total_reg_loss = 0.0
         total_reg_feasibility = 0.0
         total_reg_parametric = 0.0
+        total_reg_inputs = 0.0
         num_batches = 0
 
         # Reset epoch rollback counter
@@ -260,6 +254,7 @@ class Trainer:
             # Unpack batch (states may be None)
             if len(batch) == 3:
                 d, e, x0 = batch  # d: input, e: output, x: states (optional)
+                x0 = None
             else:
                 d, e = batch
                 x0 = None
@@ -268,30 +263,36 @@ class Trainer:
 
             # Forward pass
             self.optimizer.zero_grad()
-            e_hat = self.model(d, x0=x0)  # e_hat: predicted output
+            e_hat, (x,w) = self.model(d, x0=x0, return_state=True)  # e_hat: predicted output
+            # e_hat = self.model(d, x0=x0)  # e_hat: predicted output
 
             # Compute prediction loss (skip warmup steps).
             # NaN positions in e (padded trajectories) are already handled by
             # MaskedLoss, so slicing [:, n:, :] is safe even when some sequences
             # are shorter than n — those positions are NaN and get ignored.
-            n = 0
-            pred_loss = self.loss_fn(e_hat[:, n:, :], e[:, n:, :])
-            loss = pred_loss
+            pred_loss = self.loss_fn(e_hat[:, self.warmup_steps:, :], e[:, self.warmup_steps:, :])
 
             # Add custom regularization
             reg_loss_value = 0.0
             reg_feasibility_value = 0.0
-            reg_parametric_value = 0.0
+            reg_input_value = 0.0
             if self.regularization_weight > 0:
-                reg_loss_dict = self.model.get_regularization_loss(return_components=True)
-                reg_loss = reg_loss_dict['total']
-                reg_loss_value = reg_loss.item()
-                reg_feasibility_value = reg_loss_dict['feasibility'].item()
-                reg_parametric_value = reg_loss_dict['parametric'].item()
-                loss = loss + self.regularization_weight * reg_loss
+                # feasibility loss
+                reg_feasibility_loss = self.model.get_regularization_loss()
+                # reg_feasibility_loss = torch.tensor(0.0)
+                reg_feasibility_value = reg_feasibility_loss.item()
+
+                # Input constraint regularization (vectorized, moved to model)
+                reg_input_loss = self.model.get_regularization_input(d, x)
+                # reg_input_loss = torch.tensor(0.0)
+                reg_input_value = reg_input_loss.item()
+
+                loss = pred_loss + self.regularization_weight * reg_feasibility_loss + self.input_regularization_weight * reg_input_loss
+            else:
+                loss = pred_loss
 
             # Backward pass
-            loss.backward()
+            loss.backward()  # Retain graph for potential second backward pass if needed
 
             # Compute gradient statistics (before clipping) if logging enabled
             if self.log_gradients:
@@ -317,17 +318,10 @@ class Trainer:
 
             # Update weights
             self.optimizer.step()
-            # logging.info(f"B:{batch_idx}: s= {self.model.s.detach().numpy():.4f}, alpha= {self.model.alpha.detach().numpy():.4f}")
-
             # Check if constraints are satisfied (for constrained models)
             if isinstance(self.model, SimpleLure):
                 if not self.model.check_constraints() and self.regularization_weight > 0:
                     # Constraints violated - try to solve feasibility SDP
-                    # logging.info(f"Batch {batch_idx}: Constraints violated after parameter update, attempting feasibility SDP...")
-                    # if self.model.alpha > 1:
-                    #     self.model.alpha.data = torch.tensor(0.99)
-
-                    # logging.info(f"B:{batch_idx}: s= {self.model.s.detach().numpy():.4f}, alpha= {self.model.alpha.detach().numpy():.4f}")
                     b_feasible = self.model.analysis_problem()
 
                     if not b_feasible:
@@ -355,17 +349,15 @@ class Trainer:
             # Update metrics
             total_loss += loss.item()
             total_pred_loss += pred_loss.item()
-            total_reg_loss += reg_loss_value
             total_reg_feasibility += reg_feasibility_value
-            total_reg_parametric += reg_parametric_value
+            total_reg_inputs += reg_input_value
             num_batches += 1
 
         # Average loss
         avg_loss = total_loss / num_batches
         avg_pred_loss = total_pred_loss / num_batches
-        avg_reg_loss = total_reg_loss / num_batches
         avg_reg_feasibility = total_reg_feasibility / num_batches
-        avg_reg_parametric = total_reg_parametric / num_batches
+        avg_reg_inputs = total_reg_inputs / num_batches
 
         # Average gradient statistics over epoch
         avg_grad_stats = {key: np.mean(values) for key, values in epoch_grad_stats.items()}
@@ -373,9 +365,8 @@ class Trainer:
         return {
             "loss": avg_loss,
             "pred_loss": avg_pred_loss,
-            "reg_loss": avg_reg_loss,
             "reg_feasibility": avg_reg_feasibility,
-            "reg_parametric": avg_reg_parametric,
+            "reg_input": avg_reg_inputs,
             "rollback_count": self.epoch_rollback_count,
             **avg_grad_stats,
         }
@@ -390,19 +381,20 @@ class Trainer:
             for batch in self.val_loader:
                 # Unpack batch (states may be None)
                 if len(batch) == 3:
-                    d, e, x = batch  # d: input, e: output, x: states (optional)
+                    d, e, x0 = batch  # d: input, e: output, x0: initial states (optional)
+                    x0 = None
                 else:
                     d, e = batch
-                    x = None
+                    x0 = None
 
                 d = d.to(self.device)
                 e = e.to(self.device)
 
                 # Forward pass
-                e_hat = self.model(d, x)  # e_hat: predicted output
+                e_hat = self.model(d, x0)  # e_hat: predicted output
 
                 # Compute loss
-                loss = self.loss_fn(e_hat, e)
+                loss = self.loss_fn(e_hat[:, self.warmup_steps:, :], e[:, self.warmup_steps:, :])
 
                 total_loss += loss.item()
                 num_batches += 1
@@ -437,23 +429,23 @@ class Trainer:
             train_results = self.train_epoch()
             train_loss = train_results["loss"]
             train_pred_loss = train_results["pred_loss"]
-            train_reg_loss = train_results["reg_loss"]
+            train_reg_feasibility = train_results["reg_feasibility"]
             epoch_rollback_count = train_results.get("rollback_count", 0)
             grad_stats = {
                 k: v
                 for k, v in train_results.items()
-                if k not in ["loss", "pred_loss", "reg_loss", "rollback_count"]
+                if k not in ["loss", "pred_loss", "reg_feasibility", "rollback_count"]
             }
 
             self.train_losses.append(train_loss)
             self.train_pred_losses.append(train_pred_loss)
-            self.train_reg_losses.append(train_reg_loss)
-            self.train_reg_feasibility.append(train_results["reg_feasibility"])
-            self.train_reg_parametric.append(train_results["reg_parametric"])
+            self.train_reg_feasibility.append(train_reg_feasibility)
+            self.train_reg_inputs.append(train_results["reg_input"])
 
             # Validate
             val_loss = self.validate()
             self.val_losses.append(val_loss)
+            # print(f'Epoch {epoch}: constraints satisfied={self.model.check_constraints()}')
 
             # Get scheduler patience info if using ReduceLROnPlateau
             scheduler_patience_info = ""
@@ -468,7 +460,7 @@ class Trainer:
             progress_metrics = {
                 "train_loss": f"{train_loss:.4f}",
                 "pred": f"{train_pred_loss:.4f}",
-                "reg": f"{train_reg_loss:.4f}",
+                "feas": f"{train_reg_feasibility:.4f}",
                 "val_loss": f"{val_loss:.4f}",
                 "best_val": f"{self.best_val_loss:.4f}",
                 "constraints": f"{self.model.check_constraints()}",
@@ -488,9 +480,8 @@ class Trainer:
                 # Loss metrics
                 mlflow.log_metric("train_loss", train_loss, step=epoch)
                 mlflow.log_metric("train_pred_loss", train_pred_loss, step=epoch)
-                mlflow.log_metric("train_reg_loss", train_reg_loss, step=epoch)
                 mlflow.log_metric("train_reg_feasibility", train_results["reg_feasibility"], step=epoch)
-                mlflow.log_metric("train_reg_parametric", train_results["reg_parametric"], step=epoch)
+                mlflow.log_metric("train_reg_input", train_results["reg_input"], step=epoch)
                 mlflow.log_metric("val_loss", val_loss, step=epoch)
                 mlflow.log_metric("lr", self.optimizer.param_groups[0]["lr"], step=epoch)
                 if self.regularization_weight > 0:
@@ -504,27 +495,13 @@ class Trainer:
                         mlflow.log_metric(stat_name, stat_value, step=epoch)
 
                 if isinstance(self.model, SimpleLure):
+                    alpha = 1/(1+ np.exp(-self.model.tau.cpu().detach().numpy()))
                     mlflow.log_metric("s", self.model.s.item(), step=epoch)
-                    mlflow.log_metric("alpha", self.model.alpha.item(), step=epoch)
+                    mlflow.log_metric("alpha", alpha, step=epoch)
 
             # Plot trajectories and ellipse periodically (at checkpoint frequency)
             if (epoch + 1) % self.checkpoint_frequency == 0:
                 self.plot_trajectories(name=f"epoch_{epoch}", normalizer=normalizer)
-
-                # if isinstance(self.model, SimpleLure) and self.mlflow_tracking:
-                #     X = np.linalg.inv(self.model.P.cpu().detach().numpy())
-                #     H = self.model.L.cpu().detach().numpy() @ X
-                #     s = self.model.s.cpu().detach().numpy()
-                #     max_norm_x0 = self.model.max_norm_x0
-                #     fig, ax = plot_ellipse_and_parallelogram(X, H, s, max_norm_x0)
-
-                #     try:
-                #         # Log directly to MLflow without saving to output_dir
-                #         mlflow.log_figure(fig, f"plots/ellipse_epoch_{epoch}.png")
-                #     except Exception as e:
-                #         logging.warning(f"Failed to log ellipse plot: {e}")
-                #     finally:
-                #         plt.close(fig)
 
             # Learning rate scheduling
             prev_lr = self.optimizer.param_groups[0]["lr"]
@@ -548,9 +525,6 @@ class Trainer:
                     factor=self.optimizer.param_groups[0].get("lr_reduction_factor", 0.5)
                 )
                 self.decay_regularization()
-                if isinstance(self.model, SimpleLure):
-                    self.model.reset_s()
-                    pbar.write("   Reset s escape local minimum")
 
             # Log rollback count to MLflow
             if self.mlflow_tracking:
@@ -583,6 +557,7 @@ class Trainer:
                 self.best_val_loss = val_loss
                 self.best_epoch = epoch  # Track the best epoch
                 self.patience_counter = 0
+                # print(self.model.check_constraints())
                 self.save_checkpoint("best_model.pt")
                 pbar.write(f"✓ Epoch {epoch}: New best model (val_loss={val_loss:.6f})")
             else:
@@ -609,22 +584,12 @@ class Trainer:
         # Save final model
         self.save_checkpoint("final_model.pt")
 
-        # Plot and log final ellipse for SimpleLure models
+        # Store ellipse parameters for SimpleLure models
         if isinstance(self.model, SimpleLure):
             X = np.linalg.inv(self.model.P.cpu().detach().numpy())
             H = self.model.L.cpu().detach().numpy() @ X
             s = self.model.s.cpu().detach().numpy()
             max_norm_x0 = self.model.max_norm_x0
-            # fig, ax = plot_ellipse_and_parallelogram(X, H, s, max_norm_x0)
-
-            # Save and log to MLflow
-            # if self.mlflow_tracking:
-            #     try:
-            #         # Log directly to MLflow without saving to output_dir
-            #         mlflow.log_figure(fig, "plots/final_ellipse.png")
-            #         logging.info("Logged final ellipse plot to MLflow artifacts")
-            #     except Exception as e:
-            #         logging.warning(f"Failed to log final ellipse plot: {e}")
             #     finally:
             #         plt.close(fig)
 
@@ -632,9 +597,7 @@ class Trainer:
         history = {
             "train_losses": self.train_losses,
             "train_pred_losses": self.train_pred_losses,
-            "train_reg_losses": self.train_reg_losses,
             "train_reg_feasibility": self.train_reg_feasibility,
-            "train_reg_parametric": self.train_reg_parametric,
             "val_losses": self.val_losses,
             "best_val_loss": self.best_val_loss,
             "best_epoch": self.best_epoch,
@@ -658,9 +621,8 @@ class Trainer:
             "best_epoch": self.best_epoch,
             "train_losses": self.train_losses,
             "train_pred_losses": self.train_pred_losses,
-            "train_reg_losses": self.train_reg_losses,
             "train_reg_feasibility": self.train_reg_feasibility,
-            "train_reg_parametric": self.train_reg_parametric,
+            "train_reg_inputs": self.train_reg_inputs,
             "val_losses": self.val_losses,
         }
 
@@ -741,9 +703,8 @@ class Trainer:
         self.best_epoch = checkpoint.get("best_epoch", 0)  # Use .get() for backward compatibility
         self.train_losses = checkpoint.get("train_losses", [])
         self.train_pred_losses = checkpoint.get("train_pred_losses", [])
-        self.train_reg_losses = checkpoint.get("train_reg_losses", [])
         self.train_reg_feasibility = checkpoint.get("train_reg_feasibility", [])
-        self.train_reg_parametric = checkpoint.get("train_reg_parametric", [])
+        self.train_reg_inputs = checkpoint.get("train_reg_inputs", [])
         self.val_losses = checkpoint.get("val_losses", [])
 
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:

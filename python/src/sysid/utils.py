@@ -238,6 +238,7 @@ def plot_predictions(
     save_path: Optional[str] = None,
     ax: Optional[plt.Axes] = None,
     return_axes: bool = False,
+    warmup_steps: int = 0,
 ) -> plt.Axes:
     """
     Plot predictions vs targets and optionally inputs.
@@ -249,6 +250,7 @@ def plot_predictions(
         num_samples: Number of samples to plot (used if sample_indices is None)
         sample_indices: Specific sample indices to plot (overrides num_samples)
         save_path: Path to save figure
+        warmup_steps: Number of steps to warm up before plotting
     """
     if sample_indices is not None:
         indices = sample_indices
@@ -276,6 +278,9 @@ def plot_predictions(
 
         # Plot predictions vs targets
         ax_pred = axes[i, 0] if num_plots > 1 else axes[i, 0]
+
+        # dashes vertical line at warmup_steps if specified
+        ax_pred.axvline(x=warmup_steps, color="k", linestyle=":", label="Warmup Steps")
 
         if e_hat.ndim == 3:
             # Sequence data (unused: seq_len = e_hat.shape[1])

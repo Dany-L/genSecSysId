@@ -150,12 +150,14 @@ def create_dataloaders(
             test_inputs = normalizer.transform_inputs(test_inputs)
             test_outputs = normalizer.transform_outputs(test_outputs)
 
-    # For concatenated loading (shape: (1, total_len, n_features)), default to
-    # non-overlapping windows unless explicitly configured.
-    if sequence_length is not None and sequence_stride is None and train_inputs.shape[0] == 1:
+    # Default to non-overlapping windows when sequence_length is set but stride is not specified.
+    # This prevents the 901x data multiplication issue from overlapping sequences.
+    # Note: sequence_length is only applied to training. Validation and test always use full sequences.
+    if sequence_length is not None and sequence_stride is None:
         sequence_stride = sequence_length
 
     # Create datasets
+    # Training: use configured sequence_length and stride
     train_dataset = TimeSeriesDataset(
         train_inputs,
         train_outputs,
@@ -163,12 +165,13 @@ def create_dataloaders(
         sequence_length,
         sequence_stride,
     )
+    # Validation: always use full sequences (sequence_length=None)
     val_dataset = TimeSeriesDataset(
         val_inputs,
         val_outputs,
         val_states,
-        sequence_length,
-        sequence_stride,
+        sequence_length=sequence_length, 
+        sequence_stride=sequence_stride,
     )
 
     # Create data loaders
@@ -190,12 +193,13 @@ def create_dataloaders(
 
     test_loader = None
     if test_inputs is not None:
+        # Test: always use full sequences (sequence_length=None)
         test_dataset = TimeSeriesDataset(
             test_inputs,
             test_outputs,
             test_states,
-            sequence_length,
-            sequence_stride,
+            sequence_length=None,  # Always use full sequences for testing
+            sequence_stride=None,
         )
         test_loader = TorchDataLoader(
             test_dataset,

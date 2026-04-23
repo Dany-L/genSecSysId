@@ -30,7 +30,7 @@ class DataConfig:
     normalization: Optional[str] = None  # Alias for normalize (if "minmax" or "standard")
     normalization_method: str = "minmax"  # or "standard"
     batch_size: int = 32
-    sequence_length: Optional[int] = None  # None = use full sequences
+    train_sequence_length: Optional[int] = None  # Sequence length for training only. None = use full sequences. Validation/test always use full sequences.
     sequence_stride: Optional[int] = None  # None = auto (non-overlap for concatenated data)
     shuffle: bool = True
     num_workers: int = 0
@@ -135,7 +135,7 @@ class TrainingConfig:
     """Configuration for training."""
 
     max_epochs: int = 1000
-    early_stopping_patience: int = 50
+    early_stopping_patience: int = 1000
     checkpoint_frequency: int = 10  # save every N epochs
     gradient_clip_value: Optional[float] = 1.0
 
@@ -149,14 +149,17 @@ class TrainingConfig:
     regularization_decay_factor: float = 0.5  # Same as scheduler_factor by default
     min_regularization_weight: float = 1e-7  # Early stopping threshold for reg weight
 
+    # Input constraint regularization weight
+    input_regularization_weight: float = 0.01  # Weight for input constraint loss
+
     # Gradient monitoring
     log_gradients: bool = True  # Log gradient statistics to MLflow
 
+    # Warmup steps (initial transient period to skip when computing loss)
+    warmup_steps: int = 0  # Number of warmup steps before computing loss
+
     # Device
     device: str = "cuda"  # "cuda", "cpu", "mps"
-
-    # Logging
-    log_interval: int = 10  # log every N batches
 
 
 @dataclass

@@ -312,31 +312,6 @@ def get_regularization_loss(self):
     return reg_loss
 ```
 
-### Hyperparameter Tuning
-
-Modify configuration files or use a hyperparameter search library:
-
-```python
-import optuna
-from sysid.config import Config
-
-def objective(trial):
-    config = Config.from_yaml("configs/example_config.yaml")
-    
-    # Tune hyperparameters
-    config.model.hidden_size = trial.suggest_int("hidden_size", 32, 256)
-    config.model.num_layers = trial.suggest_int("num_layers", 1, 4)
-    config.optimizer.learning_rate = trial.suggest_loguniform("lr", 1e-5, 1e-2)
-    
-    # Train and evaluate
-    # ... (training code)
-    
-    return val_loss
-
-study = optuna.create_study()
-study.optimize(objective, n_trials=50)
-```
-
 ## Debugging
 
 Enable debug mode for detailed logging:
@@ -345,23 +320,25 @@ Enable debug mode for detailed logging:
 python scripts/train.py --config configs/example_config.yaml --debug
 ```
 
-## GPU/Cluster Usage
+## GPU Usage
 
 The package automatically detects CUDA and MPS devices. For multi-GPU training, set:
 
 ```yaml
 training:
   device: "cuda:0"  # Specify GPU
+  # Or use "auto" for automatic device selection
+  device: "auto"
 ```
 
-For cluster usage with SLURM:
+For cluster usage, simply run the training script:
 
 ```bash
-#!/bin/bash
-#SBATCH --gres=gpu:1
-#SBATCH --time=24:00:00
-
+# Standard training on GPU
 python scripts/train.py --config configs/example_config.yaml
+
+# The device will be auto-detected (CUDA/MPS/CPU)
+# Or specify explicitly in your config
 ```
 
 ## Testing

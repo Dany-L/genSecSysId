@@ -103,46 +103,110 @@ class LureSystem(Linear):
         self.D21 = sys.D21
         self.Delta = sys.Delta  # static nonlinearity
 
+
     def forward(
-        self,
-        d: torch.Tensor,
-        x0: Optional[Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]] = None,
-        return_states: bool = False,
-    ) -> Tuple[
-        torch.Tensor,
-        Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]],
-    ]:
-        n_batch, N, _, _ = d.shape
-        e_hat = torch.zeros(size=(n_batch, N, self._ne, 1))
+            self,
+            d: torch.Tensor,
+            x0: Optional[Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]] = None,
+            return_states: bool = False,
+        ) -> Tuple[
+            torch.Tensor,
+            Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]],
+        ]:
+            n_batch, N, _, _ = d.shape
+            
+            # Initialize the current state
+            x_k = x0.reshape(n_batch, self._nx, 1)
 
-        if return_states:
+            # Use Python lists to accumulate the sequence
+            e_hat_list = []
 
-            w = torch.zeros(size=(n_batch, N, self._nw, 1))
-            x = torch.zeros(size=(n_batch, N + 1, self._nx, 1))
-            x[:, 0, :, :] = x0.reshape(n_batch, self._nx, 1)
+            if return_states:
+                w_list = []
+                x_list = [x_k] # Store the initial state k=0
 
-            for k in range(N):
-                w[:, k, :, :] = self.Delta(self.C2 @ x[:, k, :, :] + self.D21 @ d[:, k, :, :])
-                x[:, k + 1, :, :] = (
-                    super().state_dynamics(x=x[:, k, :, :], d=d[:, k, :, :])
-                    + self.B2 @ w[:, k, :, :]
-                )
-                e_hat[:, k, :, :] = (
-                    super().output_dynamics(x=x[:, k, :, :], d=d[:, k, :, :])
-                    + self.D12 @ w[:, k, :, :]
-                )
+                for k in range(N):
+                    d_k = d[:, k, :, :]
+                    
+                    # Compute current step (creates new tensors, no in-place mutation)
+                    w_k = self.Delta(self.C2 @ x_k + self.D21 @ d_k)
+                    e_hat_k = super().output_dynamics(x=x_k, d=d_k) + self.D12 @ w_k
+                    x_k_1 = super().state_dynamics(x=x_k, d=d_k) + self.B2 @ w_k
+                    
+                    # Append to lists
+                    e_hat_list.append(e_hat_k)
+                    w_list.append(w_k)
+                    x_list.append(x_k_1)
+                    
+                    # Update state for the next iteration
+                    x_k = x_k_1
+                    
+                # Stack lists into final tensors along the time dimension (dim=1)
+                e_hat = torch.stack(e_hat_list, dim=1) # Shape: (n_batch, N, ne, 1)
+                x_tensor = torch.stack(x_list, dim=1)  # Shape: (n_batch, N+1, nx, 1)
+                w_tensor = torch.stack(w_list, dim=1)  # Shape: (n_batch, N, nw, 1)
 
-            return (e_hat, (x, w))
+                return (e_hat, (x_tensor, w_tensor))
 
-        else:
-            x = x0.reshape(n_batch, self._nx, 1)
-            for k in range(N):
-                w = self.Delta(self.C2 @ x + self.D21 @ d[:, k, :, :])
-                e_hat[:, k, :, :] = super().output_dynamics(x=x, d=d[:, k, :, :]) + self.D12 @ w
-                x = super().state_dynamics(x=x, d=d[:, k, :, :]) + self.B2 @ w
+            else:
+                # When we don't need to return all states, we can just track the current ones
+                for k in range(N):
+                    d_k = d[:, k, :, :]
+                    w_k = self.Delta(self.C2 @ x_k + self.D21 @ d_k)
+                    e_hat_k = super().output_dynamics(x=x_k, d=d_k) + self.D12 @ w_k
+                    
+                    # Overwriting the Python variable 'x_k' is totally fine! 
+                    # It just points to a new tensor in memory, leaving the old one intact for Autograd.
+                    x_k = super().state_dynamics(x=x_k, d=d_k) + self.B2 @ w_k
+                    
+                    e_hat_list.append(e_hat_k)
+
+                e_hat = torch.stack(e_hat_list, dim=1)
+                
+                # Returning the final x and w to match your original logic
+                return (e_hat, (x_k, w_k))
+
+    # def forward(
+    #     self,
+    #     d: torch.Tensor,
+    #     x0: Optional[Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]] = None,
+    #     return_states: bool = False,
+    # ) -> Tuple[
+    #     torch.Tensor,
+    #     Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]],
+    # ]:
+    #     n_batch, N, _, _ = d.shape
+    #     e_hat = torch.zeros(size=(n_batch, N, self._ne, 1))
+
+    #     if return_states:
+
+    #         w = torch.zeros(size=(n_batch, N, self._nw, 1))
+    #         x = torch.zeros(size=(n_batch, N + 1, self._nx, 1))
+    #         x[:, 0, :, :] = x0.reshape(n_batch, self._nx, 1)
+
+    #         for k in range(N):
+    #             w[:, k, :, :] = self.Delta(self.C2 @ x[:, k, :, :] + self.D21 @ d[:, k, :, :])
+    #             e_hat[:, k, :, :] = (
+    #                 super().output_dynamics(x=x[:, k, :, :], d=d[:, k, :, :])
+    #                 + self.D12 @ w[:, k, :, :]
+    #             )
+    #             x[:, k + 1, :, :] = (
+    #                 super().state_dynamics(x=x[:, k, :, :], d=d[:, k, :, :])
+    #                 + self.B2 @ w[:, k, :, :]
+    #             )
                 
 
-            return (e_hat, (x, w))
+    #         return (e_hat, (x, w))
+
+    #     else:
+    #         x = x0.reshape(n_batch, self._nx, 1)
+    #         for k in range(N):
+    #             w = self.Delta(self.C2 @ x + self.D21 @ d[:, k, :, :])
+    #             e_hat[:, k, :, :] = super().output_dynamics(x=x, d=d[:, k, :, :]) + self.D12 @ w
+    #             x = super().state_dynamics(x=x, d=d[:, k, :, :]) + self.B2 @ w
+                
+
+    #         return (e_hat, (x, w))
 
 
 class BaseRNN(nn.Module, ABC):
@@ -196,6 +260,20 @@ class BaseRNN(nn.Module, ABC):
         """
         Compute custom regularization loss on model parameters.
         This can be overridden by subclasses for specific constraints.
+
+        Returns:
+            Regularization loss tensor
+        """
+        return torch.tensor(0.0, device=next(self.parameters()).device)
+
+    def get_regularization_input(self, inputs: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
+        """
+        Compute input constraint regularization loss.
+        This can be overridden by subclasses for specific constraints.
+
+        Args:
+            inputs: Input tensor of shape (batch_size, seq_len, input_size)
+            states: State tensor of shape (batch_size, seq_len, hidden_size)
 
         Returns:
             Regularization loss tensor

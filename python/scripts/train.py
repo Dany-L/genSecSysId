@@ -198,9 +198,6 @@ def main():
     else:
         max_norm_x0 = 0.1  # Default value if states are not provided
     delta = np.max(np.abs(train_inputs), axis=(0, 1))
-    # delta = 10
-
-    # delta = 2
 
     # Create data loaders
     logger.info("Creating data loaders...")
@@ -212,7 +209,7 @@ def main():
         val_outputs=val_outputs,
         val_states=val_states,
         batch_size=data_config.batch_size,
-        sequence_length=data_config.sequence_length,
+        sequence_length=data_config.train_sequence_length,  # Use train_sequence_length for training only
         sequence_stride=getattr(data_config, "sequence_stride", None),
         normalize=data_config.normalize,
         normalization_method=data_config.normalization_method,
@@ -239,6 +236,7 @@ def main():
             train_outputs,
             init_config=config.model.initialization,
             data_dir=data_config.train_path,
+            normalizer = normalizer
         )
     print_model_summary(model)
 
@@ -336,6 +334,8 @@ def main():
                 "learning_rate": config.optimizer.learning_rate,
                 "batch_size": config.data.batch_size,
                 "max_epochs": config.training.max_epochs,
+                "warmup_steps": config.training.warmup_steps,
+                "input_regularization_weight": config.training.input_regularization_weight,
                 "custom_parameters": str(getattr(config.model, "custom_params", None)),
             }
         )
@@ -378,6 +378,9 @@ def main():
             json.dump(run_info, f, indent=2)
         logger.info(f"Run info saved to {run_info_path}")
 
+        # Compute checkpoint frequency: save 10 times during training
+        checkpoint_frequency = max(1, config.training.max_epochs // 10)
+
         # Create trainer (use run-specific directories)
         trainer = Trainer(
             model=model,
@@ -404,10 +407,12 @@ def main():
                 config.training, "regularization_decay_factor", 0.5
             ),
             min_regularization_weight=getattr(config.training, "min_regularization_weight", 1e-7),
-            checkpoint_frequency=config.training.checkpoint_frequency,
+            checkpoint_frequency=checkpoint_frequency,
             early_stopping_patience=config.training.early_stopping_patience,
             mlflow_tracking=True,
             log_gradients=getattr(config.training, "log_gradients", True),
+            warmup_steps=config.training.warmup_steps,
+            input_regularization_weight=getattr(config.training, "input_regularization_weight", 0.01),
         )
 
         if scheduler is not None:

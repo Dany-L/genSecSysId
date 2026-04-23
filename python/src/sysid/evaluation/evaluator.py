@@ -21,6 +21,7 @@ class Evaluator:
         model: BaseRNN,
         device: str = "cuda",
         output_dir: str = "evaluation_results",
+        warmup_steps: int = 0,
     ):
         """
         Initialize evaluator.
@@ -29,12 +30,14 @@ class Evaluator:
             model: Trained model
             device: Device to evaluate on
             output_dir: Directory for evaluation results
+            warmup_steps: Number of steps to skip before computing loss
         """
         self.model = model.to(device)
         self.model.eval()
         self.device = device
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.warmup_steps = warmup_steps  # Number of steps to skip before computing loss
 
     def evaluate(
         self,
@@ -64,16 +67,17 @@ class Evaluator:
             for batch in test_loader:
                 # Unpack batch (states may be None)
                 if len(batch) == 3:
-                    d, e, x = batch  # d: input, e: output, x: states (optional)
+                    d, e, x0 = batch  # d: input, e: output, x0: initial states (optional)
+                    x0 = None
                 else:
                     d, e = batch
-                    x = None
+                    x0 = None
 
                 d = d.to(self.device)
                 e = e.to(self.device)
 
                 # Forward pass
-                e_hat, (x,w) = self.model(d, x, return_state=True)  # e_hat: predicted output
+                e_hat, (x,w) = self.model(d, x0, return_state=True)  # e_hat: predicted output
 
                 all_predictions.append(e_hat.cpu().numpy())
                 all_targets.append(e.cpu().numpy())
@@ -95,8 +99,8 @@ class Evaluator:
 
         # Compute metrics
         metrics = compute_metrics(
-            e_hat.reshape(-1, e_hat.shape[-1]),
-            e.reshape(-1, e.shape[-1]),
+            e_hat[:, self.warmup_steps:, :].reshape(-1, e_hat.shape[-1]),
+            e[:, self.warmup_steps:, :].reshape(-1, e.shape[-1]),
         )
 
         # Compute per-step metrics for sequences

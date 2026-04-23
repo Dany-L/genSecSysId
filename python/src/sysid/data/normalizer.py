@@ -12,14 +12,14 @@ class DataNormalizer:
 
     def __init__(
         self,
-        method: Literal["minmax", "standard"] = "minmax",
+        method: Literal["minmax", "standard", "scale_only"] = "scale_only",
         feature_range: Tuple[float, float] = (-1, 1),
     ):
         """
         Initialize the normalizer.
 
         Args:
-            method: Normalization method ("minmax" or "standard")
+            method: Normalization method ("minmax" or "standard" or "scale_only")
             feature_range: Target range for minmax normalization
         """
         self.method = method
@@ -85,6 +85,10 @@ class DataNormalizer:
             self.input_std = np.where(self.input_std == 0, 1.0, self.input_std)
             self.output_std = np.where(self.output_std == 0, 1.0, self.output_std)
 
+        elif self.method == "scale_only":
+            self.input_std = np.nanstd(inputs, axis=(0, 1), keepdims=True)
+            self.output_std = np.nanstd(outputs, axis=(0, 1), keepdims=True)
+
         self.is_fitted = True
 
     def transform_inputs(self, inputs: np.ndarray) -> np.ndarray:
@@ -97,8 +101,10 @@ class DataNormalizer:
             normalized = (
                 normalized * (self.feature_range[1] - self.feature_range[0]) + self.feature_range[0]
             )
-        else:  # standard
+        elif self.method == "standard":  # standard
             normalized = (inputs - self.input_mean) / self.input_std
+        elif self.method == "scale_only":
+            normalized = inputs / self.input_std
 
         return normalized
 
@@ -112,9 +118,10 @@ class DataNormalizer:
             normalized = (
                 normalized * (self.feature_range[1] - self.feature_range[0]) + self.feature_range[0]
             )
-        else:  # standard
+        elif self.method == "standard":  # standard
             normalized = (outputs - self.output_mean) / self.output_std
-
+        elif self.method == "scale_only":
+            normalized = outputs / self.output_std
         return normalized
 
     def inverse_transform_outputs(self, outputs: np.ndarray) -> np.ndarray:
@@ -127,8 +134,10 @@ class DataNormalizer:
                 self.feature_range[1] - self.feature_range[0]
             )
             denormalized = denormalized * (self.output_max - self.output_min) + self.output_min
-        else:  # standard
+        elif self.method == "standard":  # standard
             denormalized = outputs * self.output_std + self.output_mean
+        elif self.method == "scale_only":
+            denormalized = outputs * self.output_std
 
         return denormalized
 
@@ -147,11 +156,15 @@ class DataNormalizer:
                 self.feature_range[1] - self.feature_range[0]
             )
             denormalized = denormalized * (output_max - output_min) + output_min
-        else:  # standard
+        elif self.method == "standard":  # standard
             output_mean = torch.from_numpy(self.output_mean).float().to(device)
             output_std = torch.from_numpy(self.output_std).float().to(device)
 
             denormalized = outputs * output_std + output_mean
+        elif self.method == "scale_only":  # scale_only
+            output_std = torch.from_numpy(self.output_std).float().to(device)
+
+            denormalized = outputs * output_std
 
         return denormalized
 
@@ -165,8 +178,10 @@ class DataNormalizer:
                 self.feature_range[1] - self.feature_range[0]
             )
             denormalized = denormalized * (self.input_max - self.input_min) + self.input_min
-        else:  # standard
+        elif self.method == "standard":  # standard
             denormalized = inputs * self.input_std + self.input_mean
+        elif self.method == "scale_only":  # scale_only
+            denormalized = inputs * self.input_std
 
         return denormalized
 
@@ -185,11 +200,15 @@ class DataNormalizer:
                 self.feature_range[1] - self.feature_range[0]
             )
             denormalized = denormalized * (input_max - input_min) + input_min
-        else:  # standard
+        elif self.method == "standard":  # standard
             input_mean = torch.from_numpy(self.input_mean).float().to(device)
             input_std = torch.from_numpy(self.input_std).float().to(device)
 
             denormalized = inputs * input_std + input_mean
+        elif self.method == "scale_only":  # scale_only
+            input_std = torch.from_numpy(self.input_std).float().to(device)
+
+            denormalized = inputs * input_std
 
         return denormalized
 
@@ -211,12 +230,19 @@ class DataNormalizer:
                         "output_max": self.output_max.tolist(),
                     }
                 )
-            else:
+            elif self.method == "standard":
                 params.update(
                     {
                         "input_mean": self.input_mean.tolist(),
                         "input_std": self.input_std.tolist(),
                         "output_mean": self.output_mean.tolist(),
+                        "output_std": self.output_std.tolist(),
+                    }
+                )
+            elif self.method == "scale_only":
+                params.update(
+                    {
+                        "input_std": self.input_std.tolist(),
                         "output_std": self.output_std.tolist(),
                     }
                 )
@@ -241,10 +267,13 @@ class DataNormalizer:
                 normalizer.input_max = np.array(params["input_max"])
                 normalizer.output_min = np.array(params["output_min"])
                 normalizer.output_max = np.array(params["output_max"])
-            else:
+            elif params["method"] == "standard":
                 normalizer.input_mean = np.array(params["input_mean"])
                 normalizer.input_std = np.array(params["input_std"])
                 normalizer.output_mean = np.array(params["output_mean"])
+                normalizer.output_std = np.array(params["output_std"])
+            elif params["method"] == "scale_only":
+                normalizer.input_std = np.array(params["input_std"])
                 normalizer.output_std = np.array(params["output_std"])
 
             normalizer.is_fitted = True

@@ -307,18 +307,18 @@ def main():
 
     from sysid.data import TimeSeriesDataset
 
+    # Always use full sequences for testing (sequence_length=None)
     test_dataset = TimeSeriesDataset(
         test_inputs_norm,
         test_outputs_norm,
         test_states,
-        sequence_length=config.data.sequence_length,
-        sequence_stride=getattr(config.data, "sequence_stride", None),
+        sequence_length=None,  # Always use full sequences for evaluation
+        sequence_stride=None,
     )
 
     test_loader = TorchDataLoader(
         test_dataset,
         batch_size=config.data.batch_size,
-        # batch_size=1,
         shuffle=False,
         collate_fn=collate_with_optional_states,
     )
@@ -368,6 +368,7 @@ def main():
         model=model,
         device=str(device),
         output_dir=str(output_dir),
+        warmup_steps=config.training.warmup_steps
     )
 
     # Evaluate (with MLflow logging if run_info exists)
@@ -424,9 +425,8 @@ def main():
                         sample_indices.extend(random_indices)
 
                     plot_predictions(
-                        evaluator.output_dir, e_hat, e, d, sample_indices=sample_indices
+                        evaluator.output_dir, e_hat, e, d, sample_indices=sample_indices, warmup_steps=config.training.warmup_steps
                     )
-                    # evaluator.plot_predictions(e_hat, e, d, sample_indices=sample_indices)
                     evaluator.analyze_errors(e_hat, e)
                     logger.info("Plots generated successfully")
                 except Exception as e_err:
