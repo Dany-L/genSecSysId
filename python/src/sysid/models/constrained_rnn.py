@@ -67,6 +67,7 @@ class SimpleLure(nn.Module):
             self.dual_penalty_growth = custom_params.get("dual_penalty_growth", 1.1)
             self.dual_penalty_shrink = custom_params.get("dual_penalty_shrink", 0.9)
             self.l_nonzero_weight = custom_params.get("l_nonzero_weight", 0.0)
+            self.safety_filter = custom_params.get("safety_filter", False)
         else:
             learn_L = True
             self.regularization_method = "interior_point"
@@ -74,6 +75,7 @@ class SimpleLure(nn.Module):
             self.dual_penalty_growth = 1.1
             self.dual_penalty_shrink = 0.9
             self.l_nonzero_weight = 0.0
+            self.safety_filter=None
 
         self.learn_L = learn_L
 
@@ -162,7 +164,8 @@ class SimpleLure(nn.Module):
                 D21=self.D21,
                 D22=self.D22,
                 Delta=Delta,
-            )
+            ),
+            self.safety_filter
         )
 
         # Register gradient masks for partially constrained parameters
@@ -592,7 +595,7 @@ class SimpleLure(nn.Module):
         logger.info(f"Initialization complete. Constraints satisfied: {constraints_ok}")
         logger.info("=" * 80)
         if not constraints_ok:
-            self.analysis_problem_init(learn_B=False, learn_D21=False)
+            self.analysis_problem_init(learn_B=True, learn_D21=True)
         
 
     def _init_identity(self, train_inputs, train_states, train_outputs):
@@ -1304,6 +1307,7 @@ class SimpleLure(nn.Module):
         d: torch.Tensor,  # input
         x0: Optional[torch.Tensor] = None,
         return_state: bool = False,
+        warmup_steps: int = 0,
     ) -> torch.Tensor:
         """
         Forward pass.
@@ -1335,7 +1339,9 @@ class SimpleLure(nn.Module):
                     x0_padded[:, :self.nx_data, :] = x0
                 x0 = x0_padded
         ds = d.reshape(shape=(B, N, nd, 1))
-        es_hat, x = self.lure.forward(x0=x0, d=ds, return_states=return_state)
+        P = self.P
+        alpha = 1/(1+ torch.exp(-self.tau))
+        es_hat, x = self.lure.forward(x0=x0, d=ds, return_states=return_state, X=torch.linalg.inv(P), s=self.s, alpha=alpha, warmup_steps=warmup_steps)
         # return (
         #     es_hat.reshape(B, N, self.lure._nd),
         #     (x.reshape(B, self.nx),),

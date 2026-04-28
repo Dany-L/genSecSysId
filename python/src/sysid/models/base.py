@@ -92,6 +92,7 @@ class LureSystem(Linear):
     def __init__(
         self,
         sys: LureSystemClass,
+        safety_filter: Optional[bool] = None,
     ) -> None:
         super().__init__(A=sys.A, B=sys.B, C=sys.C, D=sys.D)
         self._nw = sys.B2.shape[1]
@@ -102,6 +103,21 @@ class LureSystem(Linear):
         self.D12 = sys.D12
         self.D21 = sys.D21
         self.Delta = sys.Delta  # static nonlinearity
+        self.safety_filter = safety_filter
+
+    
+    def input_filter(self, X: torch.Tensor, s: torch.Tensor, alpha: torch.Tensor, x_k: torch.Tensor, d_k: torch.Tensor) -> torch.Tensor:
+        X_x_squared = []
+        for x_k_i in x_k:
+            X_x_squared.append(x_k_i.T @ X @ x_k_i)
+        X_x_squared = torch.stack(X_x_squared)
+        d_max = torch.sqrt(s**2 - alpha**2 * X_x_squared)
+        
+        safety_violations = d_k > d_max
+        for idx, safety_violation in enumerate(safety_violations):
+            if safety_violation:
+                d_k[idx] = d_max[idx]
+        return d_k
 
 
     def forward(
@@ -109,12 +125,19 @@ class LureSystem(Linear):
             d: torch.Tensor,
             x0: Optional[Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]] = None,
             return_states: bool = False,
+            X: Optional[np.ndarray] = None,
+            s: Optional[float] = None,
+            alpha: Optional[float] = None,
+            warmup_steps: Optional[int] = 0,
         ) -> Tuple[
             torch.Tensor,
             Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]],
         ]:
             n_batch, N, _, _ = d.shape
-            
+
+            if self.safety_filter and (X is None or s is None or alpha is None):
+                raise ValueError("Safety filter enabled but no safe set X or parameter s provided")
+
             # Initialize the current state
             x_k = x0.reshape(n_batch, self._nx, 1)
 
@@ -127,11 +150,17 @@ class LureSystem(Linear):
 
                 for k in range(N):
                     d_k = d[:, k, :, :]
+
+                    # safety filter
+                    if self.safety_filter and k >= warmup_steps:  # Only apply safety filter after warmup steps
+                        d_k_safe = (self.input_filter(X, s, alpha, x_k, d_k)).clone()  # Clone to ensure we don't modify the original d_k tensor
+                    else:
+                        d_k_safe = d_k
                     
                     # Compute current step (creates new tensors, no in-place mutation)
-                    w_k = self.Delta(self.C2 @ x_k + self.D21 @ d_k)
-                    e_hat_k = super().output_dynamics(x=x_k, d=d_k) + self.D12 @ w_k
-                    x_k_1 = super().state_dynamics(x=x_k, d=d_k) + self.B2 @ w_k
+                    w_k = self.Delta(self.C2 @ x_k + self.D21 @ d_k_safe)
+                    e_hat_k = super().output_dynamics(x=x_k, d=d_k_safe) + self.D12 @ w_k
+                    x_k_1 = super().state_dynamics(x=x_k, d=d_k_safe) + self.B2 @ w_k
                     
                     # Append to lists
                     e_hat_list.append(e_hat_k)
@@ -152,12 +181,18 @@ class LureSystem(Linear):
                 # When we don't need to return all states, we can just track the current ones
                 for k in range(N):
                     d_k = d[:, k, :, :]
-                    w_k = self.Delta(self.C2 @ x_k + self.D21 @ d_k)
-                    e_hat_k = super().output_dynamics(x=x_k, d=d_k) + self.D12 @ w_k
+
+                    if self.safety_filter:
+                        d_k_safe = (self.input_filter(X, s, alpha, x_k, d_k)).clone()  # Clone to ensure we don't modify the original d_k tensor
+                    else:
+                        d_k_safe = d_k
+
+                    w_k = self.Delta(self.C2 @ x_k + self.D21 @ d_k_safe)
+                    e_hat_k = super().output_dynamics(x=x_k, d=d_k_safe) + self.D12 @ w_k
                     
                     # Overwriting the Python variable 'x_k' is totally fine! 
                     # It just points to a new tensor in memory, leaving the old one intact for Autograd.
-                    x_k = super().state_dynamics(x=x_k, d=d_k) + self.B2 @ w_k
+                    x_k = super().state_dynamics(x=x_k, d=d_k_safe) + self.B2 @ w_k
                     
                     e_hat_list.append(e_hat_k)
 

@@ -263,7 +263,7 @@ class Trainer:
 
             # Forward pass
             self.optimizer.zero_grad()
-            e_hat, (x,w) = self.model(d, x0=x0, return_state=True)  # e_hat: predicted output
+            e_hat, (x,w) = self.model(d, x0=x0, return_state=True, warmup_steps=self.warmup_steps)  # e_hat: predicted output
             # e_hat = self.model(d, x0=x0)  # e_hat: predicted output
 
             # Compute prediction loss (skip warmup steps).
