@@ -6,7 +6,7 @@ from typing import Optional, Union
 import torch
 
 from ..config import Config
-from .constrained_rnn import SimpleLure
+from .constrained_rnn import SimpleLure, SimpleLureSafe
 from .rnn import GRU, LSTM, SimpleRNN
 
 
@@ -54,22 +54,36 @@ def create_model(
             num_layers=model_config.num_layers,
             dropout=model_config.dropout,
         )
-    elif model_config.model_type == "crnn":
-        # Build kwargs for SimpleLure, only including delta and max_norm_x0 if provided
+    elif model_config.model_type in ("crnn", "crnn_safe"):
+        # Hard cutover: the legacy custom_params.safety_filter flag is gone.
+        # Loud failure here prevents a config that asked for the filter from
+        # silently running without it.
+        custom_params = model_config.custom_params
+        if (
+            model_config.model_type == "crnn"
+            and custom_params is not None
+            and custom_params.get("safety_filter")
+        ):
+            raise ValueError(
+                "custom_params.safety_filter has been removed. "
+                "Set model_type: 'crnn_safe' in your config instead."
+            )
+
         crnn_kwargs = {
             "nd": input_size,
             "ne": output_size,
             "nw": model_config.nw,
             "nx": model_config.nx,
             "activation": model_config.activation,
-            "custom_params": model_config.custom_params,
+            "custom_params": custom_params,
         }
         if delta is not None:
             crnn_kwargs["delta"] = delta
         if max_norm_x0 is not None:
             crnn_kwargs["max_norm_x0"] = max_norm_x0
 
-        model = SimpleLure(**crnn_kwargs)
+        cls = SimpleLureSafe if model_config.model_type == "crnn_safe" else SimpleLure
+        model = cls(**crnn_kwargs)
     else:
         raise ValueError(f"Unknown model type: {model_config.model_type}")
 

@@ -17,7 +17,7 @@ from tqdm import tqdm
 from ..evaluation.evaluator import Evaluator
 from ..models.base import BaseRNN
 from ..models.constrained_rnn import SimpleLure
-from ..utils import plot_ellipse_and_parallelogram, plot_predictions
+from ..utils import plot_predictions, plot_safe_set_trajectories
 
 
 class Trainer:
@@ -153,7 +153,7 @@ class Trainer:
         temp_output_dir = self.output_dir / "predictions"
         temp_output_dir.mkdir(parents=True, exist_ok=True)
 
-        evaluator = Evaluator(model=self.model, device=self.device, output_dir=str(temp_output_dir))
+        evaluator = Evaluator(model=self.model, device=self.device, output_dir=str(temp_output_dir), warmup_steps=self.warmup_steps)
 
         # Evaluate on validation set
         results = evaluator.evaluate(
@@ -166,6 +166,8 @@ class Trainer:
         e_hat = results["e_hat"]
         e = results["e"]
         d = results.get("inputs", None)
+        x = results.get("x", None)
+        c = results.get("c", None)
 
         # Select sample indices: always include sequence 0, plus 2 random sequences
         num_sequences = e_hat.shape[0]
@@ -179,6 +181,22 @@ class Trainer:
                 other_indices, size=num_random, replace=False
             ).tolist()
             sample_indices.extend(random_indices)
+
+        if self.model.nx == 2:
+            fig, ax, _, _ = plot_safe_set_trajectories(
+                P=self.model.P.cpu().detach().numpy(),
+                L=self.model.L.cpu().detach().numpy(),
+                s=self.model.s.cpu().detach().numpy(),
+                x_traj=x,
+                c=c,
+                warmup_steps=self.warmup_steps,
+                horizon=50,
+            )
+            ellipse_plot_path = temp_output_dir / f"ellipse-{name}.png"
+            fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            if self.mlflow_tracking:
+                mlflow.log_artifact(str(ellipse_plot_path), artifact_path="predictions")
 
         # Generate plot
         plot_path = temp_output_dir / f"{name}.png"
@@ -263,7 +281,7 @@ class Trainer:
 
             # Forward pass
             self.optimizer.zero_grad()
-            e_hat, (x,w) = self.model(d, x0=x0, return_state=True, warmup_steps=self.warmup_steps)  # e_hat: predicted output
+            e_hat, (x, w), _ = self.model(d, x0=x0, warmup_steps=self.warmup_steps)
             # e_hat = self.model(d, x0=x0)  # e_hat: predicted output
 
             # Compute prediction loss (skip warmup steps).
@@ -391,7 +409,7 @@ class Trainer:
                 e = e.to(self.device)
 
                 # Forward pass
-                e_hat = self.model(d, x0)  # e_hat: predicted output
+                e_hat, _, _ = self.model(d, x0, warmup_steps=self.warmup_steps)
 
                 # Compute loss
                 loss = self.loss_fn(e_hat[:, self.warmup_steps:, :], e[:, self.warmup_steps:, :])
@@ -417,7 +435,7 @@ class Trainer:
         print(f"Model has {self.model.count_parameters()} trainable parameters")
 
         # Plot initial trajectories before training
-        self.plot_trajectories(normalizer=normalizer, name="initial_trajectories")
+        self.plot_trajectories(name="initial_trajectories")
 
         # Epoch-level progress bar
         pbar = tqdm(range(max_epochs), desc="Training Progress")
