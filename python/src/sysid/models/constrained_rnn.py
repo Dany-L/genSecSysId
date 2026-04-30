@@ -1,7 +1,7 @@
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import cvxpy as cp
 import numpy as np
@@ -10,7 +10,7 @@ import torch.nn as nn
 
 from sysid.utils import plot_ellipse_and_parallelogram, torch_bmat
 
-from .base import DznActivation, LureSystem, LureSystemClass
+from .base import DznActivation, LureSystem, LureSystemClass, LureSystemSafe
 from ..data import DataNormalizer
 
 logger = logging.getLogger(__name__)
@@ -150,7 +150,7 @@ class SimpleLure(nn.Module):
         # for p in [self.A, self.B, self.C, self.D]:
         #     p.requires_grad = False
 
-        self.lure = LureSystem(
+        self.lure = self._build_lure(
             LureSystemClass(
                 A=self.A,
                 B=self.B,
@@ -1299,51 +1299,69 @@ class SimpleLure(nn.Module):
                     return False
         return True
 
+    def _build_lure(self, sys: LureSystemClass) -> LureSystem:
+        """Construct the inner Lure dynamics. Subclasses override to swap in
+        a filtered variant (see ``SimpleLureSafe``)."""
+        return LureSystem(sys)
+
+    def _prepare_x0(self, x0: Optional[torch.Tensor], B: int) -> torch.Tensor:
+        if x0 is None:
+            return torch.zeros(size=(B, self.nx, 1))
+        # Handle padding if pad_state is enabled and x0 comes from dataset (nx_data dim)
+        if self.pad_state and x0.shape[1] == self.nx_data:
+            x0_padded = torch.zeros(B, self.nx, 1, device=x0.device, dtype=x0.dtype)
+            if x0.ndim == 2:
+                x0_padded[:, :self.nx_data, 0] = x0
+            else:
+                x0_padded[:, :self.nx_data, :] = x0
+            return x0_padded
+        return x0
+
+    def _run_lure(
+        self,
+        ds: torch.Tensor,
+        x0: torch.Tensor,
+        warmup_steps: int,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Dispatch to the inner Lure dynamics. Subclasses can override to
+        inject the safe-set arguments without re-implementing ``forward``."""
+        return self.lure(d=ds, x0=x0)
+
     def forward(
         self,
-        d: torch.Tensor,  # input
+        d: torch.Tensor,
         x0: Optional[torch.Tensor] = None,
-        return_state: bool = False,
-    ) -> torch.Tensor:
-        """
-        Forward pass.
+        warmup_steps: int = 0,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Run the constrained RNN.
 
         Args:
-            d: Input tensor (batch, seq_len, input_size)
-            w: Nonlinearity input tensor (batch, seq_len, nw)
-            hidden_state: Hidden state (num_layers, batch, hidden_size)
-            x0: Initial state (batch, nx_data) or (batch, nx, 1). If nx_data dimension,
-                will be padded with zeros to nx dimension.
+            d: input ``(B, seq_len, nd)``.
+            x0: initial state ``(B, nx, 1)`` or ``(B, nx_data)`` (padded if
+                ``pad_state``). Defaults to zeros.
+            warmup_steps: number of leading steps the safety filter is
+                bypassed for (only used by ``SimpleLureSafe``).
 
         Returns:
-            e_hat: Predicted output (batch, seq_len, output_size)
+            ``(e_hat, (x, w), d_applied)`` with shapes
+                ``e_hat``: ``(B, seq_len, ne)``
+                ``x``:     ``(B, seq_len + 1, nx)`` — full state trajectory
+                ``w``:     ``(B, seq_len, nw)``
+                ``d_applied``: ``(B, seq_len, nd)`` — equal to ``d`` for the
+                plain class; the filtered input for ``SimpleLureSafe``.
         """
-
-        B, N, nd = d.shape  # number of batches, length of sequence, input size
+        B, N, nd = d.shape
         assert self.lure._nd == nd
-        if x0 is None:
-            x0 = torch.zeros(size=(B, self.nx, 1))
-            # x0 = torch.randn((B, self.nx, 1)) * 2 * self.max_norm_x0 - self.max_norm_x0
-            # x0 = torch.random.uniform(-self.max_norm_x0, self.max_norm_x0, size=(B, self.nx, 1))
-        else:
-            # Handle padding if pad_state is enabled and x0 comes from dataset (nx_data dimension)
-            if self.pad_state and x0.shape[1] == self.nx_data:
-                x0_padded = torch.zeros(B, self.nx, 1, device=x0.device, dtype=x0.dtype)
-                if x0.ndim == 2:
-                    x0_padded[:, :self.nx_data, 0] = x0
-                else:  # Already has shape (B, nx_data, 1)
-                    x0_padded[:, :self.nx_data, :] = x0
-                x0 = x0_padded
+        x0 = self._prepare_x0(x0, B)
         ds = d.reshape(shape=(B, N, nd, 1))
-        es_hat, x = self.lure.forward(x0=x0, d=ds, return_states=return_state)
-        # return (
-        #     es_hat.reshape(B, N, self.lure._nd),
-        #     (x.reshape(B, self.nx),),
-        # )
-        if return_state:
-            return es_hat.reshape(B, N, self.lure._ne), x
-        else:
-            return es_hat.reshape(B, N, self.lure._ne)
+
+        es_hat, (x_seq, w_seq), ds_applied = self._run_lure(ds, x0, warmup_steps)
+
+        e_hat = es_hat.reshape(B, N, self.lure._ne)
+        x = x_seq.reshape(B, N + 1, self.nx)
+        w = w_seq.reshape(B, N, self.lure._nw)
+        d_applied = ds_applied.reshape(B, N, nd)
+        return e_hat, (x, w), d_applied
 
     def count_parameters(self) -> int:
         """Count the number of trainable parameters."""
@@ -1510,6 +1528,13 @@ class SimpleLure(nn.Module):
 
         S_hat_opt = S_hat.value[0, 0] if hasattr(S_hat.value, "__len__") else S_hat.value
         s = np.sqrt(1.0 / S_hat_opt)
+
+        # update model parameters
+        self.P.data = torch.tensor(P.value)
+        self.L.data = torch.tensor(L.value)
+        self.la.data = torch.tensor(np.diag(M.value))
+        # self.M = torch.diag(self.la)
+        self.s.data = torch.tensor(s)
 
 
         # calculate output bound
@@ -1807,7 +1832,8 @@ class SimpleLure(nn.Module):
         self,
         u: torch.Tensor,
         x: torch.Tensor,
-        return_c: bool = False
+        return_c: bool = False,
+        warmup_steps: int = 0,
     ) -> torch.Tensor:
         """
         Compute input constraint regularization loss (vectorized).
@@ -1844,17 +1870,17 @@ class SimpleLure(nn.Module):
 
         # Compute vectorized quantities
         # ||u_k||^2 for all timesteps: (batch, seq_len, n_inputs) -> (batch, seq_len)
-        u_norm_sq = (u ** 2).sum(dim=-1)
+        u_norm_sq = (u[:,warmup_steps:N] ** 2).sum(dim=-1)
 
         # x_k^T * P^(-1) * x_k for all timesteps using einsum
         # states: (batch, seq_len, n_states)
         # X: (n_states, n_states)
         # Result: (batch, seq_len)
-        x_quad_form = torch.einsum("bti,ij,btj->bt", x[:,:N,:], X, x[:,:N,:])
+        x_quad_form = torch.einsum("bti,ij,btj->bt", x[:,warmup_steps:N,:], X, x[:,warmup_steps:N,:])
 
         # Compute constraint: c_k = ||u_k||^2 - s^2 + α^2 * (x_k^T * P^(-1) * x_k)
         # Shape: (batch, seq_len)
-        eps = 1e-4  # small epsilon for numerical stability
+        eps = 0  # small epsilon for numerical stability
         c = u_norm_sq - s**2 + alpha**2 * x_quad_form + eps
 
         # Apply ReLU (only penalize violations, i.e., c > 0)
@@ -1867,3 +1893,53 @@ class SimpleLure(nn.Module):
             return reg_loss, c
 
         return reg_loss
+
+
+class SimpleLureSafe(SimpleLure):
+    """SimpleLure with the safety input filter wired into the forward pass.
+
+    The filter clamps each input ``d_k`` to keep the closed-loop state inside
+    the learned safe set ``{x : (1/s²) xᵀ P⁻¹ x ≤ 1}``. The safe-set parameters
+    are derived on-the-fly from the model's own learnable ``P``, ``s``, ``tau``.
+    """
+
+    def _build_lure(self, sys: LureSystemClass) -> LureSystem:
+        return LureSystemSafe(sys)
+
+    def _run_lure(
+        self,
+        ds: torch.Tensor,
+        x0: torch.Tensor,
+        warmup_steps: int,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        X = torch.linalg.inv(self.P)
+        alpha = 1.0 / (1.0 + torch.exp(-self.tau))
+        return self.lure(
+            d=ds, x0=x0, X=X, s=self.s, alpha=alpha, warmup_steps=warmup_steps,
+        )
+
+    def forward_unfiltered(
+        self,
+        d: torch.Tensor,
+        x0: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Diagnostic: run the dynamics with the safety filter bypassed.
+
+        Used by post-processing to visualize what trajectories *would* do
+        without the filter, so the constraint margin ``c`` from
+        ``get_regularization_input`` reflects raw (unprotected) behavior.
+
+        Returns the same ``(e_hat, (x, w), d)`` tuple as ``forward``.
+        """
+        B, N, nd = d.shape
+        assert self.lure._nd == nd
+        x0 = self._prepare_x0(x0, B)
+        ds = d.reshape(shape=(B, N, nd, 1))
+
+        es_hat, (x_seq, w_seq), ds_applied = LureSystem.forward(self.lure, d=ds, x0=x0)
+
+        e_hat = es_hat.reshape(B, N, self.lure._ne)
+        x = x_seq.reshape(B, N + 1, self.nx)
+        w = w_seq.reshape(B, N, self.lure._nw)
+        d_applied = ds_applied.reshape(B, N, nd)
+        return e_hat, (x, w), d_applied

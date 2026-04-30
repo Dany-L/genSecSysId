@@ -89,6 +89,8 @@ class ModelConfig:
     #       - Partially learnable parameters use gradient masking to zero non-learnable elements
     #       - Initialization methods respect constraints (fixed params not modified)
     #       - Fully backward compatible (configs without constraints work unchanged)
+    #   - pad_state: bool, optional (default: False)
+    #     Pads state dimension to match nz (nonlinearity state size)
     custom_params: Optional[Dict[str, Any]] = None
     # Initialization configuration
     initialization: InitializationConfig = None

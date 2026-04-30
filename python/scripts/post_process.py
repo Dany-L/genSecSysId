@@ -31,8 +31,13 @@ import matplotlib.pyplot as plt
 from sysid.config import Config
 from sysid.data import DataNormalizer
 from sysid.data.direct_loader import load_csv_folder
-from sysid.models import SimpleLure
-from sysid.utils import plot_ellipse, plot_ellipse_and_parallelogram, plot_polytope
+from sysid.models import SimpleLure, SimpleLureSafe
+from sysid.utils import (
+    plot_ellipse,
+    plot_ellipse_and_parallelogram,
+    plot_polytope,
+    plot_safe_set_trajectories,
+)
 
 torch.set_default_dtype(torch.float64)
 
@@ -49,15 +54,16 @@ DEFAULT_TRAIN_DATA_PATH = "/Users/jack/genSecSysId-Data/data/Duffing/train"
 DEFAULT_CONFIG_PATH = "~/genSecSysId-Data/configs/crnn_gen-sec.yaml"
 
 
-def check_input_condition(c: np.ndarray) -> (int, int):
-    count_stable, count_unstable = 0,0
-    for c_i in c:
-        if np.any(c_i>0):
-            count_unstable+=1
-        else:
-            count_stable+=1
+def _simulate(model, u, x0, warmup_steps):
+    """Run model dynamics for diagnostic plots.
 
-    return count_stable, count_unstable
+    For SimpleLureSafe we explicitly bypass the safety filter so that the
+    constraint margin c reflects raw behavior (the filter would otherwise
+    prevent any violation by construction, making the plots uninformative).
+    """
+    if isinstance(model, SimpleLureSafe):
+        return model.forward_unfiltered(u, x0)
+    return model(u, x0, warmup_steps=warmup_steps)
 
 
 def parse_args():
@@ -121,6 +127,12 @@ def main():
         config = Config.from_json(os.path.expanduser(config_path))
     else:
         raise ValueError(f"Unsupported config file format: {config_path.suffix}")
+
+    if getattr(config, "root_dir", None):
+        base = Path(os.path.expanduser(config.root_dir))
+        output_dir = base / "outputs" / config.model.model_type
+    else:
+        output_dir = Path(os.path.expanduser(config.output_dir))
 
     # Load model from MLflow
     logger.info(f"Loading model from run {args.run_id}")
@@ -234,38 +246,32 @@ def main():
         x0_train = torch.zeros((b, model.nx))  # Start from origin
 
         # check input condition on training trajectories before post-processing
-        with torch.no_grad():
-            _, (x_hat_train, _) = model(u_train_n, x0_train, return_state=True)
-            _, c_train = model.get_regularization_input(u_train_n, x_hat_train, return_c=True)
-
-        count_stable_orig, count_unstable_orig = check_input_condition(c_train.cpu().detach().numpy())
-
         warmup_steps = config.training.warmup_steps if hasattr(config.training, "warmup_steps") else 0
+        with torch.no_grad():
+            _, (x_hat_train, _), u_safe = _simulate(model, u_train_n, x0_train, warmup_steps)
+            _, c_train = model.get_regularization_input(u_safe, x_hat_train, return_c=True, warmup_steps=warmup_steps)
 
-        fix, ax = plt.subplots(figsize=(10,6))
-        for c_i, x_hat_i in zip(c_train.cpu().detach().numpy(), x_hat_train.cpu().detach().numpy()):
-            M = warmup_steps+200
-            if np.any(c_i>0):
-                ax.plot(x_hat_i[warmup_steps, 0], x_hat_i[warmup_steps, 1], "rx")
-                ax.plot(x_hat_i[warmup_steps:M, 0], x_hat_i[warmup_steps:M, 1], '--')
-            else:
-                ax.plot(x_hat_i[warmup_steps, 0], x_hat_i[warmup_steps, 1], "go")
-                ax.plot(x_hat_i[warmup_steps:M, 0], x_hat_i[warmup_steps:M, 1])
+        c_train_np = c_train.cpu().detach().numpy()
+        x_hat_train_np = x_hat_train.cpu().detach().numpy()
 
-        X = np.linalg.inv(model.P.cpu().detach().numpy())
-        H = model.L.cpu().detach().numpy() @ X
-        s = model.s.cpu().detach().numpy()
-
-        fig, ax = plot_ellipse_and_parallelogram(
-            X, H, s, None, ax=ax, show=False, fill_polytope=True
+        fig, ax, count_stable_orig, count_unstable_orig = plot_safe_set_trajectories(
+            P=model.P.cpu().detach().numpy(),
+            L=model.L.cpu().detach().numpy(),
+            s=model.s.cpu().detach().numpy(),
+            x_traj=x_hat_train_np,
+            c=c_train_np,
+            warmup_steps=warmup_steps,
+            horizon=200,
         )
         ellipse_plot_path = output_dir / f"ellipse_polytope_post_train_orig_{args.run_id[:8]}.png"
         fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
-
         mlflow.log_figure(fig, str(ellipse_plot_path.with_suffix(".png")))
+        plt.close(fig)
 
         logger.info(f"Original training trajectories: total={b}, stable={count_stable_orig}, unstable={count_unstable_orig}")
-        
+        mlflow.log_metric("post_process/orig_stable_train_trajectories", count_stable_orig)
+        mlflow.log_metric("post_process/orig_unstable_train_trajectories", count_unstable_orig)
+
         result = model.post_process()
         
         if not result["success"]:
@@ -287,6 +293,7 @@ def main():
         mlflow.log_metric("post_process/norm_P_original", summary["original"]["norm_P"])
         mlflow.log_metric("post_process/norm_L_original", summary["original"]["norm_L"])
         mlflow.log_metric("post_process/norm_H_original", summary["original"]["norm_H"])
+        
         # mlflow.log_metric("post_process/norm_P_optimized", summary["optimized"]["norm_P"])
         # mlflow.log_metric("post_process/norm_L_optimized", summary["optimized"]["norm_L"])
         # mlflow.log_metric("post_process/norm_H_optimized", summary["optimized"]["norm_H"])
@@ -297,33 +304,26 @@ def main():
 
         # check how many training trajectories satisfy the input condition after post-processing
         with torch.no_grad():
-            _, (x_hat_train, _) = model(u_train_n, x0_train, return_state=True)
-            _, c_train = model.get_regularization_input(u_train_n, x_hat_train, return_c=True)
-        count_stable_post, count_unstable_post = check_input_condition(c_train.cpu().detach().numpy())
-        logger.info(f"Post-processed training trajectories: total={b}, stable={count_stable_post}, unstable={count_unstable_post}")
+            _, (x_hat_train, _), u_safe = _simulate(model, u_train_n, x0_train, warmup_steps)
+            _, c_train = model.get_regularization_input(u_safe, x_hat_train, return_c=True, warmup_steps=warmup_steps)
 
-        X = np.linalg.inv(model.P.cpu().detach().numpy())
-        H = model.L.cpu().detach().numpy() @ X
-        s = model.s.cpu().detach().numpy()
-        
-        fix, ax = plt.subplots(figsize=(10,6))
-        for c_i, x_hat_i in zip(c_train.cpu().detach().numpy(), x_hat_train.cpu().detach().numpy()):
-            M = warmup_steps+100
-            if np.any(c_i>0):
-                ax.plot(x_hat_i[warmup_steps, 0], x_hat_i[warmup_steps, 1], "rx")
-                ax.plot(x_hat_i[warmup_steps:M, 0], x_hat_i[warmup_steps:M, 1], '--')
-            else:
-                ax.plot(x_hat_i[warmup_steps, 0], x_hat_i[warmup_steps, 1], "go")
-                ax.plot(x_hat_i[warmup_steps:M, 0], x_hat_i[warmup_steps:M, 1])
-
-        fig, ax = plot_ellipse_and_parallelogram(
-            X, H, s, None, ax=ax, show=False, fill_polytope=True
+        fig, ax, count_stable_post, count_unstable_post = plot_safe_set_trajectories(
+            P=model.P.cpu().detach().numpy(),
+            L=model.L.cpu().detach().numpy(),
+            s=model.s.cpu().detach().numpy(),
+            x_traj=x_hat_train.cpu().detach().numpy(),
+            c=c_train.cpu().detach().numpy(),
+            warmup_steps=warmup_steps,
+            horizon=200,
         )
+        logger.info(f"Post-processed training trajectories: total={b}, stable={count_stable_post}, unstable={count_unstable_post}")
+        mlflow.log_metric("post_process/opt_stable_train_trajectories", count_stable_post)
+        mlflow.log_metric("post_process/opt_unstable_train_trajectories", count_unstable_post)
 
         ellipse_plot_path = output_dir / f"ellipse_polytope_post_train_opt_{args.run_id[:8]}.png"
         fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
-
         mlflow.log_figure(fig, str(ellipse_plot_path.with_suffix(".png")))
+        plt.close(fig)
 
         # Log parameter
         mlflow.log_param("post_processing", True)
@@ -370,60 +370,33 @@ def main():
                 b, N, _ = test_inputs.shape
                 x0= torch.zeros((b, model.nx))  # Start from origin for visualization
                 u_n = torch.tensor(normalizer.transform_inputs(test_inputs))
-                e_hat_n, (xs, ws) = model(
-                    u_n, x0, return_state=True
-                )
+                e_hat_n, (xs, ws), _ = _simulate(model, u_n, x0, warmup_steps)
                 e_hat = normalizer.inverse_transform_outputs(e_hat_n.cpu().detach().numpy())
                 xs = xs[:,:N] # strip last state
 
             try:
-                
-                import tikzplotlib
 
-                X = np.linalg.inv(model.P.cpu().detach().numpy())
-                H = model.L.cpu().detach().numpy() @ X
-                s = model.s.cpu().detach().numpy()
-                warmup_steps = config.training.warmup_steps if hasattr(config.training, "warmup_steps") else 0
+                import tikzplotlib
 
                 # check if (u^k)^T u^k <= s^2 - alpha^2 (x^k)^T X x^k holds for all test trajectories
                 # c = (u^k)^T u^k - s^2 + alpha^2 (x^k)^T X x^k
                 _, cs = model.get_regularization_input(u_n, xs, return_c=True)
                 cs = cs.cpu().detach().numpy()
-                
-                # pos_c = np.where(c>0,True, False)
 
-                fig, ax = plt.subplots(figsize=(8, 8))
-
-                count_stable, count_unstable = 0,0
-                for x, x_hat, c in zip(test_states, xs, cs):
-                    # if np.linalg.norm(x[-1, :], ord=2) > np.linalg.norm(x[0, :], ord=2) and not (
-                    #     np.linalg.norm(x[0, :], ord=2) == 0.0
-                    # ):
-                    #     # diverging trajectory
-                    #     ax.plot(x[0, 0], x[0, 1], "rx")
-                    # else:
-                    #     ax.plot(x[0, 0], x[0, 1], "go")
-                    # ax.plot(x[:,0], x[:,1], '--')
-
-                    M = warmup_steps+100
-                    if np.any(c>0):
-                        ax.plot(x_hat[warmup_steps, 0], x_hat[warmup_steps, 1], "rx")
-                        ax.plot(x_hat[warmup_steps:M, 0], x_hat[warmup_steps:M, 1], '--')
-                        # ax.plot(x_hat[c>0,0], x_hat[c>0,1])
-                        count_unstable+=1
-                    else:
-                        ax.plot(x_hat[warmup_steps, 0], x_hat[warmup_steps, 1], "go")
-                        ax.plot(x_hat[warmup_steps:M, 0], x_hat[warmup_steps:M, 1])
-                        count_stable +=1
-
-                logger.info(f'total:{b}, stable: {count_stable}, count unstable: {count_unstable}')
                 ellipse_plot_path = output_dir / f"ellipse_polytope_post_{args.run_id[:8]}.png"
- 
-                if model.learn_L and config.training.use_custom_regularization:
 
-                    fig, ax = plot_ellipse_and_parallelogram(
-                        X, H, s, None, ax=ax, show=False, fill_polytope=True
+                if model.learn_L and config.training.use_custom_regularization:
+                    fig, ax, count_stable, count_unstable = plot_safe_set_trajectories(
+                        P=model.P.cpu().detach().numpy(),
+                        L=model.L.cpu().detach().numpy(),
+                        s=model.s.cpu().detach().numpy(),
+                        x_traj=xs.cpu().detach().numpy(),
+                        c=cs,
+                        warmup_steps=warmup_steps,
+                        horizon=100,
+                        figsize=(8, 8),
                     )
+                    logger.info(f'total:{b}, stable: {count_stable}, count unstable: {count_unstable}')
 
                     # Save to output directory
                     fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
@@ -443,6 +416,20 @@ def main():
                     plt.close(fig)
                     logger.info("Ellipse/polytope plot logged to MLflow")
                 else:
+                    fig, ax = plt.subplots(figsize=(8, 8))
+                    count_stable, count_unstable = 0, 0
+                    xs_np = xs.cpu().detach().numpy()
+                    for x_hat, c in zip(xs_np, cs):
+                        M = warmup_steps + 100
+                        if np.any(c > 0):
+                            ax.plot(x_hat[warmup_steps, 0], x_hat[warmup_steps, 1], "rx")
+                            ax.plot(x_hat[warmup_steps:M, 0], x_hat[warmup_steps:M, 1], '--')
+                            count_unstable += 1
+                        else:
+                            ax.plot(x_hat[warmup_steps, 0], x_hat[warmup_steps, 1], "go")
+                            ax.plot(x_hat[warmup_steps:M, 0], x_hat[warmup_steps:M, 1])
+                            count_stable += 1
+                    logger.info(f'total:{b}, stable: {count_stable}, count unstable: {count_unstable}')
                     ax.grid(True, alpha=0.3)
                     ax.set_xlabel(r"$x_1$", fontsize=12)
                     ax.set_ylabel(r"$x_2$", fontsize=12)
