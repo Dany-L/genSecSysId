@@ -95,8 +95,8 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="post_processing",
-        help="Output directory for post-processed results (default: post_processing)",
+        default=None,
+        help="Output directory for post-processed results (default: derived from config root_dir or config output_dir)",
     )
 
     parser.add_argument(
@@ -128,7 +128,9 @@ def main():
     else:
         raise ValueError(f"Unsupported config file format: {config_path.suffix}")
 
-    if getattr(config, "root_dir", None):
+    if args.output_dir is not None:
+        output_dir = Path(os.path.expanduser(args.output_dir))
+    elif getattr(config, "root_dir", None):
         base = Path(os.path.expanduser(config.root_dir))
         output_dir = Path(base / "outputs" / config.model.model_type)
 
