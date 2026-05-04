@@ -34,6 +34,7 @@ class DataConfig:
     sequence_stride: Optional[int] = None  # None = auto (non-overlap for concatenated data)
     shuffle: bool = True
     num_workers: int = 0
+    sampling_time: float = 0.01
 
     def __post_init__(self):
         """Set default column names if none provided."""

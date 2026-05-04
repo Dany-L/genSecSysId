@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_TEST_DATA_PATH = "/Users/jack/genSecSysId-Data/data/Duffing/test"
 DEFAULT_TRAIN_DATA_PATH = "/Users/jack/genSecSysId-Data/data/Duffing/train"
 # DEFAULT_TRAJECTORY_LIST = [0, 1]
-DEFAULT_CONFIG_PATH = "~/genSecSysId-Data/configs/crnn_gen-sec.yaml"
+
 
 
 def _simulate(model, u, x0, warmup_steps):
@@ -81,7 +81,7 @@ def parse_args():
     parser.add_argument(
         "--config",
         type=str,
-        default=DEFAULT_CONFIG_PATH,
+        default='~/genSecSysId-Data/configs/crnn_gen-sec_duffing.yaml',
         help="Path to configuration file (YAML or JSON)",
     )
 
@@ -95,8 +95,8 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="post_processing",
-        help="Output directory for post-processed results (default: post_processing)",
+        default=None,
+        help="Output directory for post-processed results (default: derived from config root_dir or config output_dir)",
     )
 
     parser.add_argument(
@@ -128,11 +128,17 @@ def main():
     else:
         raise ValueError(f"Unsupported config file format: {config_path.suffix}")
 
-    if getattr(config, "root_dir", None):
+    if args.output_dir is not None:
+        output_dir = Path(os.path.expanduser(args.output_dir))
+    elif getattr(config, "root_dir", None):
         base = Path(os.path.expanduser(config.root_dir))
-        output_dir = base / "outputs" / config.model.model_type
+        output_dir = Path(base / "outputs" / config.model.model_type)
+
     else:
         output_dir = Path(os.path.expanduser(config.output_dir))
+    run_id = args.run_id
+    run_output_dir = Path(output_dir) / run_id
+    run_output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load model from MLflow
     logger.info(f"Loading model from run {args.run_id}")
@@ -236,10 +242,6 @@ def main():
                 np.stack(train_inputs),
                 np.stack(train_outputs),
             )
-
-        # output dir
-        output_dir = Path(args.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
         
         u_train_n = torch.tensor(normalizer.transform_inputs(train_inputs))
         b, N, _ = u_train_n.shape
@@ -263,9 +265,10 @@ def main():
             warmup_steps=warmup_steps,
             horizon=200,
         )
-        ellipse_plot_path = output_dir / f"ellipse_polytope_post_train_orig_{args.run_id[:8]}.png"
+        ellipse_plot_name= Path(f"ellipse_polytope_post_train_orig_{args.run_id[:8]}.png")
+        ellipse_plot_path = Path(run_output_dir / ellipse_plot_name)
         fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
-        mlflow.log_figure(fig, str(ellipse_plot_path.with_suffix(".png")))
+        mlflow.log_figure(fig, f'post_processing/{ellipse_plot_name}')
         plt.close(fig)
 
         logger.info(f"Original training trajectories: total={b}, stable={count_stable_orig}, unstable={count_unstable_orig}")
@@ -289,18 +292,21 @@ def main():
         )
         mlflow.log_metric("post_process/s_original", summary["original"]["s"])
         mlflow.log_metric("post_process/s_optimized", summary["optimized"]["s"])
-        # mlflow.log_metric("post_process/max_eig_F", summary["optimized"]["max_eig_F"])
         mlflow.log_metric("post_process/norm_P_original", summary["original"]["norm_P"])
         mlflow.log_metric("post_process/norm_L_original", summary["original"]["norm_L"])
         mlflow.log_metric("post_process/norm_H_original", summary["original"]["norm_H"])
-        
-        # mlflow.log_metric("post_process/norm_P_optimized", summary["optimized"]["norm_P"])
-        # mlflow.log_metric("post_process/norm_L_optimized", summary["optimized"]["norm_L"])
-        # mlflow.log_metric("post_process/norm_H_optimized", summary["optimized"]["norm_H"])
-        # y_bar = summary["optimized"]["output_range"] * normalizer.output_std
-        # mlflow.log_metric("post_process/y_bar", y_bar)
+        mlflow.log_metric("post_process/max_eig_F", summary["optimized"]["max_eig_F"])
+        mlflow.log_metric("post_process/norm_P_optimized", summary["optimized"]["norm_P"])
+        mlflow.log_metric("post_process/norm_L_optimized", summary["optimized"]["norm_L"])
+        mlflow.log_metric("post_process/norm_H_optimized", summary["optimized"]["norm_H"])
+        y_bar = summary["optimized"]["y_bar_n"] * normalizer.output_std
+        mlflow.log_metric("post_process/y_bar", y_bar)
 
-        # logger.info(f"Maximum output range (y_bar) after post-processing: {y_bar}")
+        logger.info(f"Maximum output range (y_bar) after post-processing: {y_bar}")
+        # compute maximum output value from training dataset
+        y_max_train = np.max(np.abs(train_outputs))
+        logger.info(f"Maximum output value in training data: {y_max_train}")
+        mlflow.log_metric("data/max_output_train", y_max_train)
 
         # check how many training trajectories satisfy the input condition after post-processing
         with torch.no_grad():
@@ -320,9 +326,11 @@ def main():
         mlflow.log_metric("post_process/opt_stable_train_trajectories", count_stable_post)
         mlflow.log_metric("post_process/opt_unstable_train_trajectories", count_unstable_post)
 
-        ellipse_plot_path = output_dir / f"ellipse_polytope_post_train_opt_{args.run_id[:8]}.png"
+    
+        ellipse_plot_name = Path(f"ellipse_polytope_post_train_opt_{args.run_id[:8]}.png")
+        ellipse_plot_path = Path(run_output_dir / ellipse_plot_name)
         fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
-        mlflow.log_figure(fig, str(ellipse_plot_path.with_suffix(".png")))
+        mlflow.log_figure(fig, f'post_processing/{ellipse_plot_name}')
         plt.close(fig)
 
         # Log parameter
@@ -332,18 +340,17 @@ def main():
         # Save results to file
         alpha = 1/(1 + np.exp(-model.tau.cpu().detach().numpy()))  # Sigmoid of tau
 
-        results_path = output_dir / f"post_processing_{args.run_id[:8]}.npz"
+        results_path = run_output_dir / f"post_processing_{args.run_id[:8]}.npz"
         np.savez(
             results_path,
             P_original=model.P.cpu().detach().numpy(),
-            # P_opt=result["P_opt"],
+            P_opt=result["P_opt"],
             L_original=model.L.cpu().detach().numpy() if model.learn_L else None,
-            # L_opt=result["L_opt"],
-            # m_opt=result["m_opt"],
+            L_opt=result["L_opt"],
             s_original=summary["original"]["s"],
-            # s_opt=result["s_opt"],
-            # S_hat_opt=result["S_hat_opt"],
-            # max_eig_F=result["max_eig_F"],
+            s_opt=result["s_opt"],
+            max_eig_F=result["max_eig_F"],
+            y_bar=y_bar,
             alpha=alpha,
             A=model.A.cpu().detach().numpy(),
             B=model.B.cpu().detach().numpy(),
@@ -357,7 +364,7 @@ def main():
         mlflow.log_artifact(str(results_path), artifact_path="post_processing")
 
         # Save and log updated model with different name
-        # model_path = output_dir / f"post_processing_model_{args.run_id[:8]}.pt"
+        # model_path = run_output_dir / f"post_processing_model_{args.run_id[:8]}.pt"
         # torch.save(model.state_dict(), model_path)
         # mlflow.pytorch.log_model(model, name="model_post_processing")
 
@@ -383,7 +390,8 @@ def main():
                 _, cs = model.get_regularization_input(u_n, xs, return_c=True)
                 cs = cs.cpu().detach().numpy()
 
-                ellipse_plot_path = output_dir / f"ellipse_polytope_post_{args.run_id[:8]}.png"
+                ellipse_plot_name = Path(f"ellipse_polytope_post_{args.run_id[:8]}.png")
+                ellipse_plot_path = Path(run_output_dir / ellipse_plot_name)
 
                 if model.learn_L and config.training.use_custom_regularization:
                     fig, ax, count_stable, count_unstable = plot_safe_set_trajectories(
@@ -412,7 +420,7 @@ def main():
                     logger.info(f"Ellipse/polytope plot saved to {ellipse_plot_path}")
 
                     # Log to MLflow
-                    mlflow.log_figure(fig, str(ellipse_plot_path.with_suffix(".png")))
+                    mlflow.log_figure(fig, f'post_processing/{str(ellipse_plot_name.with_suffix(".png"))}')
                     plt.close(fig)
                     logger.info("Ellipse/polytope plot logged to MLflow")
                 else:
@@ -433,10 +441,10 @@ def main():
                     ax.grid(True, alpha=0.3)
                     ax.set_xlabel(r"$x_1$", fontsize=12)
                     ax.set_ylabel(r"$x_2$", fontsize=12)
-                    mlflow.log_figure(fig, str(ellipse_plot_path.with_suffix(".png")))
+                    mlflow.log_figure(fig, f'post_processing/{ellipse_plot_name}')
                     tikzplotlib.save(str(ellipse_plot_path.with_suffix(".tex")))
                     mlflow.log_artifact(
-                        str(ellipse_plot_path.with_suffix(".tex")), artifact_path="post_processing"
+                        str(ellipse_plot_name.with_suffix(".tex")), artifact_path="post_processing"
                     )
                     plt.close(fig)
 
@@ -451,10 +459,11 @@ def main():
 
             from sysid.utils import plot_predictions
 
-            pred_plot_path = output_dir / f"prediction_trajectory_post_{args.run_id[:8]}.png"
+            pred_plot_name = Path(f"prediction_trajectory_post_{args.run_id[:8]}.png")
+            pred_plot_path = Path(run_output_dir / pred_plot_name)
 
             fig, axes = plot_predictions(
-                output_dir=output_dir,
+                output_dir=run_output_dir,
                 e_hat=e_hat,
                 e=test_outputs,
                 num_samples=3,
@@ -464,8 +473,8 @@ def main():
                 warmup_steps=warmup_steps,
             )
 
+            mlflow.log_figure(fig, f'post_processing/{str(pred_plot_name.with_suffix(".png"))}')
             try:
-                mlflow.log_figure(fig, str(pred_plot_path.with_suffix(".png")))
                 tikzplotlib.save(str(pred_plot_path.with_suffix(".tex")))
                 mlflow.log_artifact(
                     str(pred_plot_path.with_suffix(".tex")), artifact_path="post_processing"
