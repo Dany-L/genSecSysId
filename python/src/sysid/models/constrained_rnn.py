@@ -638,11 +638,16 @@ class SimpleLure(nn.Module):
         
         if not self._should_skip_initialization('B'):
             # B_init = torch.tensor([
-            #     [0.0],      
+            #     [0.0],
             #     [0.0039662]
             # ])
-            B_init = normalizer.input_std.squeeze()*self.ts * torch.tensor([
-                [0.0],      
+            input_scale = 1.0
+            if normalizer is not None:
+                input_std = getattr(normalizer, 'input_std', None)
+                if input_std is not None:
+                    input_scale = input_std.squeeze()
+            B_init = input_scale * self.ts * torch.tensor([
+                [0.0],
                 [1.0]
             ])
             if 'B' in self.structural_constraints:
