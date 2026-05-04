@@ -1,0 +1,82 @@
+# Dedicated config for tests/test_safety_filter.py
+# Independent of the working config in genSecSysId-Data so that toggling
+# safety_filter / structural_constraints / etc. while developing does not
+# break the test. Mirrors crnn_gen-sec_duffing.yaml at the time the test
+# was written, but always with the safety filter enabled.
+
+data:
+  train_path: "~/genSecSysId-Data/data/Duffing"
+  input_col: ["u"]
+  output_col: ["q"]
+  state_col: ["q", "q_dot"]
+  pattern: "*.csv"
+  normalize: true
+  normalization_method: "scale_only"
+  batch_size: 32
+  train_sequence_length: 700
+  shuffle: true
+  num_workers: 0
+  sequence_stride: 500
+
+model:
+  model_type: "crnn_safe"
+  nw: 20
+  nx: 2
+  activation: "dzn"
+  custom_params:
+    learn_L: true
+    structural_constraints:
+      C:
+        learnable_cols: [0]
+        fixed_value: 0.0
+      B:
+        learnable_rows: [1]
+        fixed_value: 0.0
+      D:
+        fixed: true
+        value: 0.0
+      D12:
+        fixed: true
+        value: 0.0
+      D21:
+        fixed: true
+        value: 0.0
+
+  initialization:
+    method: identity
+
+optimizer:
+  optimizer_type: "adam"
+  learning_rate: 0.001
+  use_scheduler: true
+  scheduler_type: "reduce_on_plateau"
+  scheduler_patience: 100
+  scheduler_factor: 0.25
+
+training:
+  max_epochs: 100
+  gradient_clip_value: 1.0e1
+  loss_type: "mse"
+  use_custom_regularization: true
+  min_regularization_weight: 1.0e-7
+  regularization_weight: 1.0e-2
+  decay_regularization_weight: true
+  regularization_decay_factor: 0.1
+  device: "cpu"
+  log_gradients: true
+  warmup_steps: 500
+  input_regularization_weight: 1.0e-3
+
+mlflow:
+  tracking_uri: null
+  experiment_name: "safety_filter_test"
+  run_name: null
+  log_models: false
+  log_artifacts: false
+
+evaluation:
+  metrics:
+    - rmse
+    - nrmse
+
+root_dir: "~/genSecSysId-Data"

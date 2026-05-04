@@ -89,10 +89,13 @@ class Linear(nn.Module):
 
 
 class LureSystem(Linear):
-    def __init__(
-        self,
-        sys: LureSystemClass,
-    ) -> None:
+    """Lure dynamics x⁺ = Ax + Bd + B₂Δ(C₂x + D₂₁d), without safety filtering.
+
+    Forward always returns ``(e_hat, (x, w), d)`` with the full state and
+    nonlinearity trajectories — no flags, no shape variants.
+    """
+
+    def __init__(self, sys: LureSystemClass) -> None:
         super().__init__(A=sys.A, B=sys.B, C=sys.C, D=sys.D)
         self._nw = sys.B2.shape[1]
         self._nz = sys.C2.shape[0]
@@ -103,110 +106,98 @@ class LureSystem(Linear):
         self.D21 = sys.D21
         self.Delta = sys.Delta  # static nonlinearity
 
+    def input_filter(
+        self,
+        X: torch.Tensor,
+        s: torch.Tensor,
+        alpha: torch.Tensor,
+        x_k: torch.Tensor,
+        d_k: torch.Tensor,
+    ) -> torch.Tensor:
+        # The safety projection is value-only: gradients must not flow through d_max.
+        # Otherwise sqrt(...) produces NaN gradients near/outside the safe-set boundary,
+        # and the model can't recover. The optimizer still gets the right signal because
+        # clamping increases prediction error, which the loss already penalizes.
+        eps = 1e-6
+        with torch.no_grad():
+            X_x_squared = torch.stack([x_k_i.T @ X @ x_k_i for x_k_i in x_k])
+            radicand = torch.clamp(s**2 - alpha**2 * X_x_squared, min=0.0)
+            d_max = torch.sqrt(radicand) - eps
+
+        return torch.clamp(d_k, min=-d_max, max=d_max)
+
+    def _rollout(
+        self,
+        d: torch.Tensor,
+        x0: torch.Tensor,
+        clamp_step=None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Step the Lure dynamics over the full sequence.
+
+        ``clamp_step(k, x_k, d_k) -> d_k`` lets subclasses inject a per-step
+        input filter; the default is identity (no clamping).
+        """
+        n_batch, N, _, _ = d.shape
+        x_k = x0.reshape(n_batch, self._nx, 1)
+
+        e_hat_list = []
+        w_list = []
+        x_list = [x_k]
+        d_list = []
+
+        for k in range(N):
+            d_k = d[:, k, :, :]
+            d_k_safe = clamp_step(k, x_k, d_k) if clamp_step is not None else d_k
+
+            w_k = self.Delta(self.C2 @ x_k + self.D21 @ d_k_safe)
+            e_hat_k = super().output_dynamics(x=x_k, d=d_k_safe) + self.D12 @ w_k
+            x_k_1 = super().state_dynamics(x=x_k, d=d_k_safe) + self.B2 @ w_k
+
+            e_hat_list.append(e_hat_k)
+            w_list.append(w_k)
+            x_list.append(x_k_1)
+            d_list.append(d_k_safe)
+
+            x_k = x_k_1
+
+        e_hat = torch.stack(e_hat_list, dim=1)   # (n_batch, N, ne, 1)
+        x_tensor = torch.stack(x_list, dim=1)     # (n_batch, N+1, nx, 1)
+        w_tensor = torch.stack(w_list, dim=1)     # (n_batch, N, nw, 1)
+        d_tensor = torch.stack(d_list, dim=1)     # (n_batch, N, nd, 1)
+
+        return e_hat, (x_tensor, w_tensor), d_tensor
 
     def forward(
-            self,
-            d: torch.Tensor,
-            x0: Optional[Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]] = None,
-            return_states: bool = False,
-        ) -> Tuple[
-            torch.Tensor,
-            Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]],
-        ]:
-            n_batch, N, _, _ = d.shape
-            
-            # Initialize the current state
-            x_k = x0.reshape(n_batch, self._nx, 1)
+        self,
+        d: torch.Tensor,
+        x0: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        return self._rollout(d, x0, clamp_step=None)
 
-            # Use Python lists to accumulate the sequence
-            e_hat_list = []
 
-            if return_states:
-                w_list = []
-                x_list = [x_k] # Store the initial state k=0
+class LureSystemSafe(LureSystem):
+    """LureSystem with the safety input filter wired in.
 
-                for k in range(N):
-                    d_k = d[:, k, :, :]
-                    
-                    # Compute current step (creates new tensors, no in-place mutation)
-                    w_k = self.Delta(self.C2 @ x_k + self.D21 @ d_k)
-                    e_hat_k = super().output_dynamics(x=x_k, d=d_k) + self.D12 @ w_k
-                    x_k_1 = super().state_dynamics(x=x_k, d=d_k) + self.B2 @ w_k
-                    
-                    # Append to lists
-                    e_hat_list.append(e_hat_k)
-                    w_list.append(w_k)
-                    x_list.append(x_k_1)
-                    
-                    # Update state for the next iteration
-                    x_k = x_k_1
-                    
-                # Stack lists into final tensors along the time dimension (dim=1)
-                e_hat = torch.stack(e_hat_list, dim=1) # Shape: (n_batch, N, ne, 1)
-                x_tensor = torch.stack(x_list, dim=1)  # Shape: (n_batch, N+1, nx, 1)
-                w_tensor = torch.stack(w_list, dim=1)  # Shape: (n_batch, N, nw, 1)
+    Forward requires ``X``, ``s``, ``alpha`` (no runtime ``ValueError`` — the
+    arguments are just non-optional). Returns the same 3-tuple as ``LureSystem``,
+    with ``d`` containing the *filtered* inputs that were actually applied.
+    """
 
-                return (e_hat, (x_tensor, w_tensor))
+    def forward(
+        self,
+        d: torch.Tensor,
+        x0: torch.Tensor,
+        X: torch.Tensor,
+        s: torch.Tensor,
+        alpha: torch.Tensor,
+        warmup_steps: int = 0,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        def clamp_step(k: int, x_k: torch.Tensor, d_k: torch.Tensor) -> torch.Tensor:
+            if k < warmup_steps:
+                return d_k
+            return self.input_filter(X, s, alpha, x_k, d_k)
 
-            else:
-                # When we don't need to return all states, we can just track the current ones
-                for k in range(N):
-                    d_k = d[:, k, :, :]
-                    w_k = self.Delta(self.C2 @ x_k + self.D21 @ d_k)
-                    e_hat_k = super().output_dynamics(x=x_k, d=d_k) + self.D12 @ w_k
-                    
-                    # Overwriting the Python variable 'x_k' is totally fine! 
-                    # It just points to a new tensor in memory, leaving the old one intact for Autograd.
-                    x_k = super().state_dynamics(x=x_k, d=d_k) + self.B2 @ w_k
-                    
-                    e_hat_list.append(e_hat_k)
-
-                e_hat = torch.stack(e_hat_list, dim=1)
-                
-                # Returning the final x and w to match your original logic
-                return (e_hat, (x_k, w_k))
-
-    # def forward(
-    #     self,
-    #     d: torch.Tensor,
-    #     x0: Optional[Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]] = None,
-    #     return_states: bool = False,
-    # ) -> Tuple[
-    #     torch.Tensor,
-    #     Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]],
-    # ]:
-    #     n_batch, N, _, _ = d.shape
-    #     e_hat = torch.zeros(size=(n_batch, N, self._ne, 1))
-
-    #     if return_states:
-
-    #         w = torch.zeros(size=(n_batch, N, self._nw, 1))
-    #         x = torch.zeros(size=(n_batch, N + 1, self._nx, 1))
-    #         x[:, 0, :, :] = x0.reshape(n_batch, self._nx, 1)
-
-    #         for k in range(N):
-    #             w[:, k, :, :] = self.Delta(self.C2 @ x[:, k, :, :] + self.D21 @ d[:, k, :, :])
-    #             e_hat[:, k, :, :] = (
-    #                 super().output_dynamics(x=x[:, k, :, :], d=d[:, k, :, :])
-    #                 + self.D12 @ w[:, k, :, :]
-    #             )
-    #             x[:, k + 1, :, :] = (
-    #                 super().state_dynamics(x=x[:, k, :, :], d=d[:, k, :, :])
-    #                 + self.B2 @ w[:, k, :, :]
-    #             )
-                
-
-    #         return (e_hat, (x, w))
-
-    #     else:
-    #         x = x0.reshape(n_batch, self._nx, 1)
-    #         for k in range(N):
-    #             w = self.Delta(self.C2 @ x + self.D21 @ d[:, k, :, :])
-    #             e_hat[:, k, :, :] = super().output_dynamics(x=x, d=d[:, k, :, :]) + self.D12 @ w
-    #             x = super().state_dynamics(x=x, d=d[:, k, :, :]) + self.B2 @ w
-                
-
-    #         return (e_hat, (x, w))
+        return self._rollout(d, x0, clamp_step=clamp_step)
 
 
 class BaseRNN(nn.Module, ABC):

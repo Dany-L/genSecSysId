@@ -2,7 +2,7 @@
 
 import logging
 import random
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -63,6 +63,69 @@ def torch_bmat(mat: List[List[torch.Tensor]]) -> torch.Tensor:
     for col in mat:
         mat_list.append(torch.hstack(col))
     return torch.vstack(mat_list)
+
+
+def plot_safe_set_trajectories(
+    P: np.ndarray,
+    L: np.ndarray,
+    s: float,
+    x_traj: np.ndarray,
+    c: np.ndarray,
+    warmup_steps: int = 0,
+    horizon: int = 200,
+    ax: Optional[plt.Axes] = None,
+    figsize: Tuple[int, int] = (10, 6),
+    fill_polytope: bool = True,
+) -> Tuple[plt.Figure, plt.Axes, int, int]:
+    """Plot 2D state trajectories color-coded by the safe-set constraint and
+    overlay the safe-set ellipse + input-constraint polytope.
+
+    Trajectories whose constraint vector ``c`` ever exceeds 0 are drawn red
+    (dashed); the rest are drawn green (solid). The starting point (at
+    ``warmup_steps``) is marked ``rx`` / ``go`` accordingly.
+
+    Args:
+        P: Lyapunov matrix ``(nx, nx)``. The ellipse is ``{x : (1/s²) xᵀ P⁻¹ x ≤ 1}``.
+        L: Coupling matrix ``(nz, nx)``. The polytope is ``{x : ‖L P⁻¹ x‖∞ ≤ 1}``.
+        s: Sector bound.
+        x_traj: State trajectories ``(batch, seq_len, nx)``. Only ``nx == 2``
+            is supported (the plot is 2D).
+        c: Constraint values ``(batch, seq_len)`` from
+            ``model.get_regularization_input(..., return_c=True)``. Trajectory
+            ``i`` is unstable iff ``np.any(c[i] > 0)``.
+        warmup_steps: Index where the trajectory window starts.
+        horizon: Number of steps after ``warmup_steps`` to draw.
+        ax: Optional pre-built axis; a new figure is created if ``None``.
+        figsize: Figure size used when creating a new axis.
+        fill_polytope: Forwarded to ``plot_ellipse_and_parallelogram``.
+
+    Returns:
+        ``(fig, ax, count_stable, count_unstable)``.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    M = warmup_steps + horizon
+    count_stable = 0
+    count_unstable = 0
+    for c_i, x_i in zip(c, x_traj):
+        if np.any(c_i > 0):
+            ax.plot(x_i[warmup_steps, 0], x_i[warmup_steps, 1], "rx")
+            ax.plot(x_i[warmup_steps:M, 0], x_i[warmup_steps:M, 1], "--")
+            count_unstable += 1
+        else:
+            ax.plot(x_i[warmup_steps, 0], x_i[warmup_steps, 1], "go")
+            ax.plot(x_i[warmup_steps:M, 0], x_i[warmup_steps:M, 1])
+            count_stable += 1
+
+    X = np.linalg.inv(P)
+    H = L @ X
+    fig, ax = plot_ellipse_and_parallelogram(
+        X, H, s, None, ax=ax, show=False, fill_polytope=fill_polytope,
+    )
+    return fig, ax, count_stable, count_unstable
 
 
 def plot_ellipse_and_parallelogram(
