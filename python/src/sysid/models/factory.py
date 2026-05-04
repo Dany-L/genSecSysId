@@ -76,6 +76,7 @@ def create_model(
             "nx": model_config.nx,
             "activation": model_config.activation,
             "custom_params": custom_params,
+            "ts": data_config.sampling_time,
         }
         if delta is not None:
             crnn_kwargs["delta"] = delta

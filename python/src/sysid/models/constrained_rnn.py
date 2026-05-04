@@ -31,6 +31,7 @@ class SimpleLure(nn.Module):
         custom_params: Optional[dict] = None,
         delta: np.float64 = 0.1,
         max_norm_x0: np.float64 = 1.0,
+        ts: float = 0.1,
     ):
         """
         Initialize the Simple Lure system.
@@ -51,6 +52,7 @@ class SimpleLure(nn.Module):
         self.nw = nw
         self.nz = nz
         self.pad_state = pad_state
+        self.ts = ts
 
         # Register delta and max_norm_x0 as buffers (saved with model, not trainable)
         self.register_buffer("delta", torch.tensor(delta))
@@ -526,9 +528,6 @@ class SimpleLure(nn.Module):
         
         logger.info("=" * 80)
 
-    # def reset_s(self):
-    #     self.s.data = torch.sqrt(self.delta**2 / (1 - self.alpha**2)).squeeze()
-
     def initialize_parameters(
         self,
         train_inputs,
@@ -572,8 +571,9 @@ class SimpleLure(nn.Module):
         if normalizer is not None:
             train_inputs = normalizer.transform_inputs(train_inputs)
         u_squared_norm = np.sum(train_inputs**2, axis=2)
-        max_input = np.max(u_squared_norm)
-        self.s.data = torch.tensor(np.sqrt(max_input))
+        max_input_n = np.max(u_squared_norm)
+        # self.s.data = torch.tensor(np.sqrt(normalizer.inverse_transform_inputs(max_input_n))).squeeze()
+        # self.s.data = torch.tensor(4.0)
 
         if init_method == "n4sid":
             success = self._init_n4sid(train_inputs, train_states, train_outputs, data_dir)
@@ -581,7 +581,7 @@ class SimpleLure(nn.Module):
                 logger.warning("N4SID initialization failed or file not found. Falling back to ESN.")
                 self._init_esn(train_inputs, train_states, train_outputs, n_restarts)
         elif init_method == "identity":
-            self._init_identity(train_inputs, train_states, train_outputs)
+            self._init_identity(normalizer)
         elif init_method == "esn":
             self._init_esn(train_inputs, train_states, train_outputs, n_restarts)
         else:
@@ -592,10 +592,14 @@ class SimpleLure(nn.Module):
         logger.info(f"Initialization complete. Constraints satisfied: {constraints_ok}")
         logger.info("=" * 80)
         if not constraints_ok:
-            self.analysis_problem_init(learn_B=False, learn_D21=False)
+            b_feasible = self.analysis_problem_init(learn_B=False, learn_D21=True)
+            if not b_feasible:
+                raise ValueError("Initialization did not satisfy constraints and problem is infeasible. Please check your initialization method and structural constraints.")
+            # self.analysis_problem_init(learn_B=True, learn_D21=True)
+
         
 
-    def _init_identity(self, train_inputs, train_states, train_outputs):
+    def _init_identity(self, normalizer: Optional[DataNormalizer] = None):
         """
         Identity initialization: predefined simple linear system.
 
@@ -614,25 +618,32 @@ class SimpleLure(nn.Module):
         logger.info("Identity initialization: α=0.99, A=0.9I, random C2, identity-like C")
 
         # self.alpha.data = torch.tensor(0.9999)
-
-        input_std = train_inputs.std(axis=(0, 1), keepdims=True)
-        output_std = train_outputs.std(axis=(0, 1), keepdims=True)
         
         # A matrix - only update if not fully fixed
         if not self._should_skip_initialization('A'):
-            A_init = torch.tensor([
-                [ 1.   ,  0.05 ],
-                [-0.05 ,  0.985]
-            ])
+            A_ct = torch.tensor([[0,1.0], [0.0,0.0]])
+            A_ct[1,:] = -torch.rand((1, self.nx))
+            A_dt = torch.eye(self.nx) + A_ct * self.ts # euler discretizatioin
+            A_init = A_dt
+            # torch.nn.init.normal_(A_init, std=1)
+            # A_init = torch.tensor([
+            #     [ 1.   ,  0.05 ],
+            #     [-0.05 ,  0.985]
+            # ])
+            logger.info(f'Absolute eigenvalues of A_init: {torch.linalg.eigvals(A_init).abs()}')
             if 'A' in self.structural_constraints:
                 self._apply_partial_initialization('A', A_init)
             else:
                 self.A.data = A_init
         
         if not self._should_skip_initialization('B'):
-            B_init = torch.tensor([
+            # B_init = torch.tensor([
+            #     [0.0],      
+            #     [0.0039662]
+            # ])
+            B_init = normalizer.input_std.squeeze()*self.ts * torch.tensor([
                 [0.0],      
-                [0.0039662]
+                [1.0]
             ])
             if 'B' in self.structural_constraints:
                 self._apply_partial_initialization('B', B_init)
@@ -640,7 +651,9 @@ class SimpleLure(nn.Module):
                 self.B.data = B_init
         
         if not self._should_skip_initialization('B2'):
-            torch.nn.init.normal_(self.B2, std=0.1)
+            # B2_init = torch.zeros(self.nx, self.nw)
+            B2_init = self.ts * torch.randn((self.nx, self.nw))
+            self.B2.data = B2_init
             # self.B2.data = torch.zeros(self.nx, self.nw)
             # self.B2.data = torch.randn(self.nx, self.nw) *0.1
             # self.B2.data = torch.tensor([
@@ -654,8 +667,7 @@ class SimpleLure(nn.Module):
         
         # C2 matrix - random initialization
         if not self._should_skip_initialization('C2'):
-            C2_init = torch.zeros(self.nz, self.nx)
-            torch.nn.init.normal_(C2_init, std=1)
+            C2_init = torch.randn(self.nz, self.nx)
             # C2_init = torch.tensor(np.random.uniform(-1, 1, size=(self.nz, self.nx)))
             # C2_init = torch.randn(self.nz, self.nx)*0.9
             # C2_init = torch.tensor([
@@ -687,8 +699,11 @@ class SimpleLure(nn.Module):
                 self.C2.data = C2_init
 
         if not self._should_skip_initialization('C'):
-            C_init_tensor = torch.tensor([
-                [6.58489445, 0.0        ]
+            # C_init_tensor = torch.tensor([
+            #     [6.58489445, 0.0        ]
+            # ])
+            C_init_tensor = 1/normalizer.output_std.squeeze()*torch.tensor([
+                [1.0, 0.0        ]
             ])
             if 'C' in self.structural_constraints:
                 self._apply_partial_initialization('C', C_init_tensor)
@@ -705,7 +720,7 @@ class SimpleLure(nn.Module):
 
         # Random D21 for measurement noise
         if not self._should_skip_initialization('D21'):
-            D21_init = torch.tensor(np.random.randn(self.nz, self.nd) * 0.01)
+            D21_init = torch.randn(self.nz, self.nd)
             if 'D21' in self.structural_constraints:
                 self._apply_partial_initialization('D21', D21_init)
             else:
@@ -1125,8 +1140,6 @@ class SimpleLure(nn.Module):
         la = cp.Variable((self.nz, 1))
         M = cp.diag(la)
         A = self.A.cpu().detach().numpy()
-        # s_hat = cp.Variable((1,1))
-        # B = self.B.cpu().detach().numpy()
         if learn_B:
             B = cp.Variable(self.B.shape)
         else:
@@ -1138,15 +1151,8 @@ class SimpleLure(nn.Module):
         B2 = self.B2.cpu().detach().numpy()
         C2 = self.C2.cpu().detach().numpy()
         alpha = 1/(1+ np.exp(-self.tau.cpu().detach().numpy()))
-        # alpha = self.alpha.cpu().detach().numpy()
-        # delta = self.delta.cpu().detach().numpy()  # Currently unused
-        s = self.s.cpu().detach().numpy()
-
-        # if delta**2 - (1-alpha**2)*s**2 > 0:
-        #     s = np.sqrt(delta**2/(1-alpha**2)).squeeze()
-
-        # D21 = self.D21.cpu().detach().numpy()
-        # s_tilde = cp.Variable((1,1))
+        # s = self.s.cpu().detach().numpy()
+        s_hat = cp.Variable((1,1))
 
         multiplier_constraints = []
         if self.learn_L:
@@ -1160,9 +1166,15 @@ class SimpleLure(nn.Module):
             else:
                 li = li.reshape((1, -1))
             multiplier_constraints.append(
+                # cp.bmat(
+                #     [
+                #         [np.array([[1 / s**2]]), li],
+                #         [li.T, P],
+                #     ]
+                # )
                 cp.bmat(
                     [
-                        [np.array([[1 / s**2]]), li],
+                        [s_hat, li],
                         [li.T, P],
                     ]
                 )
@@ -1178,8 +1190,6 @@ class SimpleLure(nn.Module):
             ]
         )
 
-        init_constraints = [-P + self.max_norm_x0**2 / s**2 * np.eye(self.nx) << 0]
-
         t = cp.Variable((1,1))
 
         size_constraints = [
@@ -1189,9 +1199,9 @@ class SimpleLure(nn.Module):
 
         nF = F.shape[0]
         problem = cp.Problem(
-            cp.Minimize(None),
+            # cp.Minimize(None),
             # cp.Minimize(t),
-            # cp.Minimize(s_tilde),
+            cp.Minimize(s_hat),
             [
                 F << -EPS * np.eye(nF), 
                 *multiplier_constraints, 
@@ -1200,13 +1210,16 @@ class SimpleLure(nn.Module):
             ],
         )
         try:
-            problem.solve(solver=cp.MOSEK, verbose=False, accept_unknown=True)
+            problem.solve(solver=cp.MOSEK, verbose=False)
         except Exception:
             return False  # SDP failed due to solver error
-        if not problem.status == "optimal" and not problem.status == "optimal_inaccurate":
+        if not problem.status == "optimal":
             return False  # SDP failed to find feasible solution    
         logger.info(f"SDP analysis problem solved: {problem.status}")
 
+        s = 1/torch.sqrt(torch.tensor(s_hat.value).squeeze())
+        logger.info(f"  Initial s from SDP: {s.item():.6f}")
+        self.s.data = s
         self.P.data = torch.tensor(P.value)
         self.la.data = torch.tensor(np.diag(M.value))
         # self.M.data = torch.tensor(M.value)
@@ -1217,9 +1230,6 @@ class SimpleLure(nn.Module):
         if learn_D21:
             self.D21.data = torch.tensor(D21.value)
 
-        # self.s.data = torch.tensor(s)
-        # self.s.data = torch.tensor(np.sqrt(1 / s_tilde.value).squeeze())
-        # self.delta = torch.tensor(np.sqrt((1 - alpha**2) * s**2).squeeze())
 
         return True  # SDP successfully found feasible solution
 
@@ -1481,10 +1491,6 @@ class SimpleLure(nn.Module):
         # Constraints
         constraints = []
 
-        # Multiplier constraints: m(i) >= eps for all i
-        # for i in range(self.nz):
-        #     constraints.append(m[i, 0] >= eps)
-
         # Main LMI: F <= -eps*I
         F = cp.bmat(
             [
@@ -1498,13 +1504,12 @@ class SimpleLure(nn.Module):
         constraints.append(F << -EPS * np.eye(nF))
 
         # Locality constraints: [S_hat, li; li', P] >= EPS*I for each row of L
+        Gs = []
         for i in range(self.nz):
             li = L[i, :].reshape((1, -1), order="C")
             locality_lmi = cp.bmat([[S_hat, li], [li.T, P]])
+            Gs.append(locality_lmi)
             constraints.append(locality_lmi >> EPS * np.eye(self.nx + 1))
-
-        # P positive definite
-        # constraints.append(P >> EPS * np.eye(self.nx))
 
         # Objective
         objective = cp.Minimize(S_hat)
@@ -1527,114 +1532,82 @@ class SimpleLure(nn.Module):
         logger.info(f"✓ SDP state set solved successfully: {problem.status}")
 
         S_hat_opt = S_hat.value[0, 0] if hasattr(S_hat.value, "__len__") else S_hat.value
-        s = np.sqrt(1.0 / S_hat_opt)
+        s_star = np.sqrt(1.0 / S_hat_opt)
+
+        # Verify solution
+        max_eig_F = np.max(np.real(np.linalg.eigvals(F.value)))
+        logger.info(f"Max eigenvalue of F: {max_eig_F:.6e}")
+
+        for Gi in Gs:
+            min_eig_Gi = np.min(np.real(np.linalg.eigvals(Gi.value)))
+            if min_eig_Gi < 0:
+                logger.warning(f"Locality LMI violated: min eigenvalue = {min_eig_Gi:.6e}")
+            else:
+                logger.info(f"Locality LMI satisfied: min eigenvalue = {min_eig_Gi:.6e}")
 
         # update model parameters
         self.P.data = torch.tensor(P.value)
         self.L.data = torch.tensor(L.value)
         self.la.data = torch.tensor(np.diag(M.value))
         # self.M = torch.diag(self.la)
-        self.s.data = torch.tensor(s)
+        self.s.data = torch.tensor(s_star)
 
 
         # calculate output bound
-        # C = self.C.cpu().detach().numpy()
-        # P = cp.Variable((self.nx, self.nx), symmetric=True)
-        # L = cp.Variable((self.nz, self.nx))
-        # m = cp.Variable((self.nz, 1))
-        # M = cp.diag(m)    
+        C = self.C.cpu().detach().numpy()
+        P_star = P.value
+        X_star = np.linalg.inv(P_star)
+        L_star = L.value
 
-        # Y_tilde = cp.Variable((self.ne,self.ne))
+        # Y_tilde = cp.Variable((self.ne,self.ne), symmetric=True)
+        Y = cp.Variable((self.ne, self.ne), symmetric=True)
 
-        # constraints = []
-
-        # F = cp.bmat(
-        #     [
-        #         [-(alpha**2) * P, np.zeros((self.nx, self.nd)), P @ C2.T + L.T, P @ A.T],
-        #         [np.zeros((self.nd, self.nx)), -np.eye(self.nd), D21.T, B.T],
-        #         [C2 @ P + L, D21, -2 * M, M @ B2.T],
-        #         [A @ P, B, B2 @ M, -P],
-        #     ]
-        # )
-        # nF = F.shape[0]
-        # constraints.append(F << -EPS * np.eye(nF))
-
-        # Gs = []
-        # for i in range(self.nz):
-        #     li = L[i, :].reshape((1, -1), order="C")
-        #     Gi = cp.bmat([[np.array([[1/s**2]]), li], [li.T, P]])
-        #     Gs.append(Gi)
-        #     constraints.append(Gi >> EPS * np.eye(self.nx + 1))
-
-        # E = cp.bmat([
-        #     [P/s**2, (C @ P).T], 
-        #     [C @ P, Y_tilde]
-        # ])
+        constraints = [
+            Y >> EPS * np.eye(self.ne),
+            X_star / s_star**2 - C.T @ Y @ C >> EPS * np.eye(self.nx),
+        ]
         # constraints.append(E >> EPS * np.eye(self.nx + self.ne))
-        # # constraints.append(cp.bmat([
-        # #     [Y_tilde, C @ P, D],
-        # #     [(C@P).T, P/s**2, np.zeros((nx,nd))],
-        # #     [D.T, np.zeros((nd,nx)), 1/(s**2*(1-alpha**2))]
-        # # ]) >> EPS * np.eye(nx+ne+nd))
+        # constraints.append(cp.bmat([
+        #     [Y_tilde, C @ P, D],
+        #     [(C@P).T, P/s**2, np.zeros((nx,nd))],
+        #     [D.T, np.zeros((nd,nx)), 1/(s**2*(1-alpha**2))]
+        # ]) >> EPS * np.eye(nx+ne+nd))
 
-        # objective = cp.Minimize(cp.norm(Y_tilde))
-        # problem = cp.Problem(objective, constraints)
-        # logger.info(f"Solving output SDP with {len(constraints)} constraints using MOSEK...")
+        objective = cp.Maximize(cp.lambda_min(Y))
+        problem = cp.Problem(objective, constraints)
+        logger.info(f"Solving output SDP with {len(constraints)} constraints using MOSEK...")
 
-        # try:
-        #     problem.solve(solver=cp.MOSEK, verbose=False, accept_unknown=True)
-        # except Exception as e:
-        #     logger.error(f"SDP solver failed: {e}")
-        #     return {"success": False, "error": str(e)}
+        try:
+            problem.solve(solver=cp.MOSEK, verbose=False, accept_unknown=True)
+        except Exception as e:
+            logger.error(f"SDP solver failed: {e}")
+            # return {"success": False, "error": str(e)}
 
-        # # Check solution status
-        # if problem.status not in ["optimal", "optimal_inaccurate"]:
-        #     logger.error(f"SDP failed with status: {problem.status}")
-        #     return {"success": False, "status": problem.status}
+        # Check solution status
+        if problem.status not in ["optimal", "optimal_inaccurate"]:
+            logger.error(f"SDP failed with status: {problem.status}")
+            y_bar_n = -1
+            # return {"success": False, "status": problem.status}
+        else:
+            # Y = np.linalg.inv(Y_tilde.value)
+            Y_star = Y.value
+            if self.ne == 1:
+                y_bar_n = np.sqrt(1/Y_star[0,0])
+            else:
+                y_bar_n = -1 # needs to be handled differently
+            logger.info(f'Normalized output range {y_bar_n}')
 
-        # logger.info(f"✓ output SDP solved successfully: {problem.status}")
+        logger.info(f"✓ output SDP solved successfully: {problem.status}")
 
-        # Y = 1/Y_tilde.value
-        # if self.ne == 1:
-        #     output_range = np.sqrt(1/Y[0,0])
-        # else:
-        #     output_range = -1 # needs to be handled differently
-        # logger.info(f'Normalized output range {output_range}')
+        # for ne=1 we can directly calculate y_bar
+        if self.ne == 1:
+            y_bar_n_exact = float(s_star * np.sqrt((C @ P_star @ C.T).item()))
+            logger.info(f'Exact normalized output range {y_bar_n_exact}')
 
-        # # Extract solution
-        # P_opt = P.value
-        P_opt = np.zeros_like(P_original)
-        # L_opt = L.value
-        L_opt = np.zeros_like(L_original) if L_original is not None else None
-        # m_opt = m.value
-        m_opt = np.zeros_like(m) if m is not None else None
-        # M_opt = np.diag(m_opt.flatten())
-        M_opt = np.zeros_like(M) if M is not None else None
-
-        # # norm H
-        # H = L_opt @ np.linalg.inv(P_opt)
-        # norm_H = np.linalg.norm(H, ord=2)
-        # logger.info(f"Norm of H = {norm_H:.6f}")
-
-        # Verify solution
-        # max_eig_F = np.max(np.real(np.linalg.eigvals(F.value)))
-        # logger.info(f"Max eigenvalue of F: {max_eig_F:.6e}")
-
-        # for Gi in Gs:
-        #     min_eig_Gi = np.min(np.real(np.linalg.eigvals(Gi.value)))
-        #     if min_eig_Gi < 0:
-        #         logger.warning(f"Locality LMI violated: min eigenvalue = {min_eig_Gi:.6e}")
-        #     else:
-        #         logger.info(f"Locality LMI satisfied: min eigenvalue = {min_eig_Gi:.6e}")
-        # min_eig_E = np.min(np.real(np.linalg.eigvals(E.value)))
-        # logger.info(f"Min eigenvalue of E: {min_eig_E:.6e}")
-
-        # Update model parameters
-        # self.P.data = torch.tensor(P_opt)
-        # self.L.data = torch.tensor(L_opt)
-        # self.la.data = torch.tensor(np.diag(M_opt))
-        # # self.M = torch.diag(self.la)
-        # self.s.data = torch.tensor(s)
+        # norm H
+        H = L_star @ np.linalg.inv(P_star)
+        norm_H = np.linalg.norm(H, ord=2)
+        logger.info(f"Norm of H = {norm_H:.6f}")
 
         # Verify constraints
         constraints_satisfied = self.check_constraints()
@@ -1649,14 +1622,14 @@ class SimpleLure(nn.Module):
                 "norm_H": float(np.linalg.norm(H_original, ord="fro")) if H_original is not None else 0.0,
             },
             "optimized": {
-                "s": float(s),
-                "max_eig_P": float(np.max(np.linalg.eigvals(P_opt))),
-                "min_eig_P": float(np.min(np.linalg.eigvals(P_opt))),
-                "norm_P": float(np.linalg.norm(P_opt, ord="fro")),
-                # "max_eig_F": float(max_eig_F),
-                # "norm_H": float(norm_H),
-                "norm_L": float(np.linalg.norm(L_opt, ord="fro")),
-                # "output_range": float(output_range)
+                "s": float(s_star),
+                "max_eig_P": float(np.max(np.linalg.eigvals(P_star))),
+                "min_eig_P": float(np.min(np.linalg.eigvals(P_star))),
+                "norm_P": float(np.linalg.norm(P_star, ord="fro")),
+                "max_eig_F": float(max_eig_F),
+                "norm_H": float(norm_H),
+                "norm_L": float(np.linalg.norm(L_star, ord="fro")),
+                "y_bar_n": float(y_bar_n)
             },
         }
 
@@ -1670,12 +1643,10 @@ class SimpleLure(nn.Module):
 
         return {
             "success": True,
-            "P_opt": P_opt,
-            "L_opt": L_opt,
-            "m_opt": m_opt,
-            "s_opt": s,
-            "S_hat_opt": S_hat_opt,
-            # "max_eig_F": max_eig_F,
+            "P_opt": P_star,
+            "L_opt": L_star,
+            "s_opt": s_star,
+            "max_eig_F": max_eig_F,
             "constraints_satisfied": constraints_satisfied,
             "summary": summary,
         }
