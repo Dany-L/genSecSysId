@@ -297,3 +297,4 @@ docs/_templates/
 .vscode/
 mlruns_backup
 .claude
+CLAUDE.md
