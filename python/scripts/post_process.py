@@ -284,12 +284,12 @@ def regional_verification(
         for amp in in_amps
     ]  # list of (n_traj, horizon)
 
-    st_x0 = _sample_on_ellipsoid(rng, X, radius=2.5 * s / max(alpha, 1e-12), n=n_traj)
+    st_x0 = _sample_on_ellipsoid(rng, X, radius=1.5 * s / max(alpha, 1e-12), n=n_traj)
     st_u = np.stack(
         [_make_lp_noise(rng, horizon, amp_max=0.01 * s, Ts=Ts) for _ in range(n_traj)]
     )
 
-    DIVERGE_THRESHOLD = 2
+    DIVERGE_THRESHOLD = 10
 
     def _run(model, u_n, x0):
         """Simulate model on (u_n, x0) and return (xs, c, diverged_flag) per traj."""
@@ -328,7 +328,7 @@ def regional_verification(
             u_phys = normalizer.inverse_transform_inputs(u_n[..., None]).squeeze(-1)
             xs_list, div_list = [], []
             for x0_p, u_p in zip(in_x0, u_phys):
-                X_true, _, div = spec.simulate(x0_p, u_p)
+                X_true, _, div = spec.simulate(x0_p, u_p, diverge_thresh=DIVERGE_THRESHOLD)
                 xs_list.append(X_true)
                 div_list.append(div)
             in_true.append((np.array(div_list), xs_list))
@@ -336,7 +336,7 @@ def regional_verification(
         u_phys_st = normalizer.inverse_transform_inputs(st_u[..., None]).squeeze(-1)
         xs_list, div_list = [], []
         for x0_p, u_p in zip(st_x0, u_phys_st):
-            X_true, _, div = spec.simulate(x0_p, u_p)
+            X_true, _, div = spec.simulate(x0_p, u_p, diverge_thresh=DIVERGE_THRESHOLD)
             xs_list.append(X_true)
             div_list.append(div)
         st_true = (np.array(div_list), xs_list)
@@ -426,8 +426,8 @@ def regional_verification(
         ax_in.legend(loc="upper right", fontsize=8)
     factor_summary = ",".join(f"{f:g}" for f in factors)
     ax_in.set_title(f"Regional verification – input violation (factors {factor_summary})")
-    ax_in.set_xlim(-1.5, 1.5)
-    ax_in.set_ylim(-1.5, 1.5)
+    ax_in.set_xlim(-2.5, 2.5)
+    ax_in.set_ylim(-2.5, 2.5)
     in_plot = run_output_dir / f"rv_input_{run_id[:8]}.png"
     fig_in.savefig(in_plot, dpi=150, bbox_inches="tight")
     mlflow.log_figure(fig_in, f"regional_verification/{in_plot.name}")
