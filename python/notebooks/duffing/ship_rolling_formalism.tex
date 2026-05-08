@@ -1,0 +1,325 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{inputenc}
+\geometry{margin=1in}
+
+\newcommand{\R}{\mathbb{R}}
+
+\title{Softening Duffing oscillator as a regionally stable ship-rolling
+       model: dynamics, energy balance, and (regional) passivity}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent
+This note collects the equations and the energy / passivity argument
+behind the ship-rolling demo in
+\texttt{python/notebooks/duffing/ship\_rolling\_simulation.py}.
+Everything is stated rigorously enough to verify by hand. The dynamics
+are taken verbatim from
+\texttt{python/src/sysid/evaluation/true\_dynamics.py}, line~30:
+\[
+\ddot q \;=\; -\delta\,\dot q \;-\; q \;+\; q^3 \;+\; u,
+\qquad \delta=0{.}3.
+\]
+
+\section{State-space form}
+
+Let $x = (q, \dot q)^\top \in \R^2$. With input $u\in\R$ and damping
+$\delta > 0$, the dimensionless softening Duffing oscillator reads
+\begin{equation}
+\dot x
+  \;=\; f(x, u)
+  \;=\;
+  \begin{pmatrix} \dot q \\[2pt]
+                  -\delta\,\dot q \;-\; q \;+\; q^3 \;+\; u
+  \end{pmatrix}.
+\label{eq:state}
+\end{equation}
+The cubic enters with a {\bfseries plus} sign --- this is the
+{\itshape softening} Duffing, not the hardening one. The conservative
+restoring force is therefore
+\begin{equation}
+F_{\mathrm{cons}}(q) \;=\; -q + q^3,
+\label{eq:Fcons}
+\end{equation}
+which {\itshape weakens} as $|q|$ grows past $1$, vanishes at
+$q=\pm 1$, and {\itshape reverses sign} for $|q|>1$.
+
+\section{Mapping to ship rolling}
+
+Let $\varphi$ denote the roll angle and $\varphi_v$ the
+\emph{angle of vanishing stability} (the heel angle past which the GZ
+righting arm changes sign --- physically, the capsize boundary). With
+the dimensionless rescaling
+\begin{equation}
+q \;=\; \varphi / \varphi_v,
+\qquad
+\dot q \;=\; \dot\varphi / \varphi_v,
+\label{eq:rescale}
+\end{equation}
+\eqref{eq:state} corresponds, after multiplying through by $\varphi_v$,
+to the ship-roll model
+\begin{equation}
+\ddot\varphi
+  \;=\; -\delta\,\dot\varphi
+        \;-\; \omega_0^2\,\varphi
+        \;+\; k_3\,\varphi^3
+        \;+\; \tilde u,
+\label{eq:phi-eqn}
+\end{equation}
+where $\omega_0^2$ and $k_3>0$ are obtained from the cubic
+Taylor truncation of the GZ righting arm
+\(
+GZ(\varphi) \approx C_1\,\varphi + C_3\,\varphi^3,
+\)
+with $C_1>0$, $C_3<0$ (softening). The dimensionless
+form~\eqref{eq:state} is~\eqref{eq:phi-eqn} with $\omega_0=1$, $k_3=1$,
+and $\varphi_v$ absorbed into the state. The hilltops of the
+dimensionless potential at $q=\pm 1$ correspond to
+$\varphi = \pm \varphi_v$.
+
+\section{Potential and Hamiltonian}
+
+The conservative force~\eqref{eq:Fcons} is the negative gradient of
+\begin{equation}
+V(q) \;=\; \tfrac{1}{2}\,q^2 \;-\; \tfrac{1}{4}\,q^4,
+\qquad
+V'(q) \;=\; q - q^3 \;=\; -F_{\mathrm{cons}}(q).
+\label{eq:V}
+\end{equation}
+Properties of $V$:
+\begin{itemize}
+\item Local minimum at $q=0$ with $V(0) = 0$ (upright equilibrium).
+\item Local maxima (\emph{hilltops}) at $q=\pm 1$ with
+      \(V(\pm 1) = \tfrac{1}{2} - \tfrac{1}{4} = \tfrac{1}{4}\).
+\item Unbounded below: $V(q) \to -\infty$ as $|q|\to\infty$.
+\end{itemize}
+The total mechanical energy (which is the Hamiltonian when
+$u = \delta = 0$) is
+\begin{equation}
+H(q,\dot q)
+  \;=\; \underbrace{\tfrac{1}{2}\,\dot q^2}_{\text{kinetic}}
+        \;+\; \underbrace{\tfrac{1}{2}\,q^2 - \tfrac{1}{4}\,q^4}_{V(q)}.
+\label{eq:H}
+\end{equation}
+
+\paragraph{Code/text sign convention.} The function
+\texttt{duffing\_V\_energy} in
+\texttt{python/src/sysid/evaluation/true\_dynamics.py} returns
+$V_{\mathrm{code}} := -H$ (sign-flipped) so that the rule
+{\it``inside basin''} reads as \(V_{\mathrm{code}} > V_{\mathrm{saddle,code}} = -1/4\).
+In the convention~\eqref{eq:H} the equivalent rule is $H < 1/4$.
+
+\section{Equilibria and the saddle-node bifurcation in $u$}
+
+For constant input $u$, equilibria of~\eqref{eq:state} satisfy
+$\dot q = 0$ and
+\begin{equation}
+P_u(q) \;:=\; q^3 - q + u \;=\; 0.
+\label{eq:cubic}
+\end{equation}
+The discriminant of~\eqref{eq:cubic} is $\Delta = 4 - 27\,u^2$. Hence:
+\begin{itemize}
+\item $|u| < u_c$: three real roots; one stable equilibrium near
+      $q=0$ and two saddles.
+\item $|u| = u_c$: a stable equilibrium and a saddle merge
+      (saddle-node).
+\item $|u| > u_c$: only one real root, an unstable equilibrium far
+      from $q=0$. {\bfseries No stable equilibrium exists.}
+\end{itemize}
+The critical input is
+\begin{equation}
+u_c \;=\; \frac{2}{3\sqrt{3}} \;\approx\; 0.3849.
+\label{eq:uc}
+\end{equation}
+For $u=0$, the three equilibria are $q\in\{-1,0,+1\}$. Linearising
+$f(\cdot, 0)$ at $(0,0)$ gives Jacobian
+\(
+A_0 = \bigl(\begin{smallmatrix} 0 & 1 \\ -1 & -\delta \end{smallmatrix}\bigr)
+\),
+characteristic equation $\lambda^2 + \delta\lambda + 1 = 0$, eigenvalues
+with negative real part for any $\delta > 0$ ⇒ asymptotically stable.
+Linearising at $(\pm 1, 0)$ gives Jacobian
+\(
+A_{\pm} = \bigl(\begin{smallmatrix} 0 & 1 \\ 2 & -\delta \end{smallmatrix}\bigr)
+\),
+characteristic equation $\lambda^2 + \delta\lambda - 2 = 0$,
+eigenvalues $\lambda_{1,2} = (-\delta \pm \sqrt{\delta^2 + 8})/2$:
+one positive, one negative ⇒ saddle.
+
+\section{Energy balance}
+
+Multiply~\eqref{eq:state}'s second component by $\dot q$:
+\begin{align}
+\dot q\,\ddot q + \delta\,\dot q^2 + (q - q^3)\,\dot q
+   &= u\,\dot q.
+\notag\\
+\frac{d}{dt}\!\left[\tfrac{1}{2}\dot q^2
+       + \tfrac{1}{2}q^2 - \tfrac{1}{4}q^4\right]
+   &= -\delta\,\dot q^2 \;+\; u\,\dot q.
+\end{align}
+That is,
+\begin{equation}
+\boxed{\;\;
+\dot H \;=\; -\delta\,\dot q^2 \;+\; u\,\dot q
+\;\;}
+\label{eq:dHdt}
+\end{equation}
+along trajectories of~\eqref{eq:state}. Equation~\eqref{eq:dHdt}
+is the central energy identity:
+\begin{itemize}
+\item $-\delta\,\dot q^2 \le 0$: damping continuously dissipates
+      energy.
+\item $u\,\dot q$: power injected by the input through the velocity
+      port; sign depends on $\mathrm{sign}(u\,\dot q)$.
+\end{itemize}
+
+\section{Passivity --- but only \emph{regionally}}
+
+Choose $u$ as the input and the collocated output
+\(
+y \;:=\; \dot q.
+\)
+Substituting in~\eqref{eq:dHdt},
+\begin{equation}
+\dot H
+  \;=\; -\delta\,y^2 \;+\; u\,y
+  \;\le\; u\,y.
+\label{eq:passivity-ineq}
+\end{equation}
+This is the passivity differential inequality
+$\dot S \le u^\top y$ with candidate storage $S = H$.
+\textbf{However}, $H$ is {\bfseries not} bounded below on $\R^2$:
+indeed $V(q) \to -\infty$ as $|q|\to\infty$. A valid storage function
+for input--output passivity must be bounded below (and is conventionally
+nonnegative with $S(0)=0$). We therefore have:
+
+\paragraph{Regional passivity.}
+On the open sublevel set
+\begin{equation}
+\Omega
+  \;:=\;
+  \bigl\{ (q,\dot q)\in\R^2 :\, H(q,\dot q) < \tfrac{1}{4} \bigr\}
+  \;\cap\;
+  \bigl\{|q| < 1\bigr\},
+\label{eq:Omega}
+\end{equation}
+the function $H$ is nonnegative, $H(0,0)=0$, and
+$\dot H \le u\,y$ holds. So~\eqref{eq:state} is
+\emph{passive on $\Omega$} with storage $H$ and supply rate
+$w(u,y)=u\,y$. The set $\Omega$ is the (open) basin of attraction of
+the upright equilibrium under $u\equiv 0$, capped at the saddle level
+$H = V(\pm 1) = 1/4$.
+
+\paragraph{Failure of global passivity.}
+As soon as the trajectory leaves $\Omega$ --- i.e.\ crosses the
+hilltop ---
+$H$ ceases to be sign-definite. The {\itshape inequality}
+$\dot H \le u\,y$ still holds (it is an algebraic identity), but $H$
+becomes arbitrarily negative because $V$ does, so $H$ no longer
+certifies boundedness or stability. The Duffing system in this form is
+{\bfseries not globally passive} with respect to the supply rate
+$u\,\dot q$ and storage $H$.
+
+\section{``Where does the unbounded kinetic energy come from?''}
+
+Suppose $u\equiv 0$ and the trajectory has just barely crossed a
+hilltop, with finite $H_0 := H(q_0, \dot q_0)$ at $t=0$,
+$|q_0| > 1$. By~\eqref{eq:dHdt} the total mechanical energy is
+non-increasing along the trajectory:
+\begin{equation}
+H(t) \;\le\; H_0 \quad\text{for all } t \ge 0.
+\label{eq:Hbound}
+\end{equation}
+Substituting~\eqref{eq:H} and rearranging,
+\begin{equation}
+\tfrac{1}{2}\,\dot q(t)^2
+  \;\le\;
+  H_0 \;-\; \tfrac{1}{2}\,q(t)^2 \;+\; \tfrac{1}{4}\,q(t)^4,
+\end{equation}
+so that, asymptotically as $|q|\to\infty$,
+\begin{equation}
+\dot q^2 \;\sim\; \tfrac{1}{2}\,q^4,
+\qquad
+\text{i.e.}\qquad
+\underbrace{\tfrac{1}{2}\dot q^2}_{\text{KE}}
+  \;\sim\; \tfrac{q^4}{4}
+  \;\to\; +\infty,
+\quad
+\underbrace{V(q)}_{\text{PE}}
+  \;\sim\; -\tfrac{q^4}{4}
+  \;\to\; -\infty.
+\label{eq:asymp}
+\end{equation}
+The kinetic energy grows without bound, the potential energy drops
+without bound, and they cancel to keep the {\itshape sum} $H$
+bounded above by $H_0$ (in fact slowly decreasing because of damping).
+
+\paragraph{The model does not create or destroy energy.}
+What happens past the hilltop is exactly what happens to a marble
+rolling off the side of a hill into a bottomless pit: kinetic energy
+gained equals potential energy lost, instant by instant, with damping
+removing a small amount as heat. The {\itshape source} of the
+``infinite kinetic energy'' is the polynomial potential, which is
+unbounded below {\bfseries by construction} --- it is a low-order
+Taylor expansion of a real, finite restoring law (e.g.\ a GZ curve)
+that has been extrapolated outside its domain of validity.
+
+\paragraph{Physical interpretation in the ship-rolling picture.}
+For a real ship the GZ curve flattens out and eventually changes sign
+again past the angle of vanishing stability (the hull has a second,
+fully inverted, equilibrium --- the ``turtle'' position). The true
+potential is bounded below. The Duffing model is therefore a faithful
+description of the rolling dynamics {\itshape within the basin of
+attraction of upright}, and its divergence is the sharp signature of
+\emph{leaving} that basin --- equivalent to capsize. The model is
+silent about what posture the ship ends up in (turtle, sunk, broken),
+which is fine: the regional verification question is precisely
+``does the trajectory stay in the basin?'', not ``what happens
+afterwards?''.
+
+\section{Implications for regional verification}
+
+The regional analogue of global $L_2$-stability or global passivity
+is, informally:
+
+\begin{quote}
+For all admissible input signals $u(\cdot)\in\mathcal U$ and all
+initial conditions $x_0 \in X_0 \subseteq \Omega$, the resulting
+trajectory $x(\cdot)$ remains in some forward-invariant set
+$\Omega' \subseteq \Omega$, equivalently, the storage $H(x(t))$
+remains bounded above by some $\overline H < \tfrac{1}{4}$ for all
+$t \ge 0$.
+\end{quote}
+
+This is the natural specification class for benchmarks like the
+softening Duffing where global guarantees are impossible by
+construction, and it is the property that an identified model with
+``regionally stable'' structural constraints is meant to certify.
+
+\appendix
+\section{Key numerical values used in the demo}
+
+\begin{tabular}{ll}
+\hline
+Symbol & Value (default in the demo) \\
+\hline
+$\delta$ (damping)              & $0.3$ \\
+Sample time $T_s$               & $0.05$ s \\
+Saddle-node threshold $u_c$     & $2/(3\sqrt{3}) \approx 0.3849$ \\
+Saddle level of $H$             & $1/4$ \\
+Angle of vanishing stability $\varphi_v$ (visual scaling)
+                                & $60^\circ$ (CLI flag \verb|--phi-v-deg|) \\
+Stable forcing $u(t)$           & $0.25\,\sin(0.4\,t)$ \\
+Capsize forcing $u(t)$          & $1.5$ on $t\in[4,6]$ s, else $0$ \\
+\hline
+\end{tabular}
+
+\end{document}
