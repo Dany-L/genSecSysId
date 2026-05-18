@@ -1157,8 +1157,10 @@ class SimpleLure(nn.Module):
         B2 = self.B2.cpu().detach().numpy()
         C2 = self.C2.cpu().detach().numpy()
         alpha = 1/(1+ np.exp(-self.tau.cpu().detach().numpy()))
-        # s = self.s.cpu().detach().numpy()
-        s_hat = cp.Variable((1,1))
+        if self.learn_L:
+            s_hat = cp.Variable((1,1))
+        else:
+            s = self.s
 
         multiplier_constraints = []
         if self.learn_L:
@@ -1169,23 +1171,26 @@ class SimpleLure(nn.Module):
         for li in L:
             if self.learn_L:
                 li = li.reshape((1, -1), "C")
+                multiplier_constraints.append(
+                    cp.bmat(
+                        [
+                            [s_hat, li],
+                            [li.T, P],
+                        ]
+                    )
+                    >> EPS * np.eye(self.nx + 1)
+                )
             else:
                 li = li.reshape((1, -1))
-            multiplier_constraints.append(
-                # cp.bmat(
-                #     [
-                #         [np.array([[1 / s**2]]), li],
-                #         [li.T, P],
-                #     ]
-                # )
-                cp.bmat(
-                    [
-                        [s_hat, li],
-                        [li.T, P],
-                    ]
+                multiplier_constraints.append(
+                    cp.bmat(
+                        [
+                            [np.array([[1 / s**2]]), li],
+                            [li.T, P],
+                        ]
+                    )
+                    >> EPS * np.eye(self.nx + 1)
                 )
-                >> EPS * np.eye(self.nx + 1)
-            )
 
         F = cp.bmat(
             [
@@ -1204,17 +1209,22 @@ class SimpleLure(nn.Module):
         ]
 
         nF = F.shape[0]
-        problem = cp.Problem(
-            # cp.Minimize(None),
-            # cp.Minimize(t),
-            cp.Minimize(s_hat),
-            [
-                F << -EPS * np.eye(nF), 
-                *multiplier_constraints, 
-                # *size_constraints,
-                # *init_constraints
-            ],
-        )
+        if self.learn_L:
+            problem = cp.Problem(
+                cp.Minimize(s_hat),
+                [
+                    F << -EPS * np.eye(nF), 
+                    *multiplier_constraints, 
+                ],
+            )
+        else:
+            problem = cp.Problem(
+                cp.Minimize([None]),
+                [
+                    F << -EPS * np.eye(nF), 
+                    # *multiplier_constraints, 
+                ],
+            )
         try:
             problem.solve(solver=cp.MOSEK, verbose=False)
         except Exception:
@@ -1223,9 +1233,10 @@ class SimpleLure(nn.Module):
             return False  # SDP failed to find feasible solution    
         logger.info(f"SDP analysis problem solved: {problem.status}")
 
-        s = 1/torch.sqrt(torch.tensor(s_hat.value).squeeze())
-        logger.info(f"  Initial s from SDP: {s.item():.6f}")
-        self.s.data = s
+        if self.learn_L:
+            s = 1/torch.sqrt(torch.tensor(s_hat.value).squeeze())
+            self.s.data = s
+            logger.info(f"  Initial s from SDP: {s.item():.6f}")
         self.P.data = torch.tensor(P.value)
         self.la.data = torch.tensor(np.diag(M.value))
         # self.M.data = torch.tensor(M.value)

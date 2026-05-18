@@ -235,7 +235,10 @@ def regional_verification(
         )
         return
 
-    s = float(model.s.detach().cpu().numpy())
+    if model.learn_L:
+        s = float(model.s.detach().cpu().numpy())
+    else:
+        s = 5.0
     alpha = float(torch.sigmoid(model.tau.detach()).cpu().numpy())
     P = model.P.detach().cpu().numpy()
     L = model.L.detach().cpu().numpy()
