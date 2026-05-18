@@ -542,6 +542,19 @@ def parse_args():
         help="Trajectory length (steps) for regional verification.",
     )
 
+    parser.add_argument(
+        "--test-data",
+        type=str,
+        default=DEFAULT_TEST_DATA_PATH,
+        help=f"Path to test data folder (default: {DEFAULT_TEST_DATA_PATH}).",
+    )
+    parser.add_argument(
+        "--train-data",
+        type=str,
+        default=DEFAULT_TRAIN_DATA_PATH,
+        help=f"Path to train data folder (default: {DEFAULT_TRAIN_DATA_PATH}).",
+    )
+
     return parser.parse_args()
 
 
@@ -637,8 +650,8 @@ def main():
         if state_col and len(state_col) == 0:  # Empty list means no state
             state_col = None
 
-        test_path = Path(os.path.expanduser(DEFAULT_TEST_DATA_PATH))
-        train_path = Path(os.path.expanduser(DEFAULT_TRAIN_DATA_PATH))
+        test_path = Path(os.path.expanduser(args.test_data))
+        train_path = Path(os.path.expanduser(args.train_data))
 
         test_inputs, test_outputs, test_states, filenames = load_csv_folder(
             folder_path=str(test_path),

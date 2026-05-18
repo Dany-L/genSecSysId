@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -439,9 +440,12 @@ class Trainer:
 
         # Epoch-level progress bar
         pbar = tqdm(range(max_epochs), desc="Training Progress")
+        epoch_times = []
+        train_start_time = time.perf_counter()
 
         for epoch in pbar:
             self.current_epoch = epoch
+            epoch_start = time.perf_counter()
 
             # Train (returns dict with loss and gradient stats)
             train_results = self.train_epoch()
@@ -463,6 +467,13 @@ class Trainer:
             # Validate
             val_loss = self.validate()
             self.val_losses.append(val_loss)
+
+            # Synchronize CUDA so the wall-clock time reflects completed GPU work,
+            # not just queued kernels.
+            if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+                torch.cuda.synchronize()
+            epoch_time_sec = time.perf_counter() - epoch_start
+            epoch_times.append(epoch_time_sec)
             # print(f'Epoch {epoch}: constraints satisfied={self.model.check_constraints()}')
 
             # Get scheduler patience info if using ReduceLROnPlateau
@@ -482,6 +493,7 @@ class Trainer:
                 "val_loss": f"{val_loss:.4f}",
                 "best_val": f"{self.best_val_loss:.4f}",
                 "constraints": f"{self.model.check_constraints()}",
+                "epoch_s": f"{epoch_time_sec:.2f}",
             }
             if scheduler_patience_info:
                 progress_metrics["scheduler_patience"] = scheduler_patience_info
@@ -502,6 +514,7 @@ class Trainer:
                 mlflow.log_metric("train_reg_input", train_results["reg_input"], step=epoch)
                 mlflow.log_metric("val_loss", val_loss, step=epoch)
                 mlflow.log_metric("lr", self.optimizer.param_groups[0]["lr"], step=epoch)
+                mlflow.log_metric("epoch_time_sec", epoch_time_sec, step=epoch)
                 if self.regularization_weight > 0:
                     mlflow.log_metric(
                         "regularization_weight", self.regularization_weight, step=epoch
@@ -599,6 +612,25 @@ class Trainer:
         # Close progress bar
         pbar.close()
 
+        total_train_time = time.perf_counter() - train_start_time
+        if epoch_times:
+            mean_epoch = float(np.mean(epoch_times))
+            median_epoch = float(np.median(epoch_times))
+            # Use last-half mean to exclude warmup epochs (SDP init, JIT, cache fills).
+            steady_epoch = float(np.mean(epoch_times[len(epoch_times) // 2 :]))
+            print("\n=== Timing summary ===")
+            print(f"Device:                 {self.device}")
+            print(f"Epochs run:             {len(epoch_times)}")
+            print(f"Total wall time (s):    {total_train_time:.2f}")
+            print(f"Mean epoch (s):         {mean_epoch:.3f}")
+            print(f"Median epoch (s):       {median_epoch:.3f}")
+            print(f"Mean epoch, last half:  {steady_epoch:.3f}")
+            if self.mlflow_tracking:
+                mlflow.log_metric("total_train_time_sec", total_train_time)
+                mlflow.log_metric("mean_epoch_time_sec", mean_epoch)
+                mlflow.log_metric("median_epoch_time_sec", median_epoch)
+                mlflow.log_metric("steady_state_epoch_time_sec", steady_epoch)
+
         # Save final model
         self.save_checkpoint("final_model.pt")
 
@@ -620,6 +652,8 @@ class Trainer:
             "best_val_loss": self.best_val_loss,
             "best_epoch": self.best_epoch,
             "final_epoch": self.current_epoch,
+            "epoch_times_sec": epoch_times,
+            "total_time": total_train_time,
         }
 
         with open(self.output_dir / "training_history.json", "w") as f:
