@@ -64,6 +64,13 @@ def main():
         help="Random seed for reproducibility. If not set, uses seed from config. "
         "Set to -1 to disable seeding (allows variance estimation across runs)",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        choices=["auto", "cuda", "cpu", "mps"],
+        help="Override training device from config (e.g. 'cuda' on cluster).",
+    )
     args = parser.parse_args()
 
     # Load configuration
@@ -81,6 +88,10 @@ def main():
             config.seed = None  # Disable seeding
         else:
             config.seed = args.seed
+
+    # Override device from command line if provided
+    if args.device is not None:
+        config.training.device = args.device
 
     # Derive directories. If config.root_dir is provided, derive model/output/log dirs
     # as: <root>/models/<model_type>, <root>/outputs/<model_type>, <root>/logs/<model_type>

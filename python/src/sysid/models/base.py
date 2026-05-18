@@ -68,8 +68,8 @@ class Linear(nn.Module):
         Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]],
     ]:
         n_batch, N, _, _ = d.shape
-        x = torch.zeros(size=(n_batch, N + 1, self._nx, 1))
-        e_hat = torch.zeros(size=(n_batch, N, self._ne, 1))
+        x = torch.zeros(size=(n_batch, N + 1, self._nx, 1), device=d.device, dtype=d.dtype)
+        e_hat = torch.zeros(size=(n_batch, N, self._ne, 1), device=d.device, dtype=d.dtype)
         if x0 is not None:
             if isinstance(x0, Tuple):
                 x[:, 0, :, :] = x0[0]  # Use first element if tuple
