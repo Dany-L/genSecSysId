@@ -1,22 +1,22 @@
 #!/bin/bash
 #SBATCH --job-name=genSecSysId-sample
-#SBATCH --partition=dgx
-#SBATCH --time=24:00:00
+#SBATCH --partition=gpu-dev
+#SBATCH --time=1:00:00
 #SBATCH --ntasks=1
 #SBATCH --nodes=1
 #SBATCH --mem=16GB
 #SBATCH --gres=gpu:1
 #SBATCH --gpus=1
-#SBATCH --output=./Report/genSecSysId/output_%j.out
+#SBATCH --output=/home/ac137967/Report/genSecSysId/output_%j.out
 
 # -----------------------------------------------------------------------------
 # Paths — adjust if your cluster layout differs.
 # Matches the SysIdBench template: code under $HOME/01_git, data under /data/work.
 # -----------------------------------------------------------------------------
 REPO_DIR="${HOME}/01_git/genSecSysId/python"
-VENV_DIR="${HOME}/python_venv/genSecSysId"
-DATA_ROOT="/data/work/${USER}/genSecSysId"
-CONFIG_FILE="${DATA_ROOT}/configs/crnn_gen-sec_duffing.yaml"
+VENV_DIR="${HOME}/venv/genSecSysId"
+DATA_ROOT="/data/work/${USER}/Duffing"
+CONFIG_FILE="${DATA_ROOT}/config/crnn_gen-sec_duffing.yaml"
 
 # Make sure the output directory exists (sbatch does not create it).
 mkdir -p ./Report/genSecSysId
