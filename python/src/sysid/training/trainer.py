@@ -354,6 +354,8 @@ class Trainer:
                 x0 = None
             d = d.to(self.device)
             e = e.to(self.device)
+            if x0 is not None:
+                x0 = x0.to(device=self.device, dtype=d.dtype)
 
             self.optimizer.zero_grad()
             e_hat, (x, w), _ = self.model(d, x0=x0, warmup_steps=0)
