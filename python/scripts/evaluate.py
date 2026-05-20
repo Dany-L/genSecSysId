@@ -121,6 +121,13 @@ def main():
     output_dir = base / "outputs" / model_type / args.run_id
     log_dir = base / "logs" / model_type / args.run_id
 
+    # Eval artefacts go into a dedicated subfolder so they don't mingle with
+    # the training-time artefacts (e.g. <output_dir>/predictions/epoch_*.png)
+    # that were already logged to MLflow during training. Defined here (before
+    # any plot-saving code) so the ellipse/polytope plot block below can use it.
+    eval_dir = output_dir / "evaluation"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+
     # Now switch to file+console logging in the run directory.
     logger = setup_file_logging(log_dir, "evaluation")
 
@@ -373,15 +380,8 @@ def main():
     # Set up MLflow tracking (must happen before mlflow.start_run).
     setup_mlflow_tracking(config)
 
-    # Eval artefacts go into a dedicated subfolder so they don't mingle with
-    # the training-time artefacts (e.g. <output_dir>/predictions/epoch_*.png)
-    # that were already logged to MLflow during training. Logging the whole
-    # output_dir under "evaluation" would otherwise duplicate every training
-    # plot under evaluation/predictions/.
-    eval_dir = output_dir / "evaluation"
-    eval_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create evaluator
+    # Create evaluator (eval_dir was defined earlier so the ellipse plot block
+    # could use it; we just reuse it here as the evaluator's output dir).
     evaluator = Evaluator(
         model=model,
         device=str(device),
