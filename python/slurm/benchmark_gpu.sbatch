@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=genSecSysId-bench-gpu
-#SBATCH --partition=gpu-dev
+#SBATCH --partition=gpu
 #SBATCH --time=08:00:00
 #SBATCH --ntasks=1
 #SBATCH --nodes=1
