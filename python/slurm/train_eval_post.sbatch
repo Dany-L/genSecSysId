@@ -105,9 +105,9 @@ echo "############################################################"
 echo "# Step 2/3: evaluate.py                                     "
 echo "############################################################"
 python scripts/evaluate.py \
-    --config "${CONFIG_FILE}" \
-    --model "${BEST_MODEL}" \
-    --test-data "${TEST_DATA}"
+    --run-id "${RUN_ID}" \
+    --test-data "${TEST_DATA}" \
+    --data-root "${DATA_ROOT}"
 
 # -----------------------------------------------------------------------------
 # Step 3 — post_process
@@ -118,7 +118,7 @@ echo "# Step 3/3: post_process.py                                 "
 echo "############################################################"
 POST_ARGS=(
     --run-id "${RUN_ID}"
-    --config "${CONFIG_FILE}"
+    --data-root "${DATA_ROOT}"
 )
 if [[ -n "${TRUE_DYNAMICS}" ]]; then
     POST_ARGS+=(--true-dynamics "${TRUE_DYNAMICS}")
