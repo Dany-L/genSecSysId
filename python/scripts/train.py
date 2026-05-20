@@ -64,6 +64,25 @@ def main():
         help="Random seed for reproducibility. If not set, uses seed from config. "
         "Set to -1 to disable seeding (allows variance estimation across runs)",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        choices=["auto", "cuda", "cpu", "mps"],
+        help="Override training device from config (e.g. 'cuda' on cluster).",
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="Override MLflow run_name from config (handy to label benchmark runs).",
+    )
+    parser.add_argument(
+        "--run-id-out",
+        type=str,
+        default=None,
+        help="Path to write the MLflow run_id to (so downstream scripts can pick it up).",
+    )
     args = parser.parse_args()
 
     # Load configuration
@@ -81,6 +100,14 @@ def main():
             config.seed = None  # Disable seeding
         else:
             config.seed = args.seed
+
+    # Override device from command line if provided
+    if args.device is not None:
+        config.training.device = args.device
+
+    # Override MLflow run_name from command line if provided
+    if args.run_name is not None:
+        config.mlflow.run_name = args.run_name
 
     # Derive directories. If config.root_dir is provided, derive model/output/log dirs
     # as: <root>/models/<model_type>, <root>/outputs/<model_type>, <root>/logs/<model_type>
@@ -296,6 +323,15 @@ def main():
     with mlflow.start_run(run_name=config.mlflow.run_name):
         run_id = mlflow.active_run().info.run_id
         logger.info(f"MLflow run ID: {run_id}")
+
+        # Write run_id to a file so downstream scripts (evaluate, post_process)
+        # can pick it up without parsing logs. Done immediately so the file
+        # exists even if training itself later fails (eval can still be retried).
+        if args.run_id_out is not None:
+            run_id_out_path = Path(os.path.expanduser(args.run_id_out))
+            run_id_out_path.parent.mkdir(parents=True, exist_ok=True)
+            run_id_out_path.write_text(run_id)
+            logger.info(f"Wrote run_id to {run_id_out_path}")
         mlflow.log_param("total_parameters", total_params)
         mlflow.log_param("trainable_parameters", trainable_params)
 

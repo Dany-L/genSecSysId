@@ -1,15 +1,13 @@
 #!/usr/bin/env python
 """
-Export trained SimpleLure model matrices to .mat file for MATLAB analysis.
+Export trained SimpleLure model matrices to a .mat file for MATLAB analysis.
 
-This script loads a trained model from MLflow and exports all system matrices
-in MATLAB-compatible format.
+The model, config, and (best) checkpoint are resolved from the standard
+training layout via sysid.config.resolve_run_artifacts — no MLflow server
+interaction is needed.
 
 Usage:
-    python scripts/export_for_matlab.py --run-id <run_id> --output <path.mat>
-
-Examples:
-    python scripts/export_for_matlab.py --run-id abc123def456 --output model.mat
+    python scripts/export_for_matlab.py --run-id <run_id> [--output <path.mat>]
 """
 
 import argparse
@@ -17,17 +15,19 @@ import logging
 import sys
 from pathlib import Path
 
-import mlflow
 import numpy as np
 from scipy.io import savemat
 
-from sysid.models import SimpleLure
+from sysid.config import resolve_run_artifacts
+from sysid.models import SimpleLure, load_model
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+DEFAULT_DATA_ROOT = "~/genSecSysId-Data"
 
 
 def export_model_to_matlab(model: SimpleLure, output_path: str):
@@ -64,8 +64,9 @@ def export_model_to_matlab(model: SimpleLure, output_path: str):
         # Multipliers
         "la": model.la.detach().cpu().numpy(),
         "M": np.diag(model.la.detach().cpu().numpy()),
-        # Stability parameters
-        "alpha": model.alpha.item(),
+        # Stability parameters. Model stores the unconstrained `tau`; the
+        # physical α used everywhere downstream is sigmoid(tau).
+        "alpha": float(1.0 / (1.0 + np.exp(-model.tau.detach().cpu().numpy()))),
         "s": model.s.item(),
         "delta": model.delta.item(),
         "max_norm_x0": model.max_norm_x0,
@@ -128,14 +129,14 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--output", type=str, default="model.mat", help="Output .mat file path (default: model.mat)"
+        "--data-root", type=str, default=DEFAULT_DATA_ROOT,
+        help=f"Base directory for per-run artefacts (default: {DEFAULT_DATA_ROOT}).",
     )
 
     parser.add_argument(
-        "--mlflow-tracking-uri",
-        type=str,
-        default=None,
-        help="MLflow tracking URI (default: uses current tracking URI)",
+        "--output", type=str, default=None,
+        help="Output .mat file path. Defaults to <run_dir>/best_model_export.mat "
+             "next to the checkpoint.",
     )
 
     return parser.parse_args()
@@ -145,28 +146,32 @@ def main():
     """Main entry point."""
     args = parse_args()
 
-    # Set MLflow tracking URI if provided
-    if args.mlflow_tracking_uri:
-        mlflow.set_tracking_uri(args.mlflow_tracking_uri)
-
-    logger.info(f"Using MLflow tracking URI: {mlflow.get_tracking_uri()}")
-
-    # Load model from MLflow
-    logger.info(f"Loading model from run {args.run_id}")
+    # Resolve config + best-checkpoint path from the run id (local disk only).
     try:
-        model_uri = f"runs:/{args.run_id}/model"
-        model = mlflow.pytorch.load_model(model_uri)
+        config, model_path, _, _ = resolve_run_artifacts(
+            args.run_id, data_root=args.data_root
+        )
+    except Exception as e:
+        logger.error(f"Failed to resolve run_id={args.run_id}: {e}")
+        sys.exit(1)
 
+    logger.info(f"Loading model from {model_path}")
+    try:
+        model = load_model(str(model_path), config, device="cpu")
         if not isinstance(model, SimpleLure):
             logger.error("Model is not a SimpleLure model. Export only supports SimpleLure.")
             sys.exit(1)
-
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         sys.exit(1)
 
-    # Export to MATLAB
-    export_model_to_matlab(model, args.output)
+    output_path = (
+        Path(args.output).expanduser()
+        if args.output is not None
+        else Path(model_path).with_name("best_model_export.mat")
+    )
+
+    export_model_to_matlab(model, str(output_path))
 
     logger.info("Done!")
 

@@ -7,14 +7,10 @@ This script loads a trained SimpleLure model and calls its post_process() method
 to solve a semidefinite program (SDP) for optimal P and L matrices.
 
 Usage:
-    python scripts/post_process.py --run-id <run_id> [--optimize-s]
+    python scripts/post_process.py --run-id <run_id>
 
-Examples:
-    # Post-process a model, keeping s fixed
-    python scripts/post_process.py --run-id abc123def456
-
-    # Post-process and optimize for minimum s
-    python scripts/post_process.py --run-id abc123 --optimize-s
+Config, checkpoint, and normalizer are all resolved from the run id via the
+standard training layout (see sysid.config.resolve_run_artifacts).
 """
 
 import argparse
@@ -28,11 +24,11 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-from sysid.config import Config
-from sysid.data import DataNormalizer
+from sysid.config import resolve_run_artifacts, setup_mlflow_tracking
 from sysid.data.direct_loader import load_csv_folder
 from sysid.evaluation import get_true_dynamics, list_true_dynamics
-from sysid.models import SimpleLure, SimpleLureSafe
+from sysid.models import SimpleLure, SimpleLureSafe, load_model
+from sysid.data import DataNormalizer
 from sysid.utils import (
     plot_ellipse,
     plot_ellipse_and_parallelogram,
@@ -48,10 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Default configuration values (can be overridden via command line)
-DEFAULT_TEST_DATA_PATH = "/Users/jack/genSecSysId-Data/data/Duffing/test"
-DEFAULT_TRAIN_DATA_PATH = "/Users/jack/genSecSysId-Data/data/Duffing/train"
-# DEFAULT_TRAJECTORY_LIST = [0, 1]
+DEFAULT_DATA_ROOT = "~/genSecSysId-Data"
 
 
 
@@ -481,10 +474,8 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--config",
-        type=str,
-        default='~/genSecSysId-Data/configs/crnn_gen-sec_duffing.yaml',
-        help="Path to configuration file (YAML or JSON)",
+        "--data-root", type=str, default=DEFAULT_DATA_ROOT,
+        help=f"Base directory for run artefacts (default: {DEFAULT_DATA_ROOT}).",
     )
 
     parser.add_argument(
@@ -498,14 +489,14 @@ def parse_args():
         "--output-dir",
         type=str,
         default=None,
-        help="Output directory for post-processed results (default: derived from config root_dir or config output_dir)",
+        help="Output directory for post-processed results (default: derived from the run's config root_dir).",
     )
 
     parser.add_argument(
         "--mlflow-tracking-uri",
         type=str,
         default=None,
-        help="MLflow tracking URI (default: uses current tracking URI)",
+        help="Override MLflow tracking URI from the run's config (default: use config).",
     )
 
     parser.add_argument(
@@ -542,91 +533,78 @@ def parse_args():
         help="Trajectory length (steps) for regional verification.",
     )
 
+    parser.add_argument(
+        "--test-data",
+        type=str,
+        default=None,
+        help="Path to test data folder (default: <config.data.train_path>/test).",
+    )
+    parser.add_argument(
+        "--train-data",
+        type=str,
+        default=None,
+        help="Path to train data folder (default: <config.data.train_path>/train).",
+    )
+
     return parser.parse_args()
 
 
 def main():
     """Main entry point."""
     args = parse_args()
+    run_id = args.run_id
 
-    # Set MLflow tracking URI if provided
-    if args.mlflow_tracking_uri:
-        mlflow.set_tracking_uri(args.mlflow_tracking_uri)
+    # Resolve config, checkpoint, normalizer, and run_info from the run id.
+    try:
+        config, model_path, normalizer_path, run_info = resolve_run_artifacts(
+            run_id, data_root=args.data_root
+        )
+    except Exception as e:
+        logger.error(f"Failed to resolve run_id={run_id}: {e}")
+        sys.exit(1)
 
+    # Setup MLflow tracking from the run's own config (with optional CLI override).
+    setup_mlflow_tracking(config, override_uri=args.mlflow_tracking_uri)
     logger.info(f"Using MLflow tracking URI: {mlflow.get_tracking_uri()}")
 
-    # Load configuration early so we can derive directories from config.root_dir
-    config_path = Path(args.config)
-    if config_path.suffix == ".yaml" or config_path.suffix == ".yml":
-        config = Config.from_yaml(os.path.expanduser(config_path))
-    elif config_path.suffix == ".json":
-        config = Config.from_json(os.path.expanduser(config_path))
-    else:
-        raise ValueError(f"Unsupported config file format: {config_path.suffix}")
-
+    # Resolve output directory.
     if args.output_dir is not None:
         output_dir = Path(os.path.expanduser(args.output_dir))
     elif getattr(config, "root_dir", None):
         base = Path(os.path.expanduser(config.root_dir))
-        output_dir = Path(base / "outputs" / config.model.model_type)
-
+        output_dir = base / "outputs" / config.model.model_type
     else:
         output_dir = Path(os.path.expanduser(config.output_dir))
-    run_id = args.run_id
-    run_output_dir = Path(output_dir) / run_id
+    run_output_dir = output_dir / run_id
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load model from MLflow
-    logger.info(f"Loading model from run {args.run_id}")
+    # Load model from the resolved checkpoint path.
+    logger.info(f"Loading model from {model_path}")
     try:
-        model_uri = f"runs:/{args.run_id}/model"
-        model = mlflow.pytorch.load_model(model_uri)
-
+        model = load_model(str(model_path), config, device="cpu")
         if not isinstance(model, SimpleLure):
             logger.error(
                 "Model is not a SimpleLure model. Post-processing only supports SimpleLure."
             )
             sys.exit(1)
-
-        # Load best model weights (overwrites final model weights with best checkpoint)
-        try:
-            best_model_path = mlflow.artifacts.download_artifacts(
-                run_id=args.run_id, artifact_path="models/best_model.pt"
-            )
-            checkpoint = torch.load(best_model_path, map_location="cpu")
-            # model.check_constraints()
-            model.load_state_dict(checkpoint["model_state_dict"])
-            constraints_satisfied = model.check_constraints()
-            # model.check_constraints()
-            best_epoch = checkpoint.get("best_epoch", "?")
-            best_val_loss = checkpoint.get("best_val_loss", float("nan"))
-            logger.info(
-                f"Best model weights loaded (best epoch: {best_epoch}, best val loss: {best_val_loss:.6f} constraints satisfied? {constraints_satisfied})"
-            )
-        except Exception as e:
-            logger.warning(f"Could not load best model weights, using final model: {e}")
-
-        # Load normalizer from MLflow
-        normalizer = None
-        try:
-            normalizer_path = mlflow.artifacts.download_artifacts(
-                run_id=args.run_id, artifact_path="models/normalizer.json"
-            )
-            normalizer = DataNormalizer.load(normalizer_path)
-            logger.info(f"Normalizer loaded from MLflow")
-        except Exception as e:
-            logger.warning(f"Could not load normalizer from MLflow: {e}")
-
+        constraints_satisfied = model.check_constraints()
+        logger.info(
+            f"Best model weights loaded (constraints satisfied? {constraints_satisfied})"
+        )
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         sys.exit(1)
 
-    # Get the original run
-    run = mlflow.get_run(args.run_id)
-    experiment_id = run.info.experiment_id
+    # Load normalizer from the resolved path.
+    normalizer = None
+    if normalizer_path is not None:
+        normalizer = DataNormalizer.load(str(normalizer_path))
+        logger.info(f"Normalizer loaded from {normalizer_path}")
+    else:
+        logger.warning("Normalizer not found next to checkpoint.")
 
     # Use the SAME run (not a new one) - just add artifacts and metrics
-    logger.info(f"Logging post-processing results to original run: {args.run_id}")
+    logger.info(f"Logging post-processing results to original run: {run_id}")
 
     with mlflow.start_run(run_id=args.run_id):
         # Call model's post_process method
@@ -637,8 +615,17 @@ def main():
         if state_col and len(state_col) == 0:  # Empty list means no state
             state_col = None
 
-        test_path = Path(os.path.expanduser(DEFAULT_TEST_DATA_PATH))
-        train_path = Path(os.path.expanduser(DEFAULT_TRAIN_DATA_PATH))
+        data_base = Path(os.path.expanduser(config.data.train_path))
+        test_path = (
+            Path(os.path.expanduser(args.test_data))
+            if args.test_data is not None
+            else data_base / "test"
+        )
+        train_path = (
+            Path(os.path.expanduser(args.train_data))
+            if args.train_data is not None
+            else data_base / "train"
+        )
 
         test_inputs, test_outputs, test_states, filenames = load_csv_folder(
             folder_path=str(test_path),

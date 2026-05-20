@@ -1,8 +1,17 @@
-"""Evaluation script."""
+"""Evaluation script.
+
+Usage:
+    python scripts/evaluate.py --run-id <mlflow_run_id> [--test-data <path>]
+
+Config, checkpoint, and normalizer are all resolved from the standard
+training layout under --data-root (default: ~/genSecSysId-Data). Test
+data defaults to the test/ split of the dataset the run was trained on
+(config.data.train_path) unless overridden with --test-data.
+"""
 
 import argparse
-import json
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -11,8 +20,8 @@ import mlflow
 import numpy as np
 import torch
 
-from sysid.config import Config
-from sysid.data import DataLoader, DataNormalizer, create_dataloaders
+from sysid.config import resolve_run_artifacts, setup_mlflow_tracking
+from sysid.data import DataLoader, DataNormalizer
 from sysid.data.direct_loader import load_csv_folder, load_split_data
 from sysid.data.loader import collate_with_optional_states
 from sysid.evaluation import Evaluator
@@ -20,8 +29,11 @@ from sysid.models import load_model
 from sysid.utils import plot_predictions
 
 
+DEFAULT_DATA_ROOT = "~/genSecSysId-Data"
+
+
 def setup_console_logging() -> logging.Logger:
-    """Setup console-only logging (before run_id is known)."""
+    """Setup console-only logging (before run_id-based dirs exist)."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -32,7 +44,7 @@ def setup_console_logging() -> logging.Logger:
 
 
 def setup_file_logging(log_dir: Path, log_prefix: str) -> logging.Logger:
-    """Setup logging with both file and console output (after run_id is known)."""
+    """Setup logging with both file and console output."""
     log_dir.mkdir(parents=True, exist_ok=True)
     log_filename = f"{log_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     log_file_path = log_dir / log_filename
@@ -50,184 +62,124 @@ def setup_file_logging(log_dir: Path, log_prefix: str) -> logging.Logger:
 
 
 def filter_metrics(metrics: dict, allowed_metrics: list) -> dict:
-    """
-    Filter metrics to only include those in the allowed list.
-
-    Args:
-        metrics: Dictionary of all computed metrics
-        allowed_metrics: List of metric names to keep
-
-    Returns:
-        Filtered metrics dictionary
-    """
+    """Filter metrics to only include those in the allowed list."""
     filtered = {}
-
     for key, value in metrics.items():
-        # Always skip per_step (internal detail, not logged)
         if key == "per_step":
             continue
-
-        # If no filtering specified, include all metrics (except per_step)
         if allowed_metrics is None:
             filtered[key] = value
             continue
-
-        # For suffixed metrics (_avg, _final), extract base metric name
         if "_avg" in key:
             base_metric = key.replace("_avg", "")
         elif "_final" in key:
             base_metric = key.replace("_final", "")
         else:
             base_metric = key
-
-        # Include metric if base is in allowed list
         if base_metric in allowed_metrics:
             filtered[key] = value
-
     return filtered
-
-
-def load_run_info(model_path: str):
-    """
-    Load MLflow run info from model directory.
-
-    Args:
-        model_path: Path to model checkpoint
-
-    Returns:
-        dict: Run info containing run_id, experiment_name, run_name, or None if not found
-    """
-    model_dir = Path(model_path).parent
-    run_info_path = model_dir / "run_info.json"
-
-    if run_info_path.exists():
-        with open(run_info_path, "r") as f:
-            return json.load(f)
-    return None
 
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate trained RNN model")
-    parser.add_argument("--config", type=str, required=True, help="Path to config file")
-    parser.add_argument("--model", type=str, required=True, help="Path to model checkpoint")
     parser.add_argument(
-        "--test-data", type=str, required=True, help="Path to test data (folder or CSV file)"
+        "--run-id", type=str, required=True,
+        help="MLflow training-run id. Config, checkpoint, and normalizer are "
+             "resolved from <data-root>/{outputs,models}/<model_type>/<run_id>/.",
     )
     parser.add_argument(
-        "--output-dir", type=str, default="evaluation_results", help="Output directory"
+        "--data-root", type=str, default=DEFAULT_DATA_ROOT,
+        help=f"Base directory for run artefacts (default: {DEFAULT_DATA_ROOT}).",
+    )
+    parser.add_argument(
+        "--test-data", type=str, default=None,
+        help="Path to test data (folder with test/ subfolder, folder of CSVs, "
+             "or single .csv/.npy file). Defaults to config.data.train_path.",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     args = parser.parse_args()
 
-    # Load configuration early so we can derive directories from config.root_dir
-    config_path = Path(args.config)
-    if config_path.suffix == ".yaml" or config_path.suffix == ".yml":
-        config = Config.from_yaml(args.config)
-    elif config_path.suffix == ".json":
-        config = Config.from_json(args.config)
-    else:
-        raise ValueError(f"Unsupported config file format: {config_path.suffix}")
+    # Initial console-only logger (used until log_dir is known).
+    console_logger = setup_console_logging()
 
-    # Try to load run info from model directory
-    run_info = load_run_info(args.model)
+    # Resolve config + checkpoint + normalizer + run_info from the run id alone.
+    try:
+        config, model_path, normalizer_path, run_info = resolve_run_artifacts(
+            args.run_id, data_root=args.data_root
+        )
+    except Exception as e:
+        console_logger.error(f"Failed to resolve run_id={args.run_id}: {e}")
+        raise
 
-    # Setup console-only logging initially
-    logger = setup_console_logging()
-
-    # If a root_dir is configured, derive output/log dirs from it
+    # Determine output/log directories — prefer config.root_dir, fall back to data-root.
     if getattr(config, "root_dir", None):
-        base = Path(config.root_dir)
-        model_type = config.model.model_type
-        if run_info:
-            run_id = run_info["run_id"]
-            output_dir = base / "outputs" / model_type / run_id
-            log_dir = base / "logs" / model_type / run_id
-            # Setup file logging now that we have the log directory
-            logger = setup_file_logging(log_dir, "evaluation")
-            logger.info(f"Found MLflow run ID: {run_id}")
-            logger.info("Will log evaluation results to the same run")
-        else:
-            # No run info - create timestamped folder under outputs/model_type
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_dir = base / "outputs" / model_type / f"eval_{ts}"
-            log_dir = base / "logs" / model_type / f"eval_{ts}"
-            logger = setup_file_logging(log_dir, "evaluation")
-            logger.warning(
-                "No run_info.json found - evaluation results will not be logged to MLflow"
-            )
+        base = Path(os.path.expanduser(config.root_dir))
     else:
-        # Fallback: use CLI-provided output dir
-        if run_info:
-            run_id = run_info["run_id"]
-            output_dir = Path(args.output_dir) / run_id
-            logger = setup_file_logging(output_dir, "evaluation")
-            logger.info(f"Found MLflow run ID: {run_id}")
-            logger.info(f"Will log evaluation results to the same run")
-        else:
-            output_dir = Path(args.output_dir)
-            model_name = Path(args.model).stem
-            logger = setup_file_logging(output_dir, "evaluation")
-            logger.warning(
-                "No run_info.json found - evaluation results will not be logged to MLflow"
-            )
+        base = Path(os.path.expanduser(args.data_root))
+    model_type = config.model.model_type
+    output_dir = base / "outputs" / model_type / args.run_id
+    log_dir = base / "logs" / model_type / args.run_id
+
+    # Now switch to file+console logging in the run directory.
+    logger = setup_file_logging(log_dir, "evaluation")
 
     logger.info("=" * 70)
     logger.info("Model Evaluation")
     logger.info("=" * 70)
-    logger.info(f"Config file: {args.config}")
-    logger.info(f"Model checkpoint: {args.model}")
-    logger.info(f"Test data: {args.test_data}")
+    logger.info(f"Run ID: {args.run_id}")
+    logger.info(f"Model checkpoint: {model_path}")
     logger.info(f"Output directory: {output_dir}")
-
     logger.info(f"Model type: {config.model.model_type}")
     logger.info(f"Evaluation metrics: {config.evaluation.metrics}")
+    if run_info is None:
+        logger.warning("No run_info.json found alongside the checkpoint")
 
     # Get device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     print(f"Using device: {device}")
 
+    # Resolve test data path. Default to the dataset the run was trained on.
+    if args.test_data is None:
+        test_data_arg = config.data.train_path
+        logger.info(f"--test-data not provided, defaulting to {test_data_arg}")
+    else:
+        test_data_arg = args.test_data
+    test_path = Path(os.path.expanduser(test_data_arg))
+
     # Load test data
     logger.info("Loading test data...")
     print("Loading test data...")
     try:
-        # Auto-detect loading method based on path
-        test_path = Path(args.test_data)
-
         if test_path.is_dir():
-            # Check if it's a structured data directory (with train/test/validation subfolders)
             if (test_path / "test").exists():
-                # Use load_split_data to load only test data from prepared structure
                 logger.info("Loading from prepared data structure (test split only)...")
-                logger.info(f"Data directory: {args.test_data}")
+                logger.info(f"Data directory: {test_path}")
 
-                # Get state column if provided
                 state_col = getattr(config.data, "state_col", None)
-                if state_col and len(state_col) == 0:  # Empty list means no state
+                if state_col and len(state_col) == 0:
                     state_col = None
 
-                # Load only test data
                 _, _, _, _, test_inputs, test_outputs, _, _, test_states = load_split_data(
                     data_dir=str(test_path),
                     input_col=getattr(config.data, "input_col", ["d"]),
                     output_col=getattr(config.data, "output_col", ["e"]),
                     state_col=state_col,
                     pattern=getattr(config.data, "pattern", "*.csv"),
-                    load_train=False,  # Don't load training data
-                    load_val=False,  # Don't load validation data
-                    load_test=True,  # Only load test data
+                    load_train=False,
+                    load_val=False,
+                    load_test=True,
                 )
                 logger.info(f"Loaded test data: {test_inputs.shape[0]} sequences")
                 if test_states is not None:
                     logger.info(f"State information loaded: {test_states.shape}")
             else:
-                # Single folder with CSV files (backward compatibility)
                 logger.info("Loading directly from CSV folder...")
-                logger.info(f"Test data directory: {args.test_data}")
+                logger.info(f"Test data directory: {test_path}")
 
-                # Get state column if provided
                 state_col = getattr(config.data, "state_col", None)
-                if state_col and len(state_col) == 0:  # Empty list means no state
+                if state_col and len(state_col) == 0:
                     state_col = None
 
                 test_inputs, test_outputs, test_states, filenames = load_csv_folder(
@@ -242,26 +194,24 @@ def main():
                     logger.info(f"State information loaded: {test_states.shape}")
 
         elif test_path.suffix == ".csv":
-            # Fallback: Load from single CSV file
             logger.info("Loading from single CSV file...")
-            test_inputs, test_outputs = DataLoader.load_from_csv(args.test_data, delimiter=",")
+            test_inputs, test_outputs = DataLoader.load_from_csv(str(test_path), delimiter=",")
             test_states = None
 
         elif test_path.suffix == ".npy":
-            # Legacy: Load from NPY files
             logger.info("Loading NPY files...")
             test_inputs, test_outputs = DataLoader.load_from_npy(
-                args.test_data, args.test_data.replace("_inputs.npy", "_outputs.npy")
+                str(test_path), str(test_path).replace("_inputs.npy", "_outputs.npy")
             )
             test_states = None
         else:
             raise ValueError(
-                f"Unsupported data format: {args.test_data}\n"
+                f"Unsupported data format: {test_path}\n"
                 f"Use either:\n"
-                f"  1. Prepared data folder: 'data/prepared' with test/ subfolder\n"
-                f"  2. Test folder: 'data/prepared/test' with CSV files\n"
-                f"  3. Single CSV file: 'data/test.csv'\n"
-                f"  4. NPY file: 'data/test_inputs.npy'"
+                f"  1. Prepared data folder with test/ subfolder\n"
+                f"  2. Folder of CSV files\n"
+                f"  3. Single CSV file\n"
+                f"  4. NPY file"
             )
 
         logger.info(f"Test data loaded: inputs={test_inputs.shape}, outputs={test_outputs.shape}")
@@ -271,29 +221,13 @@ def main():
         logger.exception("Full traceback:")
         raise
 
-    # Load normalizer (check in model directory, which may include run_id)
-    model_dir = Path(args.model).parent
-    normalizer_path = model_dir / "normalizer.json"
+    # Load normalizer from the path resolved above.
     normalizer = None
-    if normalizer_path.exists():
+    if normalizer_path is not None:
         normalizer = DataNormalizer.load(str(normalizer_path))
         logger.info(f"Loaded normalizer from {normalizer_path}")
-        print(f"Loaded normalizer from {normalizer_path}")
     else:
-        # Fallback to config model_dir. Also check derived root model folder if configured.
-        normalizer_path_fallback = Path(config.model_dir) / "normalizer.json"
-        if getattr(config, "root_dir", None):
-            derived = Path(config.root_dir) / "models" / config.model.model_type / "normalizer.json"
-            if derived.exists():
-                normalizer_path_fallback = derived
-        if normalizer_path_fallback.exists():
-            normalizer = DataNormalizer.load(str(normalizer_path_fallback))
-            logger.info(f"Loaded normalizer from {normalizer_path_fallback}")
-            print(f"Loaded normalizer from {normalizer_path_fallback}")
-        else:
-            logger.warning(
-                f"Normalizer not found at {normalizer_path} or {normalizer_path_fallback}"
-            )
+        logger.warning("Normalizer not found next to checkpoint — proceeding unnormalized.")
 
     # Create test loader
     if normalizer is not None:
@@ -307,12 +241,11 @@ def main():
 
     from sysid.data import TimeSeriesDataset
 
-    # Always use full sequences for testing (sequence_length=None)
     test_dataset = TimeSeriesDataset(
         test_inputs_norm,
         test_outputs_norm,
         test_states,
-        sequence_length=None,  # Always use full sequences for evaluation
+        sequence_length=None,
         sequence_stride=None,
     )
 
@@ -327,13 +260,12 @@ def main():
     logger.info("Loading model...")
     print("Loading model...")
     try:
-        model = load_model(args.model, config, str(device))
-        logger.info(f"Model loaded from {args.model}")
+        model = load_model(str(model_path), config, str(device))
+        logger.info(f"Model loaded from {model_path}")
 
-        # Count parameters
         total_params = sum(p.numel() for p in model.parameters())
         logger.info(f"Total parameters: {total_params:,}")
-        print(f"Model loaded from {args.model}")
+        print(f"Model loaded from {model_path}")
 
         # Generate ellipse/polytope plot for SimpleLure models
         import matplotlib.pyplot as plt
@@ -351,8 +283,8 @@ def main():
 
                 fig, ax = plot_ellipse_and_parallelogram(X, H, s, max_norm_x0, show=False)
 
-                # Save to output directory
                 ellipse_plot_path = output_dir / "ellipse_polytope.png"
+                ellipse_plot_path.parent.mkdir(parents=True, exist_ok=True)
                 fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
                 plt.close(fig)
                 logger.info(f"Ellipse/polytope plot saved to {ellipse_plot_path}")
@@ -363,15 +295,18 @@ def main():
         logger.error(f"Failed to load model: {e}")
         raise
 
+    # Set up MLflow tracking (must happen before mlflow.start_run).
+    setup_mlflow_tracking(config)
+
     # Create evaluator
     evaluator = Evaluator(
         model=model,
         device=str(device),
         output_dir=str(output_dir),
-        warmup_steps=config.training.warmup_steps
+        warmup_steps=config.training.warmup_steps,
     )
 
-    # Evaluate (with MLflow logging if run_info exists)
+    # Evaluate — always log to the existing MLflow run.
     logger.info("=" * 70)
     logger.info("Starting evaluation...")
     logger.info(f"Test batches: {len(test_loader)}")
@@ -379,97 +314,33 @@ def main():
     print("\nEvaluating model...")
 
     try:
-        # Start MLflow run if we have run_info
-        if run_info:
-            # Reopen the training run to add evaluation metrics
-            mlflow.set_experiment(run_info["experiment_name"])
-            with mlflow.start_run(run_id=run_id):
-                logger.info(f"Logging evaluation to MLflow run: {run_id}")
+        with mlflow.start_run(run_id=args.run_id):
+            logger.info(f"Logging evaluation to MLflow run: {args.run_id}")
 
-                results = evaluator.evaluate(
-                    test_loader=test_loader,
-                    normalizer=normalizer,
-                )
-
-                # Filter metrics based on config
-                all_metrics = results.get("metrics", {})
-                metrics = filter_metrics(all_metrics, config.evaluation.metrics)
-
-                # Log evaluation metrics to MLflow
-                for metric, value in metrics.items():
-                    if isinstance(value, (int, float)) and metric != "per_step":
-                        mlflow.log_metric(f"eval_{metric}", value)
-                        logger.info(f"{metric}: {value:.6f}")
-
-                # Generate plots
-                logger.info("Generating plots and analysis...")
-                print("\nGenerating plots...")
-
-                # Load predictions, targets, and inputs from saved files
-                try:
-                    e_hat = np.load(output_dir / "predictions.npy")  # predicted output
-                    e = np.load(output_dir / "targets.npy")  # output (target)
-                    d = np.load(output_dir / "inputs.npy")  # input
-
-                    # Select sample indices: always include sample 0, plus 4 random samples
-                    num_sequences = e_hat.shape[0]
-                    sample_indices = [0]  # Always include sample 0
-
-                    if num_sequences > 1:
-                        # Select 4 random samples (excluding sample 0)
-                        other_indices = list(range(1, num_sequences))
-                        num_random = min(4, len(other_indices))
-                        random_indices = np.random.choice(
-                            other_indices, size=num_random, replace=False
-                        ).tolist()
-                        sample_indices.extend(random_indices)
-
-                    plot_predictions(
-                        evaluator.output_dir, e_hat, e, d, sample_indices=sample_indices, warmup_steps=config.training.warmup_steps
-                    )
-                    evaluator.analyze_errors(e_hat, e)
-                    logger.info("Plots generated successfully")
-                except Exception as e_err:
-                    logger.warning(f"Failed to generate plots: {e_err}")
-
-                # Log evaluation artifacts to MLflow
-                mlflow.log_artifacts(str(output_dir), "evaluation")
-                logger.info("Evaluation artifacts logged to MLflow")
-        else:
-            # No run_info - just evaluate without MLflow
             results = evaluator.evaluate(
                 test_loader=test_loader,
                 normalizer=normalizer,
             )
 
-            # Filter metrics based on config
             all_metrics = results.get("metrics", {})
             metrics = filter_metrics(all_metrics, config.evaluation.metrics)
 
-            # Log results to console/file
-            logger.info("=" * 70)
-            logger.info("Evaluation Results:")
-            logger.info("=" * 70)
             for metric, value in metrics.items():
-                if isinstance(value, (int, float)):
+                if isinstance(value, (int, float)) and metric != "per_step":
+                    mlflow.log_metric(f"eval_{metric}", value)
                     logger.info(f"{metric}: {value:.6f}")
 
-            # Generate plots
             logger.info("Generating plots and analysis...")
             print("\nGenerating plots...")
 
-            # Load predictions, targets, and inputs from saved files
             try:
-                e_hat = np.load(output_dir / "predictions.npy")  # predicted output
-                e = np.load(output_dir / "targets.npy")  # output (target)
-                d = np.load(output_dir / "inputs.npy")  # input
+                e_hat = np.load(output_dir / "predictions.npy")
+                e = np.load(output_dir / "targets.npy")
+                d = np.load(output_dir / "inputs.npy")
 
-                # Select sample indices: always include sample 0, plus 4 random samples
                 num_sequences = e_hat.shape[0]
-                sample_indices = [0]  # Always include sample 0
-
+                sample_indices = [0]
                 if num_sequences > 1:
-                    # Select 4 random samples (excluding sample 0)
                     other_indices = list(range(1, num_sequences))
                     num_random = min(4, len(other_indices))
                     random_indices = np.random.choice(
@@ -477,13 +348,19 @@ def main():
                     ).tolist()
                     sample_indices.extend(random_indices)
 
-                evaluator.plot_predictions(e_hat, e, d, sample_indices=sample_indices)
+                plot_predictions(
+                    evaluator.output_dir, e_hat, e, d,
+                    sample_indices=sample_indices,
+                    warmup_steps=config.training.warmup_steps,
+                )
                 evaluator.analyze_errors(e_hat, e)
                 logger.info("Plots generated successfully")
             except Exception as e_err:
                 logger.warning(f"Failed to generate plots: {e_err}")
 
-        logger.info("Plots and analysis generated")
+            mlflow.log_artifacts(str(output_dir), "evaluation")
+            logger.info("Evaluation artifacts logged to MLflow")
+
         logger.info(f"Predictions plot: {output_dir / 'predictions_plot.png'}")
         logger.info(f"Error analysis: {output_dir / 'error_analysis.png'}")
 
@@ -497,12 +374,8 @@ def main():
     logger.info("=" * 70)
     logger.info(f"Results saved to: {output_dir}")
     logger.info(f"Metrics file: {output_dir / 'evaluation_results.json'}")
-
-    if run_info:
-        logger.info(f"Evaluation metrics logged to training run: {run_id}")
-        print(f"\nEvaluation completed! Metrics logged to MLflow run {run_id[:8]}")
-    else:
-        print(f"\nEvaluation completed! Results saved to {output_dir}")
+    logger.info(f"Evaluation metrics logged to training run: {args.run_id}")
+    print(f"\nEvaluation completed! Metrics logged to MLflow run {args.run_id[:8]}")
 
 
 if __name__ == "__main__":
