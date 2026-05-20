@@ -41,8 +41,6 @@ from sysid.data.direct_loader import load_csv_folder
 from sysid.evaluation import compute_metrics
 from sysid.models import SimpleLure, load_model
 
-UNSTAB_STAB_ZERO = [93, 4, 122]
-
 DEFAULT_DATA_ROOT = "~/genSecSysId-Data"
 
 torch.set_default_dtype(torch.float64)
@@ -281,7 +279,10 @@ class RunComparator:
 
                 if isinstance(model, SimpleLure):
                     result["constraints_satisfied"] = model.check_constraints()
-                    result["alpha"] = model.alpha.item()
+                    # Model stores unconstrained tau; physical alpha = sigmoid(tau).
+                    result["alpha"] = float(
+                        1.0 / (1.0 + np.exp(-model.tau.detach().cpu().numpy()))
+                    )
                     result["s"] = model.s.item()
 
                 results.append(result)
@@ -482,13 +483,10 @@ class RunComparator:
 
         logger.info(f"Plotting trajectory comparison for {num_samples} random samples...")
 
-        # Select random sample indices
-        # num_sequences = test_inputs.shape[0]
-        # if num_sequences < num_samples:
-        #     sample_indices = list(range(num_sequences))
-        # else:
-        #     sample_indices = np.random.choice(num_sequences, size=num_samples, replace=False).tolist()
-        sample_indices = UNSTAB_STAB_ZERO
+        # Pick a few sample indices. Use the first `num_samples` for
+        # reproducibility, clamped to the available test trajectories.
+        num_sequences = test_inputs.shape[0]
+        sample_indices = list(range(min(num_samples, num_sequences)))
 
         # Get predictions from all models (each through its own normalizer).
         predictions_dict = {

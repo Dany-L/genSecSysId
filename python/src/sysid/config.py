@@ -328,16 +328,55 @@ class Config:
         }
 
     def save_yaml(self, path: str):
-        """Save configuration to YAML file."""
+        """Save configuration to YAML file using a safe-load-compatible representation.
+
+        Tuples (e.g. ``OptimizerConfig.betas``) are converted to lists so the
+        resulting file contains no ``!!python/...`` tags and can be read back
+        with ``yaml.safe_load``. ``yaml.safe_dump`` is used as a belt-and-braces
+        check — it raises if any non-trivial Python type sneaks into the dict.
+        """
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
-            yaml.dump(self.to_dict(), f, default_flow_style=False)
+            yaml.safe_dump(
+                _to_safe_yaml(self.to_dict()), f, default_flow_style=False, sort_keys=False
+            )
 
     def save_json(self, path: str):
         """Save configuration to JSON file."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump(self.to_dict(), f, indent=2)
+
+
+def _to_safe_yaml(obj):
+    """Recursively convert tuples to lists so a dict is safe_dump-able."""
+    if isinstance(obj, tuple):
+        return [_to_safe_yaml(x) for x in obj]
+    if isinstance(obj, list):
+        return [_to_safe_yaml(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _to_safe_yaml(v) for k, v in obj.items()}
+    return obj
+
+
+class _SafeLoaderWithTuple(yaml.SafeLoader):
+    """SafeLoader with one extra constructor for legacy ``!!python/tuple`` tags.
+
+    Older per-run YAMLs were written by ``yaml.dump`` and contain a
+    ``!!python/tuple`` tag for ``OptimizerConfig.betas``. We don't want to
+    grant the full unsafe loader (``yaml.full_load`` would happily
+    instantiate *any* tagged Python object), so we extend SafeLoader with
+    a single explicit constructor that maps the tuple tag to a list.
+    """
+
+
+def _construct_python_tuple_as_list(loader, node):
+    return loader.construct_sequence(node)
+
+
+_SafeLoaderWithTuple.add_constructor(
+    "tag:yaml.org,2002:python/tuple", _construct_python_tuple_as_list
+)
 
 
 def resolve_run_artifacts(
@@ -352,9 +391,12 @@ def resolve_run_artifacts(
         <root>/models/<model_type>/<run_id>/normalizer.json
         <root>/models/<model_type>/<run_id>/run_info.json
 
-    The per-run YAML is written by yaml.dump and contains `!!python/tuple`
-    tags (from OptimizerConfig.betas), so yaml.safe_load (what
-    Config.from_yaml uses) can't read it — we use yaml.full_load instead.
+    Newly written per-run YAMLs are safe_load-compatible (Config.save_yaml
+    converts tuples to lists). Older runs were written by yaml.dump and
+    contain ``!!python/tuple`` for OptimizerConfig.betas — we read those
+    with a SafeLoader subclass that adds *only* a tuple constructor, so
+    no arbitrary Python objects can be instantiated even if data_root
+    points at untrusted YAML.
 
     Args:
         run_id: MLflow run id.
@@ -380,7 +422,7 @@ def resolve_run_artifacts(
     config_path = matches[0]
     model_type = config_path.parent.parent.name
     with open(config_path) as f:
-        cfg_dict = yaml.full_load(f)
+        cfg_dict = yaml.load(f, Loader=_SafeLoaderWithTuple)
     config = Config.from_dict(cfg_dict)
 
     run_dir = base / "models" / model_type / run_id
