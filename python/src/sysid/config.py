@@ -1,9 +1,10 @@
 """Configuration management for the system identification package."""
 
 import json
+import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import yaml
 
@@ -334,13 +335,151 @@ class Config:
         }
 
     def save_yaml(self, path: str):
-        """Save configuration to YAML file."""
+        """Save configuration to YAML file using a safe-load-compatible representation.
+
+        Tuples (e.g. ``OptimizerConfig.betas``) are converted to lists so the
+        resulting file contains no ``!!python/...`` tags and can be read back
+        with ``yaml.safe_load``. ``yaml.safe_dump`` is used as a belt-and-braces
+        check — it raises if any non-trivial Python type sneaks into the dict.
+        """
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
-            yaml.dump(self.to_dict(), f, default_flow_style=False)
+            yaml.safe_dump(
+                _to_safe_yaml(self.to_dict()), f, default_flow_style=False, sort_keys=False
+            )
 
     def save_json(self, path: str):
         """Save configuration to JSON file."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump(self.to_dict(), f, indent=2)
+
+
+def _to_safe_yaml(obj):
+    """Recursively convert tuples to lists so a dict is safe_dump-able."""
+    if isinstance(obj, tuple):
+        return [_to_safe_yaml(x) for x in obj]
+    if isinstance(obj, list):
+        return [_to_safe_yaml(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _to_safe_yaml(v) for k, v in obj.items()}
+    return obj
+
+
+class _SafeLoaderWithTuple(yaml.SafeLoader):
+    """SafeLoader with one extra constructor for legacy ``!!python/tuple`` tags.
+
+    Older per-run YAMLs were written by ``yaml.dump`` and contain a
+    ``!!python/tuple`` tag for ``OptimizerConfig.betas``. We don't want to
+    grant the full unsafe loader (``yaml.full_load`` would happily
+    instantiate *any* tagged Python object), so we extend SafeLoader with
+    a single explicit constructor that maps the tuple tag to a list.
+    """
+
+
+def _construct_python_tuple_as_list(loader, node):
+    return loader.construct_sequence(node)
+
+
+_SafeLoaderWithTuple.add_constructor(
+    "tag:yaml.org,2002:python/tuple", _construct_python_tuple_as_list
+)
+
+
+def resolve_run_artifacts(
+    run_id: str,
+    data_root: str = "~/genSecSysId-Data",
+) -> Tuple["Config", Path, Optional[Path], Optional[Dict[str, Any]]]:
+    """Resolve an MLflow training-run id to all per-run artefacts on disk.
+
+    train.py writes the run files to a standard layout:
+        <root>/outputs/<model_type>/<run_id>/config.yaml
+        <root>/models/<model_type>/<run_id>/best_model.pt
+        <root>/models/<model_type>/<run_id>/normalizer.json
+        <root>/models/<model_type>/<run_id>/run_info.json
+
+    Newly written per-run YAMLs are safe_load-compatible (Config.save_yaml
+    converts tuples to lists). Older runs were written by yaml.dump and
+    contain ``!!python/tuple`` for OptimizerConfig.betas — we read those
+    with a SafeLoader subclass that adds *only* a tuple constructor, so
+    no arbitrary Python objects can be instantiated even if data_root
+    points at untrusted YAML.
+
+    Args:
+        run_id: MLflow run id.
+        data_root: Base directory containing outputs/ and models/. The
+            <model_type> subfolder is discovered automatically.
+
+    Returns:
+        config:          Config object reconstructed from the run YAML.
+        model_path:      Path to best_model.pt (raises if missing).
+        normalizer_path: Path to normalizer.json, or None if not saved.
+        run_info:        Dict from run_info.json, or None if not saved.
+    """
+    base = Path(data_root).expanduser()
+    matches = list(base.glob(f"outputs/*/{run_id}/config.yaml"))
+    if not matches:
+        raise FileNotFoundError(
+            f"No config.yaml found for run_id={run_id} under {base / 'outputs'}/*/"
+        )
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Multiple configs match run_id={run_id}: {[str(p) for p in matches]}"
+        )
+    config_path = matches[0]
+    model_type = config_path.parent.parent.name
+    with open(config_path) as f:
+        cfg_dict = yaml.load(f, Loader=_SafeLoaderWithTuple)
+    config = Config.from_dict(cfg_dict)
+
+    run_dir = base / "models" / model_type / run_id
+    model_path = run_dir / "best_model.pt"
+    if not model_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found at {model_path}")
+
+    normalizer_path = run_dir / "normalizer.json"
+    if not normalizer_path.exists():
+        normalizer_path = None
+
+    run_info = None
+    run_info_path = run_dir / "run_info.json"
+    if run_info_path.exists():
+        with open(run_info_path) as f:
+            run_info = json.load(f)
+
+    return config, model_path, normalizer_path, run_info
+
+
+def setup_mlflow_tracking(
+    config: "Config",
+    override_uri: Optional[str] = None,
+) -> None:
+    """Configure MLflow tracking URI and experiment from a Config.
+
+    Mirrors scripts/train.py: prefer the configured tracking URI, fall back
+    to local file-based tracking if the remote isn't reachable. Then sets
+    the experiment so subsequent ``mlflow.start_run(...)`` calls land in
+    the right place.
+
+    Args:
+        config: A Config with ``mlflow.tracking_uri`` and
+            ``mlflow.experiment_name``.
+        override_uri: Optional CLI override taking precedence over the
+            config's tracking URI.
+    """
+    import mlflow  # imported lazily so sysid.config has no hard mlflow dep
+
+    log = logging.getLogger(__name__)
+    uri = override_uri if override_uri is not None else config.mlflow.tracking_uri
+    if uri:
+        try:
+            mlflow.set_tracking_uri(uri)
+            log.info(f"MLflow tracking URI: {uri}")
+        except Exception as e:
+            log.warning(f"Failed to connect to MLflow server: {e}")
+            log.warning("Falling back to local file-based tracking")
+            mlflow.set_tracking_uri(None)
+    else:
+        log.info("Using local file-based MLflow tracking (./mlruns)")
+    mlflow.set_experiment(config.mlflow.experiment_name)
+    log.info(f"MLflow experiment: {config.mlflow.experiment_name}")

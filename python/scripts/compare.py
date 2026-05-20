@@ -35,12 +35,13 @@ import seaborn as sns
 import tikzplotlib
 import torch
 
-from sysid.data import DataLoader, DataNormalizer
-from sysid.data.direct_loader import load_csv_folder, load_split_data
+from sysid.config import resolve_run_artifacts, setup_mlflow_tracking
+from sysid.data import DataNormalizer
+from sysid.data.direct_loader import load_csv_folder
 from sysid.evaluation import compute_metrics
-from sysid.models import SimpleLure
+from sysid.models import SimpleLure, load_model
 
-UNSTAB_STAB_ZERO = [93, 4, 122]
+DEFAULT_DATA_ROOT = "~/genSecSysId-Data"
 
 torch.set_default_dtype(torch.float64)
 
@@ -57,176 +58,236 @@ warnings.filterwarnings("ignore")
 class RunComparator:
     """Compare multiple MLflow runs."""
 
-    def __init__(self, run_ids: List[str], test_data_path: Optional[str] = None):
+    def __init__(
+        self,
+        run_ids: List[str],
+        test_data_path: Optional[str] = None,
+        data_root: str = DEFAULT_DATA_ROOT,
+    ):
         """
         Initialize the comparator.
 
         Args:
             run_ids: List of MLflow run IDs to compare
-            test_data_path: Path to test data (folder or CSV). If None, uses data from run artifacts.
+            test_data_path: Path to test data (folder). If None, defaults to
+                the test/ split under the first run's config.data.train_path.
+            data_root: Base directory under which per-run artefacts live
+                (config.yaml, best_model.pt, normalizer.json, training_history.json).
         """
         self.run_ids = run_ids
+        self.data_root = data_root
         self.test_data_path = test_data_path
         self.runs_info = []
-        self.models = {}
-        self.metrics = {}
-        self.histories = {}
+        self.configs: Dict[str, Any] = {}
+        self.models: Dict[str, Any] = {}
+        self.normalizers: Dict[str, Any] = {}
+        self.metrics: Dict[str, Any] = {}
+        self.histories: Dict[str, Any] = {}
 
     def load_runs(self):
-        """Load information, models, and metrics from all runs."""
-        logger.info(f"Loading {len(self.run_ids)} MLflow runs...")
+        """Load configs, models, normalizers, and training histories from disk.
+
+        MLflow metadata (params, metrics, run name) is fetched best-effort —
+        if the tracking server is unreachable, we still proceed with the
+        artefacts that are available locally.
+        """
+        logger.info(f"Loading {len(self.run_ids)} runs from {self.data_root} ...")
 
         for run_id in self.run_ids:
             try:
-                run = mlflow.get_run(run_id)
-                run_info = {
-                    "run_id": run_id,
-                    "run_name": run.data.tags.get("mlflow.runName", run_id[:8]),
-                    "experiment_id": run.info.experiment_id,
-                    "start_time": run.info.start_time,
-                    "end_time": run.info.end_time,
-                    "status": run.info.status,
-                    "params": run.data.params,
-                    "metrics": run.data.metrics,
-                }
-                self.runs_info.append(run_info)
+                config, model_path, normalizer_path, run_info_disk = resolve_run_artifacts(
+                    run_id, data_root=self.data_root
+                )
+            except Exception as e:
+                logger.error(f"Failed to resolve run {run_id}: {e}")
+                continue
 
-                # Load model if available
+            self.configs[run_id] = config
+
+            # MLflow metadata is fetched separately in fetch_mlflow_metadata()
+            # so the tracking URI can be configured first.
+            self.runs_info.append({
+                "run_id": run_id,
+                "run_name": (
+                    run_info_disk.get("run_name") if run_info_disk else None
+                ) or run_id[:8],
+                "params": {},
+                "metrics": {},
+            })
+
+            # Load model + normalizer from local disk.
+            try:
+                model = load_model(str(model_path), config, device="cpu")
+                model.eval()
+                self.models[run_id] = model
+                logger.info(f"✓ Loaded model for run {run_id[:8]}")
+            except Exception as e:
+                logger.warning(f"Could not load model for run {run_id[:8]}: {e}")
+                continue
+
+            if normalizer_path is not None:
                 try:
-                    model_uri = f"runs:/{run_id}/model"
-                    model = mlflow.pytorch.load_model(model_uri)
-                    self.models[run_id] = model
-                    logger.info(f"✓ Loaded model for run {run_id[:8]}")
+                    self.normalizers[run_id] = DataNormalizer.load(str(normalizer_path))
                 except Exception as e:
-                    logger.warning(f"Could not load model for run {run_id[:8]}: {e}")
+                    logger.warning(f"Could not load normalizer for run {run_id[:8]}: {e}")
 
-                # Load training history if available
+            # Load training history from the per-run output dir.
+            history_path = (
+                Path(self.data_root).expanduser()
+                / "outputs" / config.model.model_type / run_id / "training_history.json"
+            )
+            if history_path.exists():
                 try:
-                    history_path = mlflow.artifacts.download_artifacts(
-                        run_id=run_id, artifact_path="outputs/training_history.json"
-                    )
-                    history = json.load(open(history_path, "r"))
+                    with open(history_path) as f:
+                        history = json.load(f)
                     self.histories[run_id] = {
-                        "train_losses": history["train_losses"],
-                        "val_losses": history["val_losses"],
-                        "train_pred_losses": history.get("train_pred_losses", None),
-                        "train_reg_losses": history.get("train_reg_losses", None),
+                        "train_losses": history.get("train_losses"),
+                        "val_losses": history.get("val_losses"),
+                        "train_pred_losses": history.get("train_pred_losses"),
+                        "train_reg_losses": history.get("train_reg_losses"),
                     }
                     logger.info(f"✓ Loaded training history for run {run_id[:8]}")
                 except Exception as e:
-                    logger.warning(f"Could not load training history for run {run_id[:8]}: {e}")
+                    logger.warning(f"Could not load training history for {run_id[:8]}: {e}")
+            else:
+                logger.warning(f"No training_history.json at {history_path}")
 
+        logger.info(f"Successfully loaded {len(self.configs)} runs")
+
+    def fetch_mlflow_metadata(self):
+        """Best-effort fetch of run params/metrics from MLflow.
+
+        Call this AFTER `setup_mlflow_tracking` so the tracking URI points
+        at the server the runs were logged to. Failures are logged and
+        skipped; summary fields fall back to "N/A".
+        """
+        for info in self.runs_info:
+            run_id = info["run_id"]
+            try:
+                run = mlflow.get_run(run_id)
+                info["run_name"] = run.data.tags.get("mlflow.runName", info["run_name"])
+                info["params"] = dict(run.data.params)
+                info["metrics"] = dict(run.data.metrics)
             except Exception as e:
-                logger.error(f"Failed to load run {run_id}: {e}")
+                logger.warning(f"Could not fetch MLflow metadata for {run_id[:8]}: {e}")
 
-        logger.info(f"Successfully loaded {len(self.runs_info)} runs")
+    def _first_config(self):
+        """Return any one of the loaded configs (used as the column-name reference)."""
+        if not self.configs:
+            return None
+        return next(iter(self.configs.values()))
+
+    def _predict(self, run_id: str, test_inputs: np.ndarray, test_states: Optional[np.ndarray]):
+        """Run a single model end-to-end with its own normalizer.
+
+        Returns predictions in physical (denormalized) units.
+        """
+        model = self.models[run_id]
+        normalizer = self.normalizers.get(run_id)
+
+        inputs = test_inputs
+        if normalizer is not None:
+            inputs = normalizer.transform_inputs(inputs)
+        inputs_tensor = torch.as_tensor(inputs, dtype=torch.float64)
+        if test_states is not None:
+            x0 = torch.as_tensor(test_states[:, 0, :], dtype=torch.float64)
+        else:
+            x0 = None
+
+        with torch.no_grad():
+            out = model(inputs_tensor, x0=x0)
+        # Some models return tuples — first element is e_hat.
+        e_hat = out[0] if isinstance(out, tuple) else out
+        predictions = e_hat.cpu().numpy()
+        if normalizer is not None:
+            predictions = normalizer.inverse_transform_outputs(predictions)
+        return predictions
+
+    def _load_test_data(self):
+        """Load test data using column names from the first loaded run's config.
+
+        Defaults the test path to `<first_config.data.train_path>/test` when
+        none was provided on the CLI. Returns (inputs, outputs, states) or
+        (None, None, None) on failure.
+        """
+        ref_config = self._first_config()
+        if ref_config is None:
+            logger.warning("No configs loaded — can't determine column names.")
+            return None, None, None
+
+        if self.test_data_path is None:
+            data_base = Path(ref_config.data.train_path).expanduser()
+            test_path = data_base / "test"
+            logger.info(f"--test-data not provided, defaulting to {test_path}")
+        else:
+            test_path = Path(self.test_data_path).expanduser()
+
+        if not test_path.is_dir():
+            logger.error(f"Test data path is not a directory: {test_path}")
+            return None, None, None
+
+        state_col = getattr(ref_config.data, "state_col", None)
+        if state_col and len(state_col) == 0:
+            state_col = None
+        try:
+            inputs, outputs, states, filenames = load_csv_folder(
+                folder_path=str(test_path),
+                input_col=ref_config.data.input_col,
+                output_col=ref_config.data.output_col,
+                state_col=state_col,
+                pattern=getattr(ref_config.data, "pattern", "*.csv"),
+            )
+        except Exception as e:
+            logger.error(f"Failed to load test data: {e}")
+            return None, None, None
+
+        logger.info(f"Loaded {len(filenames)} files from {test_path}")
+        if states is not None:
+            logger.info(f"  states: {states.shape}")
+        return inputs, outputs, states
 
     def evaluate_models(self) -> pd.DataFrame:
         """
         Evaluate all models on test data and return comparison table.
 
-        Returns:
-            DataFrame with evaluation metrics for each run
+        Each model is fed through its own normalizer so predictions are
+        computed (and compared to ground truth) in physical units.
         """
         if not self.models:
             logger.warning("No models loaded, skipping evaluation")
             return pd.DataFrame()
 
         logger.info("Evaluating models on test data...")
+        test_inputs, test_outputs, test_states = self._load_test_data()
+        if test_inputs is None:
+            return pd.DataFrame()
 
-        # Load test data using the same approach as evaluate.py
-        test_inputs = None
-        test_outputs = None
-        test_states = None
-
-        if self.test_data_path:
-            try:
-                test_path = Path(self.test_data_path)
-
-                if test_path.is_dir():
-                    # Check if it's a structured data directory (with train/test/validation subfolders)
-
-                    # Single folder with CSV files (backward compatibility)
-                    logger.info("Loading directly from CSV folder...")
-                    logger.info(f"Test data directory: {self.test_data_path}")
-
-                    test_inputs, test_outputs, test_states, filenames = load_csv_folder(
-                        folder_path=str(test_path),
-                        input_col=["d"],
-                        output_col=["e"],
-                        state_col=["x_1", "x_2"],  # Adjust based on your data
-                        pattern="*.csv",
-                    )
-                    logger.info(f"Loaded {len(filenames)} files from test set")
-                    if test_states is not None:
-                        logger.info(f"State information loaded: {test_states.shape}")
-                else:
-                    raise ValueError(
-                        f"Unsupported data format: {self.test_data_path}\n"
-                        f"Use either:\n"
-                        f"  1. Prepared data folder: 'data/prepared' with test/ subfolder\n"
-                        f"  2. Test folder: 'data/prepared/test' with CSV files\n"
-                        f"  3. Single CSV file: 'data/test.csv'\n"
-                        f"  4. NPY file: 'data/test_inputs.npy'"
-                    )
-
-                logger.info(
-                    f"Test data loaded: inputs={test_inputs.shape}, outputs={test_outputs.shape}"
-                )
-
-            except Exception as e:
-                logger.error(f"Failed to load test data: {e}")
-                logger.exception("Full traceback:")
-                return pd.DataFrame()
-
-        # Evaluate each model
         results = []
         for run_id, model in self.models.items():
             try:
                 run_info = next(r for r in self.runs_info if r["run_id"] == run_id)
+                predictions = self._predict(run_id, test_inputs, test_states)
+                metrics = compute_metrics(predictions, test_outputs)
 
-                # Set model to evaluation mode
-                model.eval()
-                with torch.no_grad():
-                    # Convert to tensors
-                    inputs_tensor = torch.Tensor(test_inputs)
-                    outputs_tensor = torch.Tensor(test_outputs)
+                result = {
+                    "run_id": run_id[:8],
+                    "run_name": run_info["run_name"],
+                    "model_type": run_info["params"].get("model_type", "unknown"),
+                    "hidden_size": run_info["params"].get("hidden_size", "N/A"),
+                    **metrics,
+                }
 
-                    # Get initial states
-                    if test_states is not None:
-                        states_tensor = torch.Tensor(test_states)
-                        x0 = states_tensor[:, 0, :]
-                    else:
-                        x0 = None
-
-                    # Forward pass
-                    predictions = model(inputs_tensor, x0=x0)
-
-                    # Compute metrics
-                    metrics = compute_metrics(
-                        predictions.numpy(),
-                        test_outputs,
+                if isinstance(model, SimpleLure):
+                    result["constraints_satisfied"] = model.check_constraints()
+                    # Model stores unconstrained tau; physical alpha = sigmoid(tau).
+                    result["alpha"] = float(
+                        1.0 / (1.0 + np.exp(-model.tau.detach().cpu().numpy()))
                     )
+                    result["s"] = model.s.item()
 
-                    # Add run information
-                    result = {
-                        "run_id": run_id[:8],
-                        "run_name": run_info["run_name"],
-                        "model_type": run_info["params"].get("model_type", "unknown"),
-                        "hidden_size": run_info["params"].get("hidden_size", "N/A"),
-                        **metrics,
-                    }
-
-                    # Add stability info for SimpleLure models
-                    if isinstance(model, SimpleLure):
-                        result["constraints_satisfied"] = model.check_constraints()
-                        result["alpha"] = model.alpha.item()
-                        result["s"] = model.s.item()
-
-                    results.append(result)
-                    self.metrics[run_id] = metrics
-                    logger.info(f"✓ Evaluated run {run_id[:8]}")
-
+                results.append(result)
+                self.metrics[run_id] = metrics
+                logger.info(f"✓ Evaluated run {run_id[:8]}")
             except Exception as e:
                 logger.error(f"Failed to evaluate run {run_id}: {e}")
 
@@ -422,29 +483,16 @@ class RunComparator:
 
         logger.info(f"Plotting trajectory comparison for {num_samples} random samples...")
 
-        # Select random sample indices
-        # num_sequences = test_inputs.shape[0]
-        # if num_sequences < num_samples:
-        #     sample_indices = list(range(num_sequences))
-        # else:
-        #     sample_indices = np.random.choice(num_sequences, size=num_samples, replace=False).tolist()
-        sample_indices = UNSTAB_STAB_ZERO
+        # Pick a few sample indices. Use the first `num_samples` for
+        # reproducibility, clamped to the available test trajectories.
+        num_sequences = test_inputs.shape[0]
+        sample_indices = list(range(min(num_samples, num_sequences)))
 
-        # Get predictions from all models
-        predictions_dict = {}
-        for run_id, model in self.models.items():
-            model.eval()
-            with torch.no_grad():
-                inputs_tensor = torch.Tensor(test_inputs)
-
-                if test_states is not None:
-                    states_tensor = torch.Tensor(test_states)
-                    x0 = states_tensor[:, 0, :]
-                else:
-                    x0 = None
-
-                predictions = model(inputs_tensor, x0=x0)
-                predictions_dict[run_id] = predictions.numpy()
+        # Get predictions from all models (each through its own normalizer).
+        predictions_dict = {
+            run_id: self._predict(run_id, test_inputs, test_states)
+            for run_id in self.models
+        }
 
         # Determine output dimensions
         output_dim = test_outputs.shape[2]
@@ -478,7 +526,6 @@ class RunComparator:
 
                 # Plot predictions from each model
                 for run_id, predictions in predictions_dict.items():
-                    run_info = next(r for r in self.runs_info if r["run_id"] == run_id)
                     short_id = run_id[:8]
                     ax.plot(
                         time_steps,
@@ -551,21 +598,11 @@ class RunComparator:
                 num_sequences, size=num_samples, replace=False
             ).tolist()
 
-        # Get predictions from all models
-        predictions_dict = {}
-        for run_id, model in self.models.items():
-            model.eval()
-            with torch.no_grad():
-                inputs_tensor = torch.Tensor(test_inputs)
-
-                if test_states is not None:
-                    states_tensor = torch.Tensor(test_states)
-                    x0 = states_tensor[:, 0, :]
-                else:
-                    x0 = None
-
-                predictions = model(inputs_tensor, x0=x0)
-                predictions_dict[run_id] = predictions.numpy()
+        # Get predictions from all models (each through its own normalizer).
+        predictions_dict = {
+            run_id: self._predict(run_id, test_inputs, test_states)
+            for run_id in self.models
+        }
 
         # Determine output dimensions
         output_dim = test_outputs.shape[2]
@@ -642,27 +679,9 @@ class RunComparator:
         print(summary_df.to_string(index=False))
         print("=" * 80 + "\n")
 
-        # Load test data for trajectory comparison
-        test_inputs = None
-        test_outputs = None
-        test_states = None
-
-        if self.test_data_path:
-            try:
-                test_path = Path(self.test_data_path)
-
-                if test_path.is_dir():
-                    logger.info("Loading test data for trajectory comparison...")
-                    test_inputs, test_outputs, test_states, filenames = load_csv_folder(
-                        folder_path=str(test_path),
-                        input_col=["d"],
-                        output_col=["e"],
-                        state_col=["x_1", "x_2"],
-                        pattern="*.csv",
-                    )
-                    logger.info(f"Loaded test data: {test_inputs.shape}")
-            except Exception as e:
-                logger.warning(f"Could not load test data for trajectory comparison: {e}")
+        # Load test data for trajectory comparison (uses column names from the
+        # first loaded run's config).
+        test_inputs, test_outputs, test_states = self._load_test_data()
 
         # 2. Evaluation metrics table
         eval_df = self.evaluate_models()
@@ -724,10 +743,16 @@ def parse_args():
     parser.add_argument("--run-ids", nargs="+", required=True, help="MLflow run IDs to compare")
 
     parser.add_argument(
+        "--data-root", type=str, default=DEFAULT_DATA_ROOT,
+        help=f"Base directory for per-run artefacts (default: {DEFAULT_DATA_ROOT}).",
+    )
+
+    parser.add_argument(
         "--test-data",
         type=str,
         default=None,
-        help="Path to test data (folder or CSV). If not provided, uses data from run artifacts.",
+        help="Path to test data folder. Defaults to <config.data.train_path>/test "
+             "of the first loaded run.",
     )
 
     parser.add_argument(
@@ -741,7 +766,8 @@ def parse_args():
         "--mlflow-tracking-uri",
         type=str,
         default=None,
-        help="MLflow tracking URI (default: uses current tracking URI)",
+        help="Override MLflow tracking URI from the first run's config "
+             "(default: use config).",
     )
 
     return parser.parse_args()
@@ -751,17 +777,23 @@ def main():
     """Main entry point."""
     args = parse_args()
 
-    # Set MLflow tracking URI if provided
-    if args.mlflow_tracking_uri:
-        mlflow.set_tracking_uri(args.mlflow_tracking_uri)
-
-    logger.info(f"Using MLflow tracking URI: {mlflow.get_tracking_uri()}")
-
-    # Create comparator
-    comparator = RunComparator(run_ids=args.run_ids, test_data_path=args.test_data)
-
-    # Load runs
+    # Create comparator and load runs (configs + models + normalizers from disk).
+    comparator = RunComparator(
+        run_ids=args.run_ids,
+        test_data_path=args.test_data,
+        data_root=args.data_root,
+    )
     comparator.load_runs()
+
+    # Set up MLflow using the first loaded run's config (with optional CLI override),
+    # then enrich each run with params/metrics from the server.
+    ref_config = comparator._first_config()
+    if ref_config is not None:
+        setup_mlflow_tracking(ref_config, override_uri=args.mlflow_tracking_uri)
+    elif args.mlflow_tracking_uri:
+        mlflow.set_tracking_uri(args.mlflow_tracking_uri)
+    logger.info(f"Using MLflow tracking URI: {mlflow.get_tracking_uri()}")
+    comparator.fetch_mlflow_metadata()
 
     # Generate report
     output_dir = Path(args.output_dir)

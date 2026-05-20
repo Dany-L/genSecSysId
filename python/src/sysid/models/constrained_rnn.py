@@ -1127,14 +1127,15 @@ class SimpleLure(nn.Module):
         # logger.info(f"SDP analysis problem solved: {problem.status}")
 
         # self.s.data = 1/torch.sqrt(torch.tensor(S_hat.value).squeeze())
-        self.P.data = torch.tensor(P.value)
+        device, dtype = self.P.device, self.P.dtype
+        self.P.data = torch.tensor(P.value, device=device, dtype=dtype)
         # self.M.data = torch.tensor(M.value)
-        self.la.data = torch.tensor(np.diag(M.value))
+        self.la.data = torch.tensor(np.diag(M.value), device=device, dtype=dtype)
         if self.learn_L:
-            self.L.data = torch.tensor(L.value)
+            self.L.data = torch.tensor(L.value, device=device, dtype=dtype)
         if learn_B_and_D21:
-            self.B.data = torch.tensor(B.value)
-            self.D21.data = torch.tensor(D21.value)
+            self.B.data = torch.tensor(B.value, device=device, dtype=dtype)
+            self.D21.data = torch.tensor(D21.value, device=device, dtype=dtype)
 
         # self.s.data = torch.tensor(np.sqrt(1/s_hat.value).squeeze())
 
@@ -1233,19 +1234,20 @@ class SimpleLure(nn.Module):
             return False  # SDP failed to find feasible solution    
         logger.info(f"SDP analysis problem solved: {problem.status}")
 
+        device, dtype = self.P.device, self.P.dtype
         if self.learn_L:
-            s = 1/torch.sqrt(torch.tensor(s_hat.value).squeeze())
+            s = 1/torch.sqrt(torch.tensor(s_hat.value, device=device, dtype=dtype).squeeze())
             self.s.data = s
             logger.info(f"  Initial s from SDP: {s.item():.6f}")
-        self.P.data = torch.tensor(P.value)
-        self.la.data = torch.tensor(np.diag(M.value))
+        self.P.data = torch.tensor(P.value, device=device, dtype=dtype)
+        self.la.data = torch.tensor(np.diag(M.value), device=device, dtype=dtype)
         # self.M.data = torch.tensor(M.value)
         if self.learn_L:
-            self.L.data = torch.tensor(L.value)
+            self.L.data = torch.tensor(L.value, device=device, dtype=dtype)
         if learn_B:
-            self.B.data = torch.tensor(B.value)
+            self.B.data = torch.tensor(B.value, device=device, dtype=dtype)
         if learn_D21:
-            self.D21.data = torch.tensor(D21.value)
+            self.D21.data = torch.tensor(D21.value, device=device, dtype=dtype)
 
 
         return True  # SDP successfully found feasible solution
@@ -1256,15 +1258,17 @@ class SimpleLure(nn.Module):
         alpha = 1/(1+ torch.exp(-self.tau))
         M = torch.diag(self.la)
         def stability_lmi() -> torch.Tensor:
+            device = self.P.device
+            dtype = self.P.dtype
             F = torch_bmat(
                 [
                     [
                         -alpha**2 * self.P,
-                        torch.zeros((self.nx, self.nd)),
+                        torch.zeros((self.nx, self.nd), device=device, dtype=dtype),
                         self.P @ self.C2.T + self.L.T,
                         self.P @ self.A.T,
                     ],
-                    [torch.zeros((self.nd, self.nx)), -torch.eye(self.nd), self.D21.T, self.B.T],
+                    [torch.zeros((self.nd, self.nx), device=device, dtype=dtype), -torch.eye(self.nd, device=device, dtype=dtype), self.D21.T, self.B.T],
                     [self.C2 @ self.P + self.L, self.D21, -2 * M, M @ self.B2.T],
                     [self.A @ self.P, self.B, self.B2 @ M, -self.P],
                 ]
@@ -1333,7 +1337,7 @@ class SimpleLure(nn.Module):
 
     def _prepare_x0(self, x0: Optional[torch.Tensor], B: int) -> torch.Tensor:
         if x0 is None:
-            return torch.zeros(size=(B, self.nx, 1))
+            return torch.zeros(size=(B, self.nx, 1), device=self.P.device, dtype=self.P.dtype)
         # Handle padding if pad_state is enabled and x0 comes from dataset (nx_data dim)
         if self.pad_state and x0.shape[1] == self.nx_data:
             x0_padded = torch.zeros(B, self.nx, 1, device=x0.device, dtype=x0.dtype)
@@ -1563,11 +1567,12 @@ class SimpleLure(nn.Module):
                 logger.info(f"Locality LMI satisfied: min eigenvalue = {min_eig_Gi:.6e}")
 
         # update model parameters
-        self.P.data = torch.tensor(P.value)
-        self.L.data = torch.tensor(L.value)
-        self.la.data = torch.tensor(np.diag(M.value))
+        device, dtype = self.P.device, self.P.dtype
+        self.P.data = torch.tensor(P.value, device=device, dtype=dtype)
+        self.L.data = torch.tensor(L.value, device=device, dtype=dtype)
+        self.la.data = torch.tensor(np.diag(M.value), device=device, dtype=dtype)
         # self.M = torch.diag(self.la)
-        self.s.data = torch.tensor(s_star)
+        self.s.data = torch.tensor(s_star, device=device, dtype=dtype)
 
 
         # calculate output bound

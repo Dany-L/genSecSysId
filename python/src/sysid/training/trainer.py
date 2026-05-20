@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -634,9 +635,12 @@ class Trainer:
 
         # Epoch-level progress bar
         pbar = tqdm(range(max_epochs), desc="Training Progress")
+        epoch_times = []
+        train_start_time = time.perf_counter()
 
         for epoch in pbar:
             self.current_epoch = epoch
+            epoch_start = time.perf_counter()
 
             # Train (returns dict with loss and gradient stats)
             train_results = self.train_epoch()
@@ -670,6 +674,13 @@ class Trainer:
             val_loss = val_results["val_loss"]
             val_loss_div = val_results["val_loss_div"]
             self.val_losses.append(val_loss)
+
+            # Synchronize CUDA so the wall-clock time reflects completed GPU work,
+            # not just queued kernels.
+            if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+                torch.cuda.synchronize()
+            epoch_time_sec = time.perf_counter() - epoch_start
+            epoch_times.append(epoch_time_sec)
             if val_loss_div is not None:
                 self.val_div_losses.append(val_loss_div)
             # print(f'Epoch {epoch}: constraints satisfied={self.model.check_constraints()}')
@@ -691,6 +702,7 @@ class Trainer:
                 "val_loss": f"{val_loss:.4f}",
                 "best_val": f"{self.best_val_loss:.4f}",
                 "constraints": f"{self.model.check_constraints()}",
+                "epoch_s": f"{epoch_time_sec:.2f}",
             }
             if train_pred_loss_div is not None:
                 progress_metrics["pred_div"] = f"{train_pred_loss_div:.4f}"
@@ -719,6 +731,7 @@ class Trainer:
                 if val_loss_div is not None:
                     mlflow.log_metric("val_loss_div", val_loss_div, step=epoch)
                 mlflow.log_metric("lr", self.optimizer.param_groups[0]["lr"], step=epoch)
+                mlflow.log_metric("epoch_time_sec", epoch_time_sec, step=epoch)
                 if self.regularization_weight > 0:
                     mlflow.log_metric(
                         "regularization_weight", self.regularization_weight, step=epoch
@@ -819,6 +832,25 @@ class Trainer:
         # Close progress bar
         pbar.close()
 
+        total_train_time = time.perf_counter() - train_start_time
+        if epoch_times:
+            mean_epoch = float(np.mean(epoch_times))
+            median_epoch = float(np.median(epoch_times))
+            # Use last-half mean to exclude warmup epochs (SDP init, JIT, cache fills).
+            steady_epoch = float(np.mean(epoch_times[len(epoch_times) // 2 :]))
+            print("\n=== Timing summary ===")
+            print(f"Device:                 {self.device}")
+            print(f"Epochs run:             {len(epoch_times)}")
+            print(f"Total wall time (s):    {total_train_time:.2f}")
+            print(f"Mean epoch (s):         {mean_epoch:.3f}")
+            print(f"Median epoch (s):       {median_epoch:.3f}")
+            print(f"Mean epoch, last half:  {steady_epoch:.3f}")
+            if self.mlflow_tracking:
+                mlflow.log_metric("total_train_time_sec", total_train_time)
+                mlflow.log_metric("mean_epoch_time_sec", mean_epoch)
+                mlflow.log_metric("median_epoch_time_sec", median_epoch)
+                mlflow.log_metric("steady_state_epoch_time_sec", steady_epoch)
+
         # Save final model
         self.save_checkpoint("final_model.pt")
 
@@ -842,6 +874,8 @@ class Trainer:
             "best_val_loss": self.best_val_loss,
             "best_epoch": self.best_epoch,
             "final_epoch": self.current_epoch,
+            "epoch_times_sec": epoch_times,
+            "total_time": total_train_time,
         }
 
         with open(self.output_dir / "training_history.json", "w") as f:
@@ -880,29 +914,12 @@ class Trainer:
         # The best model weights are available as artifacts/models/best_model.pt
         if self.mlflow_tracking and "final" in filename:
             try:
-                # Get a sample batch from train_loader for input example
-                sample_batch = next(iter(self.train_loader))
-                if isinstance(sample_batch, (tuple, list)):
-                    if len(sample_batch) == 3:
-                        sample_input, _, _ = sample_batch  # (input, output, initial_state)
-                    elif len(sample_batch) >= 2:
-                        sample_input, _ = sample_batch  # (input, output)
-                    else:
-                        sample_input = sample_batch[0]
-                else:
-                    sample_input = sample_batch
-
-                # Move to correct device and get a single sample
-                sample_input = sample_input[:1].to(self.device)
-
-                # Log model with input example (auto-generates signature)
-                mlflow.pytorch.log_model(
-                    pytorch_model=self.model, name="model", input_example=sample_input.cpu().numpy()
-                )
+                # Log the already-saved checkpoint as an artifact.
+                # mlflow.log_artifact uses the legacy artifacts API and is
+                # compatible with all MLflow tracking server versions.
+                mlflow.log_artifact(str(checkpoint_path), artifact_path="model")
             except Exception as e:
-                # Fallback: log without input example if something goes wrong
-                print(f"Warning: Could not create input example for model signature: {e}")
-                mlflow.pytorch.log_model(pytorch_model=self.model, name="model")
+                print(f"Warning: Could not log model artifact to MLflow: {e}")
 
     def save_parameters_mat(self, filename: str):
         """
