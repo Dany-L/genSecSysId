@@ -46,6 +46,8 @@ class Trainer:
         log_gradients: bool = True,
         warmup_steps: int = 0,
         input_regularization_weight: float = 0.01,
+        train_div_loader: Optional[DataLoader] = None,
+        val_div_loader: Optional[DataLoader] = None,
     ):
         """
         Initialize trainer.
@@ -73,6 +75,8 @@ class Trainer:
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.train_div_loader = train_div_loader
+        self.val_div_loader = val_div_loader
         self.loss_fn = loss_fn
         self.optimizer = optimizer
         self.device = device
@@ -116,6 +120,9 @@ class Trainer:
         self.train_reg_feasibility = []
         self.train_reg_inputs = []
         self.val_losses = []
+        # Diverging-trajectory metric histories (populated when *_div loaders are provided)
+        self.train_div_losses = []
+        self.val_div_losses = []
 
         # Scheduler (can be set later)
         self.scheduler = None
@@ -196,8 +203,9 @@ class Trainer:
             ellipse_plot_path = temp_output_dir / f"ellipse-{name}.png"
             fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
-            if self.mlflow_tracking:
-                mlflow.log_artifact(str(ellipse_plot_path), artifact_path="predictions")
+            # Plots are uploaded in bulk by train.py via log_artifacts at the
+            # end of training (avoids the predictions/ vs outputs/predictions/
+            # duplicate in MLflow).
 
         # Generate plot
         plot_path = temp_output_dir / f"{name}.png"
@@ -211,9 +219,84 @@ class Trainer:
             warmup_steps=self.warmup_steps,
         )
 
-        # Log to MLflow
-        if self.mlflow_tracking:
-            mlflow.log_artifact(str(plot_path), artifact_path="predictions")
+    def plot_trajectories_div(self, normalizer=None, name="initial_trajectories_div"):
+        """Plot model predictions on diverging validation trajectories.
+
+        Mirrors plot_trajectories() but iterates val_div_loader (batch_size=1,
+        variable length) and runs the model with warmup_steps=0. Trajectories
+        are NaN-padded to a common length only for the plotting call so the
+        existing plot_predictions can index them; matplotlib skips NaN points.
+        """
+        if self.val_div_loader is None:
+            return
+
+        output_dir = self.output_dir / "predictions"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        all_e_hat = []
+        all_e = []
+        all_d = []
+        self.model.eval()
+        with torch.no_grad():
+            for batch in self.val_div_loader:
+                if len(batch) == 3:
+                    d, e, x0 = batch
+                    x0 = None
+                else:
+                    d, e = batch
+                    x0 = None
+                d = d.to(self.device)
+                e = e.to(self.device)
+                e_hat, _, _ = self.model(d, x0, warmup_steps=0)
+                e_hat_np = e_hat.cpu().numpy()
+                e_np = e.cpu().numpy()
+                d_np = d.cpu().numpy()
+                if normalizer is not None:
+                    e_hat_np = normalizer.inverse_transform_outputs(e_hat_np)
+                    e_np = normalizer.inverse_transform_outputs(e_np)
+                    d_np = normalizer.inverse_transform_inputs(d_np)
+                # Each batch is (1, T_i, n) — unwrap to (T_i, n).
+                all_e_hat.append(e_hat_np[0])
+                all_e.append(e_np[0])
+                all_d.append(d_np[0])
+
+        if not all_e_hat:
+            return
+
+        # NaN-pad to a common length so plot_predictions can index by sample.
+        max_len = max(a.shape[0] for a in all_e_hat)
+
+        def _pad(arrays, n_cols):
+            out = np.full((len(arrays), max_len, n_cols), np.nan)
+            for i, a in enumerate(arrays):
+                out[i, : a.shape[0], :] = a
+            return out
+
+        e_hat_padded = _pad(all_e_hat, all_e_hat[0].shape[1])
+        e_padded = _pad(all_e, all_e[0].shape[1])
+        d_padded = _pad(all_d, all_d[0].shape[1])
+
+        num_seq = len(all_e_hat)
+        sample_indices = [0]
+        if num_seq > 1:
+            other_indices = list(range(1, num_seq))
+            num_random = min(2, len(other_indices))
+            random_indices = np.random.choice(
+                other_indices, size=num_random, replace=False
+            ).tolist()
+            sample_indices.extend(random_indices)
+
+        plot_path = output_dir / f"{name}.png"
+        plot_predictions(
+            output_dir=output_dir,
+            e_hat=e_hat_padded,
+            e=e_padded,
+            d=d_padded,
+            sample_indices=sample_indices,
+            save_path=str(plot_path),
+            warmup_steps=0,
+        )
+        # Plot uploaded in bulk by train.py at end of training (no duplicate).
 
     def decay_regularization(self):
         """
@@ -246,6 +329,77 @@ class Trainer:
             param_group["lr"] *= factor
             new_lr = param_group["lr"]
             print(f"  Learning rate reduced due to rollbacks: {old_lr:.6e} → {new_lr:.6e}")
+
+    def _train_diverging_epoch(self) -> float:
+        """One pass over the diverging-trajectory loader.
+
+        Each batch has batch_size=1 so trajectories of different lengths
+        do not need to be stacked. Loss is computed from t=0 with no
+        warmup skipping (these trajectories start from x0=0 so no
+        transient needs to be discarded). Equal-sum semantics with the
+        converging pass: each diverging batch produces its own optimizer
+        step, so the per-epoch gradient effectively adds ∇pred_div on top
+        of ∇pred_conv.
+
+        Returns the average diverging prediction loss over the epoch.
+        """
+        total_pred_loss_div = 0.0
+        num_batches = 0
+
+        for batch in self.train_div_loader:
+            if len(batch) == 3:
+                d, e, x0 = batch
+            else:
+                d, e = batch
+                x0 = None
+            d = d.to(self.device)
+            e = e.to(self.device)
+            if x0 is not None:
+                x0 = x0.to(device=self.device, dtype=d.dtype)
+
+            self.optimizer.zero_grad()
+            e_hat, (x, w), _ = self.model(d, x0=x0, warmup_steps=0)
+            # NO warmup slicing — diverging trajectories often die before
+            # warmup_steps would expire, and they share x0 with the model
+            # so there is no transient to discard.
+            pred_loss_div = self.loss_fn(e_hat, e)
+            loss = pred_loss_div
+            loss.backward()
+
+            if self.gradient_clip_value is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.gradient_clip_value
+                )
+
+            # Mirror the converging loop's SimpleLure rollback safety so
+            # diverging-batch updates also respect feasibility.
+            if isinstance(self.model, SimpleLure):
+                saved_state = {
+                    name: param.data.clone()
+                    for name, param in self.model.named_parameters()
+                    if param.requires_grad
+                }
+
+            self.optimizer.step()
+
+            if isinstance(self.model, SimpleLure):
+                if not self.model.check_constraints() and self.regularization_weight > 0:
+                    b_feasible = self.model.analysis_problem()
+                    if not b_feasible:
+                        logging.warning(
+                            "Diverging batch: Feasibility SDP failed, rolling back parameters"
+                        )
+                        with torch.no_grad():
+                            for name, param in self.model.named_parameters():
+                                if param.requires_grad and name in saved_state:
+                                    param.data.copy_(saved_state[name])
+                        self.rollback_count += 1
+                        self.epoch_rollback_count += 1
+
+            total_pred_loss_div += pred_loss_div.item()
+            num_batches += 1
+
+        return total_pred_loss_div / max(num_batches, 1)
 
     def train_epoch(self) -> Dict[str, float]:
         """
@@ -381,17 +535,32 @@ class Trainer:
         # Average gradient statistics over epoch
         avg_grad_stats = {key: np.mean(values) for key, values in epoch_grad_stats.items()}
 
+        # Second pass over diverging trajectories (variable length, batch_size=1,
+        # no warmup skipping). Loss is reported separately as `pred_loss_div`.
+        pred_loss_div = None
+        if self.train_div_loader is not None:
+            pred_loss_div = self._train_diverging_epoch()
+
         return {
             "loss": avg_loss,
             "pred_loss": avg_pred_loss,
+            "pred_loss_div": pred_loss_div,
             "reg_feasibility": avg_reg_feasibility,
             "reg_input": avg_reg_inputs,
             "rollback_count": self.epoch_rollback_count,
             **avg_grad_stats,
         }
 
-    def validate(self) -> float:
-        """Validate the model."""
+    def validate(self) -> Dict[str, Optional[float]]:
+        """Validate the model.
+
+        Returns a dict with keys:
+            val_loss: validation loss on converging trajectories (warmup
+                applied — this is the metric used for early stopping /
+                model selection, preserving the legacy behavior).
+            val_loss_div: validation loss on diverging trajectories
+                (no warmup applied); None when no val_div_loader is set.
+        """
         self.model.eval()
         total_loss = 0.0
         num_batches = 0
@@ -419,7 +588,29 @@ class Trainer:
                 num_batches += 1
 
         avg_loss = total_loss / num_batches
-        return avg_loss
+
+        # Diverging validation: full sequence from t=0, no warmup skipping.
+        val_loss_div: Optional[float] = None
+        if self.val_div_loader is not None:
+            div_total = 0.0
+            div_batches = 0
+            with torch.no_grad():
+                for batch in self.val_div_loader:
+                    if len(batch) == 3:
+                        d, e, x0 = batch
+                        x0 = None
+                    else:
+                        d, e = batch
+                        x0 = None
+                    d = d.to(self.device)
+                    e = e.to(self.device)
+                    e_hat, _, _ = self.model(d, x0, warmup_steps=0)
+                    loss = self.loss_fn(e_hat, e)
+                    div_total += loss.item()
+                    div_batches += 1
+            val_loss_div = div_total / max(div_batches, 1)
+
+        return {"val_loss": avg_loss, "val_loss_div": val_loss_div}
 
     def train(self, max_epochs: int, normalizer=None) -> Dict[str, Any]:
         """
@@ -437,6 +628,7 @@ class Trainer:
 
         # Plot initial trajectories before training
         self.plot_trajectories(name="initial_trajectories")
+        self.plot_trajectories_div(name="initial_trajectories_div")
 
         # Epoch-level progress bar
         pbar = tqdm(range(max_epochs), desc="Training Progress")
@@ -451,21 +643,33 @@ class Trainer:
             train_results = self.train_epoch()
             train_loss = train_results["loss"]
             train_pred_loss = train_results["pred_loss"]
+            train_pred_loss_div = train_results.get("pred_loss_div")
             train_reg_feasibility = train_results["reg_feasibility"]
             epoch_rollback_count = train_results.get("rollback_count", 0)
             grad_stats = {
                 k: v
                 for k, v in train_results.items()
-                if k not in ["loss", "pred_loss", "reg_feasibility", "rollback_count"]
+                if k not in [
+                    "loss",
+                    "pred_loss",
+                    "pred_loss_div",
+                    "reg_feasibility",
+                    "reg_input",
+                    "rollback_count",
+                ]
             }
 
             self.train_losses.append(train_loss)
             self.train_pred_losses.append(train_pred_loss)
             self.train_reg_feasibility.append(train_reg_feasibility)
             self.train_reg_inputs.append(train_results["reg_input"])
+            if train_pred_loss_div is not None:
+                self.train_div_losses.append(train_pred_loss_div)
 
             # Validate
-            val_loss = self.validate()
+            val_results = self.validate()
+            val_loss = val_results["val_loss"]
+            val_loss_div = val_results["val_loss_div"]
             self.val_losses.append(val_loss)
 
             # Synchronize CUDA so the wall-clock time reflects completed GPU work,
@@ -474,6 +678,8 @@ class Trainer:
                 torch.cuda.synchronize()
             epoch_time_sec = time.perf_counter() - epoch_start
             epoch_times.append(epoch_time_sec)
+            if val_loss_div is not None:
+                self.val_div_losses.append(val_loss_div)
             # print(f'Epoch {epoch}: constraints satisfied={self.model.check_constraints()}')
 
             # Get scheduler patience info if using ReduceLROnPlateau
@@ -495,6 +701,10 @@ class Trainer:
                 "constraints": f"{self.model.check_constraints()}",
                 "epoch_s": f"{epoch_time_sec:.2f}",
             }
+            if train_pred_loss_div is not None:
+                progress_metrics["pred_div"] = f"{train_pred_loss_div:.4f}"
+            if val_loss_div is not None:
+                progress_metrics["val_div"] = f"{val_loss_div:.4f}"
             if scheduler_patience_info:
                 progress_metrics["scheduler_patience"] = scheduler_patience_info
             if self.log_gradients and grad_stats:
@@ -513,6 +723,10 @@ class Trainer:
                 mlflow.log_metric("train_reg_feasibility", train_results["reg_feasibility"], step=epoch)
                 mlflow.log_metric("train_reg_input", train_results["reg_input"], step=epoch)
                 mlflow.log_metric("val_loss", val_loss, step=epoch)
+                if train_pred_loss_div is not None:
+                    mlflow.log_metric("train_pred_loss_div", train_pred_loss_div, step=epoch)
+                if val_loss_div is not None:
+                    mlflow.log_metric("val_loss_div", val_loss_div, step=epoch)
                 mlflow.log_metric("lr", self.optimizer.param_groups[0]["lr"], step=epoch)
                 mlflow.log_metric("epoch_time_sec", epoch_time_sec, step=epoch)
                 if self.regularization_weight > 0:
@@ -533,6 +747,9 @@ class Trainer:
             # Plot trajectories and ellipse periodically (at checkpoint frequency)
             if (epoch + 1) % self.checkpoint_frequency == 0:
                 self.plot_trajectories(name=f"epoch_{epoch}", normalizer=normalizer)
+                self.plot_trajectories_div(
+                    name=f"epoch_{epoch}_div", normalizer=normalizer
+                )
 
             # Learning rate scheduling
             prev_lr = self.optimizer.param_groups[0]["lr"]
@@ -649,6 +866,8 @@ class Trainer:
             "train_pred_losses": self.train_pred_losses,
             "train_reg_feasibility": self.train_reg_feasibility,
             "val_losses": self.val_losses,
+            "train_div_losses": self.train_div_losses,
+            "val_div_losses": self.val_div_losses,
             "best_val_loss": self.best_val_loss,
             "best_epoch": self.best_epoch,
             "final_epoch": self.current_epoch,
@@ -687,17 +906,10 @@ class Trainer:
         if "best" in filename:
             self.save_parameters_mat(filename.replace(".pt", "_params.mat"))
 
-        # Only log model to MLflow for final model (not every best model update)
-        # This avoids slowdown from logging the model every time validation improves
-        # The best model weights are available as artifacts/models/best_model.pt
-        if self.mlflow_tracking and "final" in filename:
-            try:
-                # Log the already-saved checkpoint as an artifact.
-                # mlflow.log_artifact uses the legacy artifacts API and is
-                # compatible with all MLflow tracking server versions.
-                mlflow.log_artifact(str(checkpoint_path), artifact_path="model")
-            except Exception as e:
-                print(f"Warning: Could not log model artifact to MLflow: {e}")
+        # Checkpoint files are uploaded in bulk by train.py via
+        # log_artifacts(run_model_dir, "models") at the end of training, so we
+        # don't log_artifact here — that would create a duplicate model/ folder
+        # alongside the models/ one from the bulk upload.
 
     def save_parameters_mat(self, filename: str):
         """

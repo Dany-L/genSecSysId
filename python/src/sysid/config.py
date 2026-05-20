@@ -37,6 +37,13 @@ class DataConfig:
     num_workers: int = 0
     sampling_time: float = 0.01
 
+    # Diverging trajectory support. When enabled, the loader additionally reads
+    # train_div/, validation_div/, test_div/ sibling folders. Diverging
+    # trajectories have variable length, start from x0=0, and are used with
+    # batch_size=diverging_batch_size and no warmup skipping in the loss.
+    use_diverging_trajectories: bool = False
+    diverging_batch_size: int = 1
+
     def __post_init__(self):
         """Set default column names if none provided."""
         if self.input_col is None:

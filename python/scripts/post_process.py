@@ -280,7 +280,7 @@ def regional_verification(
         for amp in in_amps
     ]  # list of (n_traj, horizon)
 
-    st_x0 = _sample_on_ellipsoid(rng, X, radius=1.5 * s / max(alpha, 1e-12), n=n_traj)
+    st_x0 = _sample_on_ellipsoid(rng, X, radius=2 * s / max(alpha, 1e-12), n=n_traj)
     st_u = np.stack(
         [_make_lp_noise(rng, horizon, amp_max=0.01 * s, Ts=Ts) for _ in range(n_traj)]
     )
@@ -514,7 +514,7 @@ def parse_args():
         "--rv-violation-factors",
         type=float,
         nargs="+",
-        default=[0.2],
+        default=[1.5],
         help=(
             "Peak-||u_n|| / s factors used for the input-violation regime. "
             "<1 stays inside the input bound (sanity baseline); >=1 violates."

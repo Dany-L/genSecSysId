@@ -5,7 +5,7 @@ from CSV folder structures. The DataLoader class is kept for backward
 compatibility with single CSV files.
 """
 
-from .dataset import TimeSeriesDataset
+from .dataset import TimeSeriesDataset, VariableLengthDataset
 from .direct_loader import load_csv_folder, load_split_data
 from .loader import DataLoader, collate_with_optional_states, create_dataloaders
 from .normalizer import DataNormalizer
@@ -18,6 +18,7 @@ __all__ = [
     "collate_with_optional_states",
     "DataNormalizer",
     "TimeSeriesDataset",
+    "VariableLengthDataset",
     # Legacy (backward compatibility)
     "DataLoader",
 ]

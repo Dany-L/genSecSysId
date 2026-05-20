@@ -160,6 +160,7 @@ def main():
                 state_col = None
 
             # Load from train/validation subfolders (skip test for training)
+            use_div = getattr(data_config, "use_diverging_trajectories", False)
             result = load_split_data(
                 data_dir=str(train_path),
                 input_col=getattr(data_config, "input_col", ["d"]),
@@ -167,6 +168,7 @@ def main():
                 state_col=state_col,
                 pattern=getattr(data_config, "pattern", "*.csv"),
                 load_test=False,  # Don't load test data during training
+                load_div=use_div,
             )
 
             # Unpack (test_* will be None)
@@ -180,9 +182,25 @@ def main():
                 train_states,
                 val_states,
                 _,
+                train_div_inputs,
+                train_div_outputs,
+                train_div_states,
+                val_div_inputs,
+                val_div_outputs,
+                val_div_states,
+                _,
+                _,
+                _,
             ) = result
             if train_states is not None:
                 logger.info(f"State information loaded: train_states={train_states.shape}")
+            if use_div:
+                train_div_n = None if train_div_inputs is None else len(train_div_inputs)
+                val_div_n = None if val_div_inputs is None else len(val_div_inputs)
+                logger.info(
+                    f"Diverging trajectories enabled: "
+                    f"train_div={train_div_n} sequences, val_div={val_div_n} sequences"
+                )
 
         elif train_path.suffix == ".csv":
             # Fallback: Load from single CSV files (requires train_path, val_path, test_path)
@@ -196,6 +214,9 @@ def main():
                 test_inputs, test_outputs = DataLoader.load_from_csv(
                     data_config.test_path, delimiter=","
                 )
+            train_states = val_states = None
+            train_div_inputs = train_div_outputs = train_div_states = None
+            val_div_inputs = val_div_outputs = val_div_states = None
         else:
             raise ValueError(
                 f"Unsupported data format: {data_config.train_path}\n"
@@ -228,13 +249,27 @@ def main():
 
     # Create data loaders
     logger.info("Creating data loaders...")
-    train_loader, val_loader, _, normalizer = create_dataloaders(
+    (
+        train_loader,
+        val_loader,
+        _,
+        train_div_loader,
+        val_div_loader,
+        _,
+        normalizer,
+    ) = create_dataloaders(
         train_inputs=train_inputs,
         train_outputs=train_outputs,
         train_states=train_states,
         val_inputs=val_inputs,
         val_outputs=val_outputs,
         val_states=val_states,
+        train_div_inputs=train_div_inputs,
+        train_div_outputs=train_div_outputs,
+        train_div_states=train_div_states,
+        val_div_inputs=val_div_inputs,
+        val_div_outputs=val_div_outputs,
+        val_div_states=val_div_states,
         batch_size=data_config.batch_size,
         sequence_length=data_config.train_sequence_length,  # Use train_sequence_length for training only
         sequence_stride=getattr(data_config, "sequence_stride", None),
@@ -242,8 +277,13 @@ def main():
         normalization_method=data_config.normalization_method,
         shuffle=data_config.shuffle,
         num_workers=data_config.num_workers,
+        diverging_batch_size=getattr(data_config, "diverging_batch_size", 1),
     )
     logger.info(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+    if train_div_loader is not None:
+        logger.info(f"Train_div batches: {len(train_div_loader)}")
+    if val_div_loader is not None:
+        logger.info(f"Val_div batches: {len(val_div_loader)}")
     logger.info(f"Batch size: {data_config.batch_size}")
     logger.info(
         f"Normalization: {data_config.normalization_method if data_config.normalize else 'None'}"
@@ -397,10 +437,11 @@ def main():
         else:
             mlflow.log_param("has_structural_constraints", False)
 
-        # Save config
+        # Save config — uploaded to MLflow in bulk via log_artifacts(run_output_dir,
+        # "outputs") at the end of training, so no individual log here (avoids
+        # the root-level config.yaml duplicating outputs/config.yaml).
         config_save_path = run_output_dir / "config.yaml"
         config.save_yaml(str(config_save_path))
-        mlflow.log_artifact(str(config_save_path))
         logger.info(f"Config saved to {config_save_path}")
 
         # Save run_id for later use (evaluation/analysis)
@@ -422,6 +463,8 @@ def main():
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
+            train_div_loader=train_div_loader,
+            val_div_loader=val_div_loader,
             loss_fn=loss_fn,
             optimizer=optimizer,
             device=str(device),

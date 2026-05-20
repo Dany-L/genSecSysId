@@ -1,15 +1,24 @@
-"""Ship-rolling demo using the softening Duffing oscillator.
+"""Ship-rolling demo: true dynamics vs. learned constrained model.
 
-Maps the dimensionless Duffing state q to a roll angle phi = phi_v * q,
-where phi_v is the angle of vanishing stability (capsize boundary).
-Two side-by-side animations:
-  - left:  small wave forcing -> stable rolling within the basin
-  - right: a strong pulse     -> trajectory crosses the hilltop -> capsize
+Inputs come from two Duffing CSV files (columns u, q, q_dot): one stable
+trajectory and one unstable one. The same `u` sequence drives both the true
+dynamics (taken straight from the CSV's q, q_dot columns — this is the
+ground-truth simulation) and the learned model, loaded by training-run id
+(config + checkpoint + normalizer all resolve from the standard layout
+under ~/genSecSysId-Data). Four side-by-side columns:
+
+  - True dynamics  (stable input)
+  - True dynamics  (unstable input)
+  - Learned model  (stable input)
+  - Learned model  (unstable input)
+
+Each column animates a tilting ship, a time-series, and the phase portrait.
 
 Run:
-  python python/notebooks/duffing/ship_rolling_simulation.py
   python python/notebooks/duffing/ship_rolling_simulation.py \\
-      --save python/notebooks/duffing/figs/ship_rolling.gif --no-show
+      --stable-csv   notebooks/duffing/datasets/Duffing/test/zero_conv_000.csv \\
+      --unstable-csv notebooks/duffing/datasets/Duffing/test_div/zero_div_000.csv \\
+      --run-id       5296a077a5074cf9b9cab0ca56fdfa0c
 """
 
 import argparse
@@ -17,6 +26,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
+import torch
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
 from matplotlib.patches import Polygon
@@ -25,46 +36,83 @@ REPO_PY = Path(__file__).resolve().parents[2]  # .../python
 if str(REPO_PY / "src") not in sys.path:
     sys.path.insert(0, str(REPO_PY / "src"))
 
-from sysid.evaluation.true_dynamics import (  # noqa: E402
-    DUFFING_DELTA_D,
-    DUFFING_TS,
-    DUFFING_U_C,
-    duffing_dt,
-)
+from sysid.config import resolve_run_artifacts  # noqa: E402
+from sysid.data import DataNormalizer  # noqa: E402
+from sysid.evaluation.true_dynamics import DUFFING_TS, DUFFING_U_C  # noqa: E402
+from sysid.models import load_model  # noqa: E402
+
+DEFAULT_DATA_ROOT = "~/genSecSysId-Data"
 
 
-def simulate(x0, u_seq, Ts=DUFFING_TS, delta_d=DUFFING_DELTA_D, q_clip=4.0):
-    """Step the Duffing system forward. Stops early once |q| > q_clip
-    so the trajectory stays bounded for visualization (the polynomial
-    blows up super-exponentially past the hilltop)."""
-    X = [np.asarray(x0, dtype=float)]
-    for u in u_seq:
-        x_next = duffing_dt(X[-1], u=float(u), Ts=Ts, delta_d=delta_d)
-        X.append(x_next)
-        if not np.all(np.isfinite(x_next)) or abs(x_next[0]) > q_clip:
-            break
-    return np.asarray(X)
+def load_csv(path):
+    """Read u, q, q_dot columns from a Duffing dataset CSV."""
+    df = pd.read_csv(path)
+    return (
+        df["u"].to_numpy(dtype=float),
+        df["q"].to_numpy(dtype=float),
+        df["q_dot"].to_numpy(dtype=float),
+    )
 
 
-def build_inputs(T_total, Ts):
-    n = int(round(T_total / Ts))
-    t = np.arange(n) * Ts
-
-    u_stable = 0.25 * np.sin(0.4 * t)
-
-    u_capsize = np.zeros_like(t)
-    pulse_mask = (t >= 4.0) & (t < 6.0)
-    u_capsize[pulse_mask] = 1.5
-
-    return t, u_stable, u_capsize
-
-
-def pad_to_length(traj, n):
-    k = traj.shape[0]
+def pad_1d(arr, n):
+    """Pad a 1D array to length n by repeating its last value."""
+    k = len(arr)
     if k >= n:
-        return traj[:n]
-    pad = np.tile(traj[-1], (n - k, 1))
-    return np.vstack([traj, pad])
+        return arr[:n]
+    return np.concatenate([arr, np.full(n - k, arr[-1])])
+
+
+def load_learned_model(run_id, data_root=DEFAULT_DATA_ROOT, device="cpu"):
+    """Resolve a run id and return (model, normalizer).
+
+    Uses the shared sysid.config.resolve_run_artifacts helper, which reads
+    the per-run YAML with a restricted SafeLoader subclass (only ``!!python/tuple``
+    is recognised, mapped to a list) rather than ``yaml.full_load`` — so a
+    tampered config can't construct arbitrary Python objects.
+    """
+    config, model_path, normalizer_path, _ = resolve_run_artifacts(
+        run_id, data_root=data_root
+    )
+    model = load_model(str(model_path), config, device=device)
+    model.eval()
+    normalizer = (
+        DataNormalizer.load(str(normalizer_path)) if normalizer_path is not None else None
+    )
+    return model, normalizer
+
+
+def run_learned_model(model, u_seq, normalizer, x0=None, device="cpu"):
+    """Run the learned model on a 1D input sequence and return predicted
+    (q, q_dot) in physical units.
+
+    Normalizes the input, runs the model with no warmup skipping, then
+    denormalizes the output. The internal state's second component is
+    taken as q_dot_hat — for the constrained Lure-type model the state is
+    [q, q_dot] in physical units. When provided, `x0` is the initial state
+    in physical units (shape (2,)); pass it for trajectories that don't
+    start from rest so the model output isn't dominated by the catch-up
+    transient.
+    """
+    u = np.asarray(u_seq, dtype=np.float64).reshape(1, -1, 1)
+    if normalizer is not None:
+        u = normalizer.transform_inputs(u)
+    d = torch.from_numpy(u).to(device)
+    x0_tensor = None
+    if x0 is not None:
+        x0_tensor = torch.from_numpy(
+            np.asarray(x0, dtype=np.float64).reshape(1, -1)
+        ).to(device)
+    with torch.no_grad():
+        e_hat, (x, _w), _ = model(d, x0_tensor, warmup_steps=0)
+    e_hat_np = e_hat.cpu().numpy()
+    if normalizer is not None:
+        e_hat_np = normalizer.inverse_transform_outputs(e_hat_np)
+    q_hat = e_hat_np[0, :, 0]
+    # The state array includes the post-final-step value, so it is one
+    # sample longer than the output. Trim to align with q_hat.
+    x_np = x.cpu().numpy()
+    q_dot_hat = x_np[0, : q_hat.shape[0], 1]
+    return q_hat, q_dot_hat
 
 
 def rotate(points, phi):
@@ -137,7 +185,7 @@ def hamiltonian(q, dq):
     return 0.5 * dq ** 2 + 0.5 * q ** 2 - 0.25 * q ** 4
 
 
-def setup_phase_axis(ax, X_traj, phi_v, phi_v_deg, color, title):
+def setup_phase_axis(ax, q_full, dq_full, phi_v, phi_v_deg, color, title):
     phi_max_deg = 1.5 * phi_v_deg
     dphi_max_deg = 1.6 * phi_v_deg
     ax.set_xlim(-phi_max_deg, phi_max_deg)
@@ -165,9 +213,8 @@ def setup_phase_axis(ax, X_traj, phi_v, phi_v_deg, color, title):
     ax.plot([phi_v_deg, -phi_v_deg], [0, 0], "x", color="red",
             markersize=10, mew=2.0, zorder=5)
 
-    phi_full_deg = np.rad2deg(np.clip(phi_v * X_traj[:, 0], -np.pi, np.pi))
-    dphi_full_deg = np.rad2deg(phi_v * X_traj[:, 1])
-    dphi_full_deg = np.clip(dphi_full_deg, -dphi_max_deg, dphi_max_deg)
+    phi_full_deg = np.rad2deg(np.clip(phi_v * q_full, -np.pi, np.pi))
+    dphi_full_deg = np.clip(np.rad2deg(phi_v * dq_full), -dphi_max_deg, dphi_max_deg)
     ax.plot(phi_full_deg, dphi_full_deg, color=color, lw=0.9, alpha=0.35, zorder=3)
 
     (trail,) = ax.plot([], [], color=color, lw=2.0, alpha=0.95, zorder=6)
@@ -176,13 +223,13 @@ def setup_phase_axis(ax, X_traj, phi_v, phi_v_deg, color, title):
     return dot, trail, dphi_max_deg
 
 
-def setup_timeseries_axis(ax, t, phi_deg, u_seq, T_total, phi_v_deg, label):
+def setup_timeseries_axis(ax, t, phi_deg, u_seq, T_total, phi_v_deg):
     ax.set_xlim(0, T_total)
     ax.set_ylim(-1.4 * phi_v_deg, 1.4 * phi_v_deg)
     ax.axhline(phi_v_deg, color="red", ls="--", lw=0.8,
                label=f"$\\pm\\varphi_v = \\pm{phi_v_deg:.0f}^\\circ$")
     ax.axhline(-phi_v_deg, color="red", ls="--", lw=0.8)
-    ax.plot(t, phi_deg, color="black", lw=1.2, label=f"roll angle $\\varphi(t)$ ({label})")
+    ax.plot(t, phi_deg, color="black", lw=1.2, label=r"$\varphi(t)$")
     ax.set_xlabel("time (s)", fontsize=9)
     ax.set_ylabel("roll angle $\\varphi$ (deg)", fontsize=9)
     ax.tick_params(labelsize=8)
@@ -193,7 +240,7 @@ def setup_timeseries_axis(ax, t, phi_deg, u_seq, T_total, phi_v_deg, label):
     ax2.axhline(DUFFING_U_C, color="steelblue", ls=":", lw=0.7, alpha=0.6)
     ax2.axhline(-DUFFING_U_C, color="steelblue", ls=":", lw=0.7, alpha=0.6)
     ax2.set_ylim(-2.0, 2.0)
-    ax2.set_ylabel("input $u$ (wave moment)", color="steelblue", fontsize=9)
+    ax2.set_ylabel("input $u$", color="steelblue", fontsize=9)
     ax2.tick_params(axis="y", labelcolor="steelblue", labelsize=8)
     return ax2
 
@@ -202,130 +249,157 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    parser.add_argument("--stable-csv", type=Path, required=True,
+                        help="CSV with a converging trajectory (columns u, q, q_dot).")
+    parser.add_argument("--unstable-csv", type=Path, required=True,
+                        help="CSV with a diverging trajectory (columns u, q, q_dot).")
+    parser.add_argument("--run-id", type=str, required=True,
+                        help="MLflow training-run id. Config, checkpoint, and "
+                             "normalizer are resolved from <data-root>/outputs|models/"
+                             "<model_type>/<run_id>/.")
+    parser.add_argument("--data-root", type=Path, default=Path(DEFAULT_DATA_ROOT),
+                        help=f"Base directory for run artefacts (default: {DEFAULT_DATA_ROOT}).")
     parser.add_argument("--save", type=Path, default=None,
                         help="Save the animation to this path (.gif or .mp4).")
     parser.add_argument("--no-show", action="store_true",
                         help="Skip plt.show(); useful when only saving.")
     parser.add_argument("--phi-v-deg", type=float, default=60.0,
                         help="Angle of vanishing stability in degrees (visual scaling).")
-    parser.add_argument("--T-total", type=float, default=30.0,
-                        help="Total simulated time (seconds).")
     args = parser.parse_args()
 
     phi_v = np.deg2rad(args.phi_v_deg)
     phi_v_deg = args.phi_v_deg
     Ts = DUFFING_TS
 
-    t, u_stable, u_capsize = build_inputs(args.T_total, Ts)
-    n = len(t)
+    # 1. Load CSV inputs and the CSV's q, q_dot as ground truth.
+    u_st, q_st_true, dq_st_true = load_csv(args.stable_csv)
+    u_un, q_un_true, dq_un_true = load_csv(args.unstable_csv)
 
-    X_stable = simulate((0.3, 0.0), u_stable, Ts=Ts)
-    X_capsize = simulate((0.0, 0.0), u_capsize, Ts=Ts)
+    # 2. Load model + normalizer from the run id.
+    model, normalizer = load_learned_model(
+        args.run_id, data_root=args.data_root, device="cpu"
+    )
 
-    X_stable = pad_to_length(X_stable, n + 1)
-    X_capsize = pad_to_length(X_capsize, n + 1)
+    # 3. Run the model on each input (each sequence keeps its own length).
+    #    Seed x0 from the CSV's first row so the model isn't penalised by an
+    #    initial-state mismatch when the CSV doesn't start from rest.
+    x0_st = np.array([q_st_true[0], dq_st_true[0]])
+    x0_un = np.array([q_un_true[0], dq_un_true[0]])
+    q_st_hat, dq_st_hat = run_learned_model(model, u_st, normalizer, x0=x0_st)
+    q_un_hat, dq_un_hat = run_learned_model(model, u_un, normalizer, x0=x0_un)
 
-    phi_stable = np.clip(phi_v * X_stable[:n, 0], -np.pi, np.pi)
-    phi_capsize = np.clip(phi_v * X_capsize[:n, 0], -np.pi, np.pi)
-    dphi_stable = phi_v * X_stable[:n, 1]
-    dphi_capsize = phi_v * X_capsize[:n, 1]
+    # 4. Pad shorter sequences to the longest length so the animation runs
+    #    continuously. Once a trajectory's CSV ends, the ship freezes on its
+    #    final state — the unstable trajectory dies early when the simulator
+    #    hits the divergence threshold.
+    n_max = max(len(u_st), len(u_un))
+    t = np.arange(n_max) * Ts
+    T_total = n_max * Ts
 
+    columns = [
+        {
+            "label": f"True dynamics — stable\n{Path(args.stable_csv).name}",
+            "color": "#5a7a3f",
+            "u": pad_1d(u_st, n_max),
+            "q": pad_1d(q_st_true, n_max),
+            "dq": pad_1d(dq_st_true, n_max),
+        },
+        {
+            "label": f"True dynamics — unstable\n{Path(args.unstable_csv).name}",
+            "color": "#7a3f3f",
+            "u": pad_1d(u_un, n_max),
+            "q": pad_1d(q_un_true, n_max),
+            "dq": pad_1d(dq_un_true, n_max),
+        },
+        {
+            "label": f"Learned model — stable\n{Path(args.stable_csv).name}",
+            "color": "#3f5a7a",
+            "u": pad_1d(u_st, n_max),
+            "q": pad_1d(q_st_hat, n_max),
+            "dq": pad_1d(dq_st_hat, n_max),
+        },
+        {
+            "label": f"Learned model — unstable\n{Path(args.unstable_csv).name}",
+            "color": "#7a5a3f",
+            "u": pad_1d(u_un, n_max),
+            "q": pad_1d(q_un_hat, n_max),
+            "dq": pad_1d(dq_un_hat, n_max),
+        },
+    ]
+
+    # Resample to a fixed animation rate (interpolation from Ts=0.05s).
     fps = 30
-    t_anim = np.arange(0.0, args.T_total, 1.0 / fps)
-    phi_stable_anim = np.interp(t_anim, t, phi_stable)
-    phi_capsize_anim = np.interp(t_anim, t, phi_capsize)
-    dphi_stable_anim = np.interp(t_anim, t, dphi_stable)
-    dphi_capsize_anim = np.interp(t_anim, t, dphi_capsize)
-    u_stable_anim = np.interp(t_anim, t, u_stable)
-    u_capsize_anim = np.interp(t_anim, t, u_capsize)
+    t_anim = np.arange(0.0, T_total, 1.0 / fps)
+    for col in columns:
+        col["phi"] = np.clip(phi_v * col["q"], -np.pi, np.pi)
+        col["dphi"] = phi_v * col["dq"]
+        col["u_anim"] = np.interp(t_anim, t, col["u"])
+        col["phi_anim"] = np.interp(t_anim, t, col["phi"])
+        col["dphi_anim"] = np.interp(t_anim, t, col["dphi"])
 
-    fig = plt.figure(figsize=(11, 11.5))
-    gs = fig.add_gridspec(3, 2, height_ratios=[3, 2, 3],
-                          hspace=0.45, wspace=0.22)
-    ax_ship_L = fig.add_subplot(gs[0, 0])
-    ax_ship_R = fig.add_subplot(gs[0, 1])
-    ax_ts_L = fig.add_subplot(gs[1, 0])
-    ax_ts_R = fig.add_subplot(gs[1, 1])
-    ax_ph_L = fig.add_subplot(gs[2, 0])
-    ax_ph_R = fig.add_subplot(gs[2, 1])
-
-    setup_ship_axis(ax_ship_L,
-                    f"Stable rolling   peak $|u|=0.25 < u_c={DUFFING_U_C:.3f}$")
-    setup_ship_axis(ax_ship_R,
-                    f"Capsize   pulse $u=1.5 > u_c={DUFFING_U_C:.3f}$  ($t\\in[4,6]$ s)")
-
-    art_L = make_ship_artists(ax_ship_L, color="#5a7a3f")
-    art_R = make_ship_artists(ax_ship_R, color="#7a3f3f")
-
-    setup_timeseries_axis(ax_ts_L, t, np.rad2deg(phi_stable), u_stable,
-                          args.T_total, phi_v_deg, "stable")
-    setup_timeseries_axis(ax_ts_R, t, np.rad2deg(phi_capsize), u_capsize,
-                          args.T_total, phi_v_deg, "capsize")
-
-    cursor_L = ax_ts_L.axvline(0.0, color="grey", lw=1.0)
-    cursor_R = ax_ts_R.axvline(0.0, color="grey", lw=1.0)
-
-    dot_L, trail_L, dphi_max_L = setup_phase_axis(
-        ax_ph_L, X_stable[:n], phi_v, phi_v_deg, "#5a7a3f",
-        r"Phase space (stable). Red dashed: $H = 1/4$ (saddle level)",
-    )
-    dot_R, trail_R, dphi_max_R = setup_phase_axis(
-        ax_ph_R, X_capsize[:n], phi_v, phi_v_deg, "#7a3f3f",
-        r"Phase space (capsize). Trajectory exits the basin",
-    )
-    trail_window = int(2.0 * fps)  # ~2 s of recent history
-
-    txt_L = ax_ship_L.text(
-        0.02, 0.97, "", transform=ax_ship_L.transAxes,
-        va="top", ha="left", fontsize=9, family="monospace",
-        bbox=dict(boxstyle="round", fc="white", ec="grey", alpha=0.85),
-    )
-    txt_R = ax_ship_R.text(
-        0.02, 0.97, "", transform=ax_ship_R.transAxes,
-        va="top", ha="left", fontsize=9, family="monospace",
-        bbox=dict(boxstyle="round", fc="white", ec="grey", alpha=0.85),
-    )
+    # 5. Figure layout: 3 rows × 4 cols.
+    fig = plt.figure(figsize=(20, 11.5))
+    gs = fig.add_gridspec(3, 4, height_ratios=[3, 2, 3],
+                          hspace=0.55, wspace=0.30)
+    for c, col in enumerate(columns):
+        ax_ship = fig.add_subplot(gs[0, c])
+        ax_ts = fig.add_subplot(gs[1, c])
+        ax_ph = fig.add_subplot(gs[2, c])
+        setup_ship_axis(ax_ship, col["label"])
+        col["art"] = make_ship_artists(ax_ship, color=col["color"])
+        setup_timeseries_axis(ax_ts, t, np.rad2deg(col["phi"]), col["u"],
+                              T_total, phi_v_deg)
+        col["cursor"] = ax_ts.axvline(0.0, color="grey", lw=1.0)
+        col["dot"], col["trail"], col["dphi_clip"] = setup_phase_axis(
+            ax_ph, col["q"], col["dq"], phi_v, phi_v_deg, col["color"], title="",
+        )
+        col["txt"] = ax_ship.text(
+            0.02, 0.97, "", transform=ax_ship.transAxes,
+            va="top", ha="left", fontsize=9, family="monospace",
+            bbox=dict(boxstyle="round", fc="white", ec="grey", alpha=0.85),
+        )
 
     fig.suptitle(
-        r"Softening Duffing as ship rolling: $\ddot q = -\delta\dot q - q + q^3 + u$,"
-        r"   $\varphi = \varphi_v\,q$",
+        r"Softening Duffing as ship rolling: true dynamics vs. learned model"
+        r"   ($\varphi = \varphi_v\,q$)",
         fontsize=12,
     )
+
+    trail_window = int(2.0 * fps)  # ~2 s of recent history
 
     def status_str(phi, u, t_now):
         deg = np.rad2deg(phi)
         mark = "CAPSIZED" if abs(deg) >= phi_v_deg else "rolling "
         return f"t = {t_now:5.2f} s\nphi = {deg:+6.1f} deg\nu   = {u:+5.2f}\n{mark}"
 
-    def init():
-        update_ship(art_L, 0.0)
-        update_ship(art_R, 0.0)
-        cursor_L.set_xdata([0.0, 0.0])
-        cursor_R.set_xdata([0.0, 0.0])
-        txt_L.set_text("")
-        txt_R.set_text("")
-        for d in (dot_L, dot_R, trail_L, trail_R):
-            d.set_data([], [])
-        return ()
-
     def update_phase(dot, trail, phi_arr, dphi_arr, i, dphi_clip):
         phi_now = np.rad2deg(phi_arr[i])
         dphi_now = float(np.clip(np.rad2deg(dphi_arr[i]), -dphi_clip, dphi_clip))
         dot.set_data([phi_now], [dphi_now])
         i0 = max(0, i - trail_window)
-        seg_phi = np.rad2deg(phi_arr[i0 : i + 1])
-        seg_dphi = np.clip(np.rad2deg(dphi_arr[i0 : i + 1]), -dphi_clip, dphi_clip)
+        seg_phi = np.rad2deg(phi_arr[i0:i + 1])
+        seg_dphi = np.clip(np.rad2deg(dphi_arr[i0:i + 1]), -dphi_clip, dphi_clip)
         trail.set_data(seg_phi, seg_dphi)
 
+    def init():
+        for col in columns:
+            update_ship(col["art"], 0.0)
+            col["cursor"].set_xdata([0.0, 0.0])
+            col["txt"].set_text("")
+            col["dot"].set_data([], [])
+            col["trail"].set_data([], [])
+        return ()
+
     def animate(i):
-        update_ship(art_L, phi_stable_anim[i])
-        update_ship(art_R, phi_capsize_anim[i])
-        cursor_L.set_xdata([t_anim[i], t_anim[i]])
-        cursor_R.set_xdata([t_anim[i], t_anim[i]])
-        txt_L.set_text(status_str(phi_stable_anim[i], u_stable_anim[i], t_anim[i]))
-        txt_R.set_text(status_str(phi_capsize_anim[i], u_capsize_anim[i], t_anim[i]))
-        update_phase(dot_L, trail_L, phi_stable_anim, dphi_stable_anim, i, dphi_max_L)
-        update_phase(dot_R, trail_R, phi_capsize_anim, dphi_capsize_anim, i, dphi_max_R)
+        for col in columns:
+            phi_now = col["phi_anim"][i]
+            u_now = col["u_anim"][i]
+            update_ship(col["art"], phi_now)
+            col["cursor"].set_xdata([t_anim[i], t_anim[i]])
+            col["txt"].set_text(status_str(phi_now, u_now, t_anim[i]))
+            update_phase(col["dot"], col["trail"],
+                         col["phi_anim"], col["dphi_anim"],
+                         i, col["dphi_clip"])
         return ()
 
     anim = FuncAnimation(

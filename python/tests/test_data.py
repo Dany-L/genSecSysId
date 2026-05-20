@@ -153,7 +153,15 @@ class TestCreateDataloaders:
         val_inputs = np.random.randn(20, 50, 2)
         val_outputs = np.random.randn(20, 50, 1)
         
-        train_loader, val_loader, test_loader, normalizer = create_dataloaders(
+        (
+            train_loader,
+            val_loader,
+            test_loader,
+            train_div_loader,
+            val_div_loader,
+            test_div_loader,
+            normalizer,
+        ) = create_dataloaders(
             train_inputs=train_inputs,
             train_outputs=train_outputs,
             val_inputs=val_inputs,
@@ -161,10 +169,13 @@ class TestCreateDataloaders:
             batch_size=16,
             normalize=True,
         )
-        
+
         assert len(train_loader) > 0
         assert len(val_loader) > 0
         assert test_loader is None
+        assert train_div_loader is None
+        assert val_div_loader is None
+        assert test_div_loader is None
         assert normalizer is not None
 
 

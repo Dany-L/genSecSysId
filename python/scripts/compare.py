@@ -230,7 +230,7 @@ class RunComparator:
         if state_col and len(state_col) == 0:
             state_col = None
         try:
-            inputs, outputs, states, filenames = load_csv_folder(
+            in_l, out_l, st_l, filenames = load_csv_folder(
                 folder_path=str(test_path),
                 input_col=ref_config.data.input_col,
                 output_col=ref_config.data.output_col,
@@ -241,6 +241,11 @@ class RunComparator:
             logger.error(f"Failed to load test data: {e}")
             return None, None, None
 
+        # load_csv_folder returns per-trajectory lists; stack into 3D arrays
+        # for the (n_files, T, n_features) tensors downstream code expects.
+        inputs = np.stack(in_l, axis=0)
+        outputs = np.stack(out_l, axis=0)
+        states = np.stack(st_l, axis=0) if st_l is not None else None
         logger.info(f"Loaded {len(filenames)} files from {test_path}")
         if states is not None:
             logger.info(f"  states: {states.shape}")
