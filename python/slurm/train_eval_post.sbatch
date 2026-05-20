@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=genSecSysId-pipeline
 #SBATCH --partition=gpu-dev
-#SBATCH --time=24:00:00
+#SBATCH --time=08:00:00
 #SBATCH --ntasks=1
 #SBATCH --nodes=1
 #SBATCH --mem=16GB
@@ -32,7 +32,7 @@ MODEL_TYPE="crnn"
 # Test/train data directories handed to evaluate.py and post_process.py.
 # Evaluate accepts either a parent folder containing test/ or the test/ folder
 # directly; post_process needs both train and test split folders.
-DATA_DIR="${DATA_ROOT}/data/Duffing"
+DATA_DIR="${DATA_ROOT}/data"
 TEST_DATA="${DATA_DIR}"
 POST_TEST_DATA="${DATA_DIR}/test"
 POST_TRAIN_DATA="${DATA_DIR}/train"
@@ -47,7 +47,7 @@ mkdir -p ./Report/genSecSysId
 # Environment
 # -----------------------------------------------------------------------------
 source "${VENV_DIR}/bin/activate"
-export PYTHONPATH="${REPO_DIR}/src:${PYTHONPATH}"
+export PYTHONPATH="${REPO_DIR}/src:${PYTHONPATH:-}"
 cd "${REPO_DIR}"
 
 echo "=== Job info ==="
@@ -119,8 +119,6 @@ echo "############################################################"
 POST_ARGS=(
     --run-id "${RUN_ID}"
     --config "${CONFIG_FILE}"
-    --test-data "${POST_TEST_DATA}"
-    --train-data "${POST_TRAIN_DATA}"
 )
 if [[ -n "${TRUE_DYNAMICS}" ]]; then
     POST_ARGS+=(--true-dynamics "${TRUE_DYNAMICS}")

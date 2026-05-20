@@ -14,7 +14,7 @@
 # Keep the YAML config identical between the two scripts — only --device differs.
 
 REPO_DIR="${HOME}/01_git/genSecSysId/python"
-VENV_DIR="${HOME}/venv/genSecSysId"
+VENV_DIR="${HOME}/venv/py311"
 DATA_ROOT="/data/work/${USER}/Duffing"
 CONFIG_FILE="${DATA_ROOT}/config/crnn_gen-sec_duffing.yaml"
 

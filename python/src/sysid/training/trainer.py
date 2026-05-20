@@ -692,29 +692,12 @@ class Trainer:
         # The best model weights are available as artifacts/models/best_model.pt
         if self.mlflow_tracking and "final" in filename:
             try:
-                # Get a sample batch from train_loader for input example
-                sample_batch = next(iter(self.train_loader))
-                if isinstance(sample_batch, (tuple, list)):
-                    if len(sample_batch) == 3:
-                        sample_input, _, _ = sample_batch  # (input, output, initial_state)
-                    elif len(sample_batch) >= 2:
-                        sample_input, _ = sample_batch  # (input, output)
-                    else:
-                        sample_input = sample_batch[0]
-                else:
-                    sample_input = sample_batch
-
-                # Move to correct device and get a single sample
-                sample_input = sample_input[:1].to(self.device)
-
-                # Log model with input example (auto-generates signature)
-                mlflow.pytorch.log_model(
-                    pytorch_model=self.model, name="model", input_example=sample_input.cpu().numpy()
-                )
+                # Log the already-saved checkpoint as an artifact.
+                # mlflow.log_artifact uses the legacy artifacts API and is
+                # compatible with all MLflow tracking server versions.
+                mlflow.log_artifact(str(checkpoint_path), artifact_path="model")
             except Exception as e:
-                # Fallback: log without input example if something goes wrong
-                print(f"Warning: Could not create input example for model signature: {e}")
-                mlflow.pytorch.log_model(pytorch_model=self.model, name="model")
+                print(f"Warning: Could not log model artifact to MLflow: {e}")
 
     def save_parameters_mat(self, filename: str):
         """
