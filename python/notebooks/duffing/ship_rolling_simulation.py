@@ -28,7 +28,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-import yaml
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
 from matplotlib.patches import Polygon
@@ -37,7 +36,7 @@ REPO_PY = Path(__file__).resolve().parents[2]  # .../python
 if str(REPO_PY / "src") not in sys.path:
     sys.path.insert(0, str(REPO_PY / "src"))
 
-from sysid.config import Config  # noqa: E402
+from sysid.config import resolve_run_artifacts  # noqa: E402
 from sysid.data import DataNormalizer  # noqa: E402
 from sysid.evaluation.true_dynamics import DUFFING_TS, DUFFING_U_C  # noqa: E402
 from sysid.models import load_model  # noqa: E402
@@ -63,46 +62,21 @@ def pad_1d(arr, n):
     return np.concatenate([arr, np.full(n - k, arr[-1])])
 
 
-def resolve_run(run_id, data_root=DEFAULT_DATA_ROOT):
-    """Resolve a training-run id to (Config, model_path, normalizer_path).
-
-    train.py writes per-run artefacts to the standard layout:
-        <root>/outputs/<model_type>/<run_id>/config.yaml
-        <root>/models/<model_type>/<run_id>/best_model.pt
-        <root>/models/<model_type>/<run_id>/normalizer.json
-    The per-run YAML is written by yaml.dump and contains `!!python/tuple`
-    tags (from OptimizerConfig.betas), so it can't be parsed by safe_load
-    the way Config.from_yaml does — we use yaml.full_load instead.
-    """
-    base = Path(data_root).expanduser()
-    matches = list(base.glob(f"outputs/*/{run_id}/config.yaml"))
-    if not matches:
-        raise FileNotFoundError(
-            f"No config.yaml found for run_id={run_id} under {base / 'outputs'}/*/"
-        )
-    if len(matches) > 1:
-        raise RuntimeError(
-            f"Multiple configs match run_id={run_id}: {[str(p) for p in matches]}"
-        )
-    config_path = matches[0]
-    model_type = config_path.parent.parent.name
-    with open(config_path) as f:
-        cfg_dict = yaml.full_load(f)
-    config = Config.from_dict(cfg_dict)
-    model_path = base / "models" / model_type / run_id / "best_model.pt"
-    normalizer_path = base / "models" / model_type / run_id / "normalizer.json"
-    if not model_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found at {model_path}")
-    return config, model_path, normalizer_path
-
-
 def load_learned_model(run_id, data_root=DEFAULT_DATA_ROOT, device="cpu"):
-    """Resolve a run id and return (model, normalizer)."""
-    config, model_path, normalizer_path = resolve_run(run_id, data_root=data_root)
+    """Resolve a run id and return (model, normalizer).
+
+    Uses the shared sysid.config.resolve_run_artifacts helper, which reads
+    the per-run YAML with a restricted SafeLoader subclass (only ``!!python/tuple``
+    is recognised, mapped to a list) rather than ``yaml.full_load`` — so a
+    tampered config can't construct arbitrary Python objects.
+    """
+    config, model_path, normalizer_path, _ = resolve_run_artifacts(
+        run_id, data_root=data_root
+    )
     model = load_model(str(model_path), config, device=device)
     model.eval()
     normalizer = (
-        DataNormalizer.load(str(normalizer_path)) if normalizer_path.exists() else None
+        DataNormalizer.load(str(normalizer_path)) if normalizer_path is not None else None
     )
     return model, normalizer
 
