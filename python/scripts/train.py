@@ -437,10 +437,11 @@ def main():
         else:
             mlflow.log_param("has_structural_constraints", False)
 
-        # Save config
+        # Save config — uploaded to MLflow in bulk via log_artifacts(run_output_dir,
+        # "outputs") at the end of training, so no individual log here (avoids
+        # the root-level config.yaml duplicating outputs/config.yaml).
         config_save_path = run_output_dir / "config.yaml"
         config.save_yaml(str(config_save_path))
-        mlflow.log_artifact(str(config_save_path))
         logger.info(f"Config saved to {config_save_path}")
 
         # Save run_id for later use (evaluation/analysis)

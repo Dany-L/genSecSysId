@@ -203,8 +203,9 @@ class Trainer:
             ellipse_plot_path = temp_output_dir / f"ellipse-{name}.png"
             fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
-            if self.mlflow_tracking:
-                mlflow.log_artifact(str(ellipse_plot_path), artifact_path="predictions")
+            # Plots are uploaded in bulk by train.py via log_artifacts at the
+            # end of training (avoids the predictions/ vs outputs/predictions/
+            # duplicate in MLflow).
 
         # Generate plot
         plot_path = temp_output_dir / f"{name}.png"
@@ -217,10 +218,6 @@ class Trainer:
             save_path=str(plot_path),
             warmup_steps=self.warmup_steps,
         )
-
-        # Log to MLflow
-        if self.mlflow_tracking:
-            mlflow.log_artifact(str(plot_path), artifact_path="predictions")
 
     def plot_trajectories_div(self, normalizer=None, name="initial_trajectories_div"):
         """Plot model predictions on diverging validation trajectories.
@@ -299,9 +296,7 @@ class Trainer:
             save_path=str(plot_path),
             warmup_steps=0,
         )
-
-        if self.mlflow_tracking:
-            mlflow.log_artifact(str(plot_path), artifact_path="predictions")
+        # Plot uploaded in bulk by train.py at end of training (no duplicate).
 
     def decay_regularization(self):
         """
@@ -909,17 +904,10 @@ class Trainer:
         if "best" in filename:
             self.save_parameters_mat(filename.replace(".pt", "_params.mat"))
 
-        # Only log model to MLflow for final model (not every best model update)
-        # This avoids slowdown from logging the model every time validation improves
-        # The best model weights are available as artifacts/models/best_model.pt
-        if self.mlflow_tracking and "final" in filename:
-            try:
-                # Log the already-saved checkpoint as an artifact.
-                # mlflow.log_artifact uses the legacy artifacts API and is
-                # compatible with all MLflow tracking server versions.
-                mlflow.log_artifact(str(checkpoint_path), artifact_path="model")
-            except Exception as e:
-                print(f"Warning: Could not log model artifact to MLflow: {e}")
+        # Checkpoint files are uploaded in bulk by train.py via
+        # log_artifacts(run_model_dir, "models") at the end of training, so we
+        # don't log_artifact here — that would create a duplicate model/ folder
+        # alongside the models/ one from the bulk upload.
 
     def save_parameters_mat(self, filename: str):
         """

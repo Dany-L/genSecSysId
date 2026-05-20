@@ -5,8 +5,8 @@ Usage:
 
 Config, checkpoint, and normalizer are all resolved from the standard
 training layout under --data-root (default: ~/genSecSysId-Data). Test
-data defaults to the test/ split of the dataset the run was trained on
-(config.data.train_path) unless overridden with --test-data.
+data defaults to <config.data.train_path>/test unless overridden with
+--test-data.
 """
 
 import argparse
@@ -24,7 +24,7 @@ from sysid.config import resolve_run_artifacts, setup_mlflow_tracking
 from sysid.data import DataLoader, DataNormalizer
 from sysid.data.direct_loader import load_csv_folder, load_split_data
 from sysid.data.loader import collate_with_optional_states
-from sysid.evaluation import Evaluator
+from sysid.evaluation import Evaluator, compute_metrics
 from sysid.models import load_model
 from sysid.utils import plot_predictions
 
@@ -94,8 +94,8 @@ def main():
     )
     parser.add_argument(
         "--test-data", type=str, default=None,
-        help="Path to test data (folder with test/ subfolder, folder of CSVs, "
-             "or single .csv/.npy file). Defaults to config.data.train_path.",
+        help="Path to test data (folder of CSVs, folder with a test/ subfolder, "
+             "or single .csv/.npy file). Defaults to <config.data.train_path>/test.",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     args = parser.parse_args()
@@ -140,13 +140,13 @@ def main():
     logger.info(f"Using device: {device}")
     print(f"Using device: {device}")
 
-    # Resolve test data path. Default to the dataset the run was trained on.
+    # Resolve test data path. Default to the test/ split of the dataset the
+    # run was trained on; --test-data overrides.
     if args.test_data is None:
-        test_data_arg = config.data.train_path
-        logger.info(f"--test-data not provided, defaulting to {test_data_arg}")
+        test_path = Path(os.path.expanduser(config.data.train_path)) / "test"
+        logger.info(f"--test-data not provided, defaulting to {test_path}")
     else:
-        test_data_arg = args.test_data
-    test_path = Path(os.path.expanduser(test_data_arg))
+        test_path = Path(os.path.expanduser(args.test_data))
 
     # Load test data
     logger.info("Loading test data...")
@@ -161,8 +161,9 @@ def main():
                 if state_col and len(state_col) == 0:
                     state_col = None
 
-                # Load only test data (plus optional test_div)
-                use_div = getattr(config.data, "use_diverging_trajectories", False)
+                # Load test/ (and test_div/ if present on disk — independent of
+                # how the run was trained, so divergent metrics can be reported
+                # for any run as long as a test_div/ folder exists).
                 result = load_split_data(
                     data_dir=str(test_path),
                     input_col=getattr(config.data, "input_col", ["d"]),
@@ -172,7 +173,7 @@ def main():
                     load_train=False,  # Don't load training data
                     load_val=False,  # Don't load validation data
                     load_test=True,  # Only load test data
-                    load_div=use_div,
+                    load_div=True,  # Auto-skip if test_div/ is missing.
                 )
                 (
                     _, _,
@@ -186,7 +187,7 @@ def main():
                 logger.info(f"Loaded test data: {test_inputs.shape[0]} sequences")
                 if test_states is not None:
                     logger.info(f"State information loaded: {test_states.shape}")
-                if use_div and test_div_inputs is not None:
+                if test_div_inputs is not None:
                     logger.info(f"Loaded test_div data: {len(test_div_inputs)} sequences")
             else:
                 logger.info("Loading directly from CSV folder...")
@@ -196,17 +197,45 @@ def main():
                 if state_col and len(state_col) == 0:
                     state_col = None
 
-                test_inputs, test_outputs, test_states, filenames = load_csv_folder(
+                test_in_l, test_out_l, test_st_l, filenames = load_csv_folder(
                     folder_path=str(test_path),
                     input_col=getattr(config.data, "input_col", ["d"]),
                     output_col=getattr(config.data, "output_col", ["e"]),
                     state_col=state_col,
                     pattern=getattr(config.data, "pattern", "*.csv"),
                 )
+                # load_csv_folder returns per-trajectory lists; stack into the
+                # (n_files, T, n_features) tensor downstream code expects.
+                test_inputs = np.stack(test_in_l, axis=0)
+                test_outputs = np.stack(test_out_l, axis=0)
+                test_states = np.stack(test_st_l, axis=0) if test_st_l is not None else None
                 logger.info(f"Loaded {len(filenames)} files from test set")
                 if test_states is not None:
                     logger.info(f"State information loaded: {test_states.shape}")
+
+                # Sibling diverging folder (e.g. .../test/ → .../test_div/).
+                # Variable-length trajectories stay as lists for the downstream
+                # batch_size=1 div loader.
                 test_div_inputs = test_div_outputs = test_div_states = None
+                div_sibling = test_path.parent / f"{test_path.name}_div"
+                if div_sibling.is_dir():
+                    try:
+                        div_in_l, div_out_l, div_st_l, div_files = load_csv_folder(
+                            folder_path=str(div_sibling),
+                            input_col=getattr(config.data, "input_col", ["d"]),
+                            output_col=getattr(config.data, "output_col", ["e"]),
+                            state_col=state_col,
+                            pattern=getattr(config.data, "pattern", "*.csv"),
+                        )
+                        test_div_inputs = div_in_l
+                        test_div_outputs = div_out_l
+                        test_div_states = div_st_l
+                        logger.info(
+                            f"Loaded test_div data from {div_sibling}: "
+                            f"{len(div_files)} sequences"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Could not load {div_sibling}: {e}")
 
         elif test_path.suffix == ".csv":
             logger.info("Loading from single CSV file...")
@@ -278,8 +307,16 @@ def main():
     test_div_loader = None
     if test_div_inputs is not None:
         if normalizer is not None:
-            test_div_inputs_norm = [normalizer.transform_inputs(a) for a in test_div_inputs]
-            test_div_outputs_norm = [normalizer.transform_outputs(a) for a in test_div_outputs]
+            # The normalizer promotes 2D (T, n) → 3D (1, T, n); reshape back so
+            # VariableLengthDataset stores per-trajectory (T, n) tensors.
+            test_div_inputs_norm = [
+                np.asarray(normalizer.transform_inputs(a)).reshape(a.shape)
+                for a in test_div_inputs
+            ]
+            test_div_outputs_norm = [
+                np.asarray(normalizer.transform_outputs(a)).reshape(a.shape)
+                for a in test_div_outputs
+            ]
         else:
             test_div_inputs_norm = test_div_inputs
             test_div_outputs_norm = test_div_outputs
@@ -322,8 +359,7 @@ def main():
 
                 fig, ax = plot_ellipse_and_parallelogram(X, H, s, max_norm_x0, show=False)
 
-                ellipse_plot_path = output_dir / "ellipse_polytope.png"
-                ellipse_plot_path.parent.mkdir(parents=True, exist_ok=True)
+                ellipse_plot_path = eval_dir / "ellipse_polytope.png"
                 fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
                 plt.close(fig)
                 logger.info(f"Ellipse/polytope plot saved to {ellipse_plot_path}")
@@ -337,11 +373,19 @@ def main():
     # Set up MLflow tracking (must happen before mlflow.start_run).
     setup_mlflow_tracking(config)
 
+    # Eval artefacts go into a dedicated subfolder so they don't mingle with
+    # the training-time artefacts (e.g. <output_dir>/predictions/epoch_*.png)
+    # that were already logged to MLflow during training. Logging the whole
+    # output_dir under "evaluation" would otherwise duplicate every training
+    # plot under evaluation/predictions/.
+    eval_dir = output_dir / "evaluation"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+
     # Create evaluator
     evaluator = Evaluator(
         model=model,
         device=str(device),
-        output_dir=str(output_dir),
+        output_dir=str(eval_dir),
         warmup_steps=config.training.warmup_steps,
     )
 
@@ -356,57 +400,113 @@ def main():
         with mlflow.start_run(run_id=args.run_id):
             logger.info(f"Logging evaluation to MLflow run: {args.run_id}")
 
+            # --- Converging pass --------------------------------------------------
             results = evaluator.evaluate(
                 test_loader=test_loader,
                 normalizer=normalizer,
             )
+            metrics_conv = filter_metrics(results.get("metrics", {}), config.evaluation.metrics)
+            for metric, value in metrics_conv.items():
+                if isinstance(value, (int, float)) and metric != "per_step":
+                    mlflow.log_metric(f"eval_conv_{metric}", value)
+                    # Also log under the legacy `eval_<metric>` name (historically
+                    # that was the conv-only metric) so existing dashboards keep
+                    # working and old runs compare directly to new ones.
+                    mlflow.log_metric(f"eval_{metric}", value)
+                    logger.info(f"conv {metric}: {value:.6f}")
+
+            # Conv pooled samples (post-warmup) so we can combine with div.
+            warmup = config.training.warmup_steps
+            e_hat_full = results["e_hat"]
+            e_full = results["e"]
+            n_out = e_hat_full.shape[-1]
+            e_hat_conv_pool = e_hat_full[:, warmup:, :].reshape(-1, n_out)
+            e_conv_pool = e_full[:, warmup:, :].reshape(-1, n_out)
+
+            # --- Diverging pass (if available) ------------------------------------
             if test_div_loader is not None:
-                evaluator.evaluate_diverging(
+                div_results = evaluator.evaluate_diverging(
                     test_div_loader=test_div_loader,
                     normalizer=normalizer,
                 )
+                metrics_div = filter_metrics(
+                    div_results["metrics_div"], config.evaluation.metrics
+                )
+                for metric, value in metrics_div.items():
+                    if isinstance(value, (int, float)) and metric != "per_step":
+                        mlflow.log_metric(f"eval_div_{metric}", value)
+                        logger.info(f"div {metric}: {value:.6f}")
+                mlflow.log_metric(
+                    "eval_div_num_trajectories", div_results["num_trajectories_div"]
+                )
 
-            all_metrics = results.get("metrics", {})
-            metrics = filter_metrics(all_metrics, config.evaluation.metrics)
-
-            for metric, value in metrics.items():
-                if isinstance(value, (int, float)) and metric != "per_step":
-                    mlflow.log_metric(f"eval_{metric}", value)
-                    logger.info(f"{metric}: {value:.6f}")
+                # --- Overall (conv post-warmup + div, pooled) ---------------------
+                e_hat_div_pool = div_results["e_hat_div"]
+                e_div_pool = div_results["e_div"]
+                e_hat_all = np.concatenate([e_hat_conv_pool, e_hat_div_pool], axis=0)
+                e_all = np.concatenate([e_conv_pool, e_div_pool], axis=0)
+                metrics_overall = filter_metrics(
+                    compute_metrics(e_hat_all, e_all), config.evaluation.metrics
+                )
+                for metric, value in metrics_overall.items():
+                    if isinstance(value, (int, float)) and metric != "per_step":
+                        mlflow.log_metric(f"eval_overall_{metric}", value)
+                        logger.info(f"overall {metric}: {value:.6f}")
+            else:
+                logger.info(
+                    "No diverging test data — div/overall metrics not computed."
+                )
 
             logger.info("Generating plots and analysis...")
             print("\nGenerating plots...")
 
+            def _pick_indices(n, max_extra=4):
+                idx = [0]
+                if n > 1:
+                    others = list(range(1, n))
+                    k = min(max_extra, len(others))
+                    idx.extend(np.random.choice(others, size=k, replace=False).tolist())
+                return idx
+
+            # Converging prediction plot + error analysis.
             try:
-                e_hat = np.load(output_dir / "predictions.npy")
-                e = np.load(output_dir / "targets.npy")
-                d = np.load(output_dir / "inputs.npy")
-
-                num_sequences = e_hat.shape[0]
-                sample_indices = [0]
-                if num_sequences > 1:
-                    other_indices = list(range(1, num_sequences))
-                    num_random = min(4, len(other_indices))
-                    random_indices = np.random.choice(
-                        other_indices, size=num_random, replace=False
-                    ).tolist()
-                    sample_indices.extend(random_indices)
-
+                e_hat = np.load(eval_dir / "predictions.npy")
+                e = np.load(eval_dir / "targets.npy")
+                d = np.load(eval_dir / "inputs.npy")
                 plot_predictions(
                     evaluator.output_dir, e_hat, e, d,
-                    sample_indices=sample_indices,
+                    sample_indices=_pick_indices(e_hat.shape[0]),
                     warmup_steps=config.training.warmup_steps,
                 )
                 evaluator.analyze_errors(e_hat, e)
-                logger.info("Plots generated successfully")
+                logger.info("Conv plots generated successfully")
             except Exception as e_err:
-                logger.warning(f"Failed to generate plots: {e_err}")
+                logger.warning(f"Failed to generate conv plots: {e_err}")
 
-            mlflow.log_artifacts(str(output_dir), "evaluation")
+            # Diverging prediction plot (variable-length trajectories, NaN-padded
+            # to a common length; matplotlib silently skips NaN points so each
+            # trajectory ends at its real final step).
+            div_pred_path = eval_dir / "predictions_div.npy"
+            if div_pred_path.exists():
+                try:
+                    e_hat_d = np.load(div_pred_path)
+                    e_d = np.load(eval_dir / "targets_div.npy")
+                    d_d = np.load(eval_dir / "inputs_div.npy")
+                    plot_predictions(
+                        evaluator.output_dir, e_hat_d, e_d, d_d,
+                        sample_indices=_pick_indices(e_hat_d.shape[0]),
+                        save_path=str(eval_dir / "predictions_div_plot.png"),
+                        warmup_steps=0,
+                    )
+                    logger.info("Div plot generated successfully")
+                except Exception as e_err:
+                    logger.warning(f"Failed to generate div plot: {e_err}")
+
+            mlflow.log_artifacts(str(eval_dir), "evaluation")
             logger.info("Evaluation artifacts logged to MLflow")
 
-        logger.info(f"Predictions plot: {output_dir / 'predictions_plot.png'}")
-        logger.info(f"Error analysis: {output_dir / 'error_analysis.png'}")
+        logger.info(f"Predictions plot: {eval_dir / 'predictions_plot.png'}")
+        logger.info(f"Error analysis: {eval_dir / 'error_analysis.png'}")
 
     except Exception as e:
         logger.error(f"Evaluation failed: {e}")
@@ -416,8 +516,8 @@ def main():
     logger.info("=" * 70)
     logger.info("Evaluation completed successfully!")
     logger.info("=" * 70)
-    logger.info(f"Results saved to: {output_dir}")
-    logger.info(f"Metrics file: {output_dir / 'evaluation_results.json'}")
+    logger.info(f"Results saved to: {eval_dir}")
+    logger.info(f"Metrics file: {eval_dir / 'evaluation_results.json'}")
     logger.info(f"Evaluation metrics logged to training run: {args.run_id}")
     print(f"\nEvaluation completed! Metrics logged to MLflow run {args.run_id[:8]}")
 

@@ -156,11 +156,17 @@ class Evaluator:
         """Evaluate model on diverging (variable-length) test trajectories.
 
         Each trajectory is consumed in full from t=0 with no warmup
-        skipping. Metrics are computed per trajectory and then averaged
-        across trajectories. Expects batch_size=1 (one full trajectory per
-        batch).
+        skipping. The primary ``metrics_div`` are computed by pooling all
+        timesteps from all trajectories into one (N, n_out) array — the
+        same approach evaluate() uses on the converging set — so callers
+        can directly concatenate the conv pool with the div pool to get
+        an overall metric. ``metrics_div_per_traj`` keeps the per-trajectory
+        mean for reference. Expects batch_size=1 (one trajectory per batch).
         """
         per_traj_metrics = []
+        flat_preds = []  # list of (T_i, n_out) per trajectory
+        flat_targs = []
+        flat_inputs = []  # list of (T_i, n_in) per trajectory
 
         with torch.no_grad():
             for batch in test_div_loader:
@@ -177,38 +183,90 @@ class Evaluator:
 
                 e_hat_np = e_hat.cpu().numpy()
                 e_np = e.cpu().numpy()
+                d_np = d.cpu().numpy()
 
                 if normalizer is not None:
                     e_hat_np = normalizer.inverse_transform_outputs(e_hat_np)
                     e_np = normalizer.inverse_transform_outputs(e_np)
+                    d_np = normalizer.inverse_transform_inputs(d_np)
 
                 for b in range(e_np.shape[0]):
                     per_traj_metrics.append(compute_metrics(e_hat_np[b], e_np[b]))
+                    flat_preds.append(e_hat_np[b])
+                    flat_targs.append(e_np[b])
+                    flat_inputs.append(d_np[b])
 
-        # Aggregate metrics (mean across trajectories).
-        agg = {}
+        # Pooled metrics — same approach as evaluate() on the conv side.
+        pooled_preds = np.concatenate(flat_preds, axis=0) if flat_preds else None
+        pooled_targs = np.concatenate(flat_targs, axis=0) if flat_targs else None
+        pooled_metrics = (
+            compute_metrics(pooled_preds, pooled_targs) if flat_preds else {}
+        )
+
+        # Per-trajectory averaged metrics (kept for reference / comparison).
+        per_traj_agg = {}
         if per_traj_metrics:
             for key in per_traj_metrics[0].keys():
                 if key == "per_step":
                     continue
                 vals = [m[key] for m in per_traj_metrics if key in m]
                 if vals:
-                    agg[key] = float(np.mean(vals))
+                    per_traj_agg[key] = float(np.mean(vals))
 
         results = {
-            "metrics_div": agg,
+            "metrics_div": pooled_metrics,
+            "metrics_div_per_traj": per_traj_agg,
+            "e_hat_div": pooled_preds,
+            "e_div": pooled_targs,
             "num_trajectories_div": len(per_traj_metrics),
         }
 
         if save_files:
             with open(self.output_dir / "evaluation_results_div.json", "w") as f:
-                json.dump({"metrics_div": agg, "num_trajectories_div": len(per_traj_metrics)}, f, indent=2)
+                json.dump(
+                    {
+                        "metrics_div": {
+                            k: v for k, v in pooled_metrics.items() if k != "per_step"
+                        },
+                        "metrics_div_per_traj": per_traj_agg,
+                        "num_trajectories_div": len(per_traj_metrics),
+                    },
+                    f,
+                    indent=2,
+                )
+
+            # Save per-trajectory predictions/targets/inputs NaN-padded to a
+            # common length so callers can plot with plot_predictions (which
+            # indexes by sample). matplotlib silently skips NaN points, so
+            # shorter trajectories simply end at their final real step.
+            if flat_preds:
+                max_len = max(a.shape[0] for a in flat_preds)
+
+                def _nan_pad(arrays, n_cols):
+                    out = np.full((len(arrays), max_len, n_cols), np.nan)
+                    for i, a in enumerate(arrays):
+                        out[i, : a.shape[0], :] = a
+                    return out
+
+                np.save(
+                    self.output_dir / "predictions_div.npy",
+                    _nan_pad(flat_preds, flat_preds[0].shape[1]),
+                )
+                np.save(
+                    self.output_dir / "targets_div.npy",
+                    _nan_pad(flat_targs, flat_targs[0].shape[1]),
+                )
+                np.save(
+                    self.output_dir / "inputs_div.npy",
+                    _nan_pad(flat_inputs, flat_inputs[0].shape[1]),
+                )
 
         if print_results:
-            print("Diverging Evaluation Results:")
+            print("Diverging Evaluation Results (pooled across all div timesteps):")
             print(f"  trajectories: {len(per_traj_metrics)}")
-            for key, value in agg.items():
-                print(f"  {key}_div: {value:.6f}")
+            for key, value in pooled_metrics.items():
+                if key != "per_step" and isinstance(value, (int, float)):
+                    print(f"  {key}_div: {value:.6f}")
 
         return results
 
