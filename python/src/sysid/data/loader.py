@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader as TorchDataLoader
 
-from .dataset import TimeSeriesDataset
+from .dataset import TimeSeriesDataset, VariableLengthDataset
 from .normalizer import DataNormalizer
 
 torch.set_default_dtype(torch.float64)
@@ -105,6 +105,15 @@ def create_dataloaders(
     train_states: Optional[np.ndarray] = None,
     val_states: Optional[np.ndarray] = None,
     test_states: Optional[np.ndarray] = None,
+    train_div_inputs: Optional[np.ndarray] = None,
+    train_div_outputs: Optional[np.ndarray] = None,
+    train_div_states: Optional[np.ndarray] = None,
+    val_div_inputs: Optional[np.ndarray] = None,
+    val_div_outputs: Optional[np.ndarray] = None,
+    val_div_states: Optional[np.ndarray] = None,
+    test_div_inputs: Optional[np.ndarray] = None,
+    test_div_outputs: Optional[np.ndarray] = None,
+    test_div_states: Optional[np.ndarray] = None,
     batch_size: int = 32,
     sequence_length: Optional[int] = None,
     sequence_stride: Optional[int] = None,
@@ -112,7 +121,16 @@ def create_dataloaders(
     normalization_method: str = "minmax",
     shuffle: bool = True,
     num_workers: int = 0,
-) -> Tuple[TorchDataLoader, TorchDataLoader, Optional[TorchDataLoader], Optional[DataNormalizer]]:
+    diverging_batch_size: int = 1,
+) -> Tuple[
+    TorchDataLoader,
+    TorchDataLoader,
+    Optional[TorchDataLoader],
+    Optional[TorchDataLoader],
+    Optional[TorchDataLoader],
+    Optional[TorchDataLoader],
+    Optional[DataNormalizer],
+]:
     """
     Create train, validation, and test data loaders.
 
@@ -133,12 +151,18 @@ def create_dataloaders(
         num_workers: Number of workers for data loading
 
     Returns:
-        Tuple of (train_loader, val_loader, test_loader, normalizer)
+        Tuple of (train_loader, val_loader, test_loader,
+                  train_div_loader, val_div_loader, test_div_loader,
+                  normalizer).
+        Diverging loaders are None when no diverging arrays were provided
+        for that split.
     """
     normalizer = None
 
     if normalize:
         normalizer = DataNormalizer(method=normalization_method)
+        # Normalizer is fit only on converging training data so the
+        # large amplitudes near divergence do not distort the scale.
         normalizer.fit(train_inputs, train_outputs)
 
         train_inputs = normalizer.transform_inputs(train_inputs)
@@ -149,6 +173,21 @@ def create_dataloaders(
         if test_inputs is not None:
             test_inputs = normalizer.transform_inputs(test_inputs)
             test_outputs = normalizer.transform_outputs(test_outputs)
+
+        # Diverging arrays are lists of per-trajectory 2D arrays — normalize each.
+        # The normalizer promotes 2D (T, n) to 3D (1, T, n); squeeze back to 2D
+        # so the VariableLengthDataset stores per-trajectory (T, n) tensors.
+        def _normalize_list(arrs, transform):
+            if arrs is None:
+                return None
+            return [np.asarray(transform(a)).reshape(a.shape) for a in arrs]
+
+        train_div_inputs = _normalize_list(train_div_inputs, normalizer.transform_inputs)
+        train_div_outputs = _normalize_list(train_div_outputs, normalizer.transform_outputs)
+        val_div_inputs = _normalize_list(val_div_inputs, normalizer.transform_inputs)
+        val_div_outputs = _normalize_list(val_div_outputs, normalizer.transform_outputs)
+        test_div_inputs = _normalize_list(test_div_inputs, normalizer.transform_inputs)
+        test_div_outputs = _normalize_list(test_div_outputs, normalizer.transform_outputs)
 
     # Default to non-overlapping windows when sequence_length is set but stride is not specified.
     # This prevents the 901x data multiplication issue from overlapping sequences.
@@ -209,4 +248,37 @@ def create_dataloaders(
             collate_fn=collate_with_optional_states,
         )
 
-    return train_loader, val_loader, test_loader, normalizer
+    # Diverging loaders: lists of variable-length trajectories starting from
+    # x0=0. Each item is one full trajectory; batch_size is fixed to 1 because
+    # different lengths can't be stacked into a single tensor.
+    def _make_div_loader(div_inputs, div_outputs, div_states, do_shuffle):
+        if div_inputs is None:
+            return None
+        ds = VariableLengthDataset(div_inputs, div_outputs, div_states)
+        return TorchDataLoader(
+            ds,
+            batch_size=diverging_batch_size,
+            shuffle=do_shuffle,
+            num_workers=num_workers,
+            collate_fn=collate_with_optional_states,
+        )
+
+    train_div_loader = _make_div_loader(
+        train_div_inputs, train_div_outputs, train_div_states, do_shuffle=shuffle
+    )
+    val_div_loader = _make_div_loader(
+        val_div_inputs, val_div_outputs, val_div_states, do_shuffle=False
+    )
+    test_div_loader = _make_div_loader(
+        test_div_inputs, test_div_outputs, test_div_states, do_shuffle=False
+    )
+
+    return (
+        train_loader,
+        val_loader,
+        test_loader,
+        train_div_loader,
+        val_div_loader,
+        test_div_loader,
+        normalizer,
+    )

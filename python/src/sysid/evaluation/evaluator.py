@@ -146,6 +146,72 @@ class Evaluator:
 
         return results
 
+    def evaluate_diverging(
+        self,
+        test_div_loader: DataLoader,
+        normalizer: Optional[Any] = None,
+        print_results: bool = True,
+        save_files: bool = True,
+    ) -> Dict[str, Any]:
+        """Evaluate model on diverging (variable-length) test trajectories.
+
+        Each trajectory is consumed in full from t=0 with no warmup
+        skipping. Metrics are computed per trajectory and then averaged
+        across trajectories. Expects batch_size=1 (one full trajectory per
+        batch).
+        """
+        per_traj_metrics = []
+
+        with torch.no_grad():
+            for batch in test_div_loader:
+                if len(batch) == 3:
+                    d, e, x0 = batch
+                    x0 = None
+                else:
+                    d, e = batch
+                    x0 = None
+                d = d.to(self.device)
+                e = e.to(self.device)
+
+                e_hat, _, _ = self.model(d, x0, warmup_steps=0)
+
+                e_hat_np = e_hat.cpu().numpy()
+                e_np = e.cpu().numpy()
+
+                if normalizer is not None:
+                    e_hat_np = normalizer.inverse_transform_outputs(e_hat_np)
+                    e_np = normalizer.inverse_transform_outputs(e_np)
+
+                for b in range(e_np.shape[0]):
+                    per_traj_metrics.append(compute_metrics(e_hat_np[b], e_np[b]))
+
+        # Aggregate metrics (mean across trajectories).
+        agg = {}
+        if per_traj_metrics:
+            for key in per_traj_metrics[0].keys():
+                if key == "per_step":
+                    continue
+                vals = [m[key] for m in per_traj_metrics if key in m]
+                if vals:
+                    agg[key] = float(np.mean(vals))
+
+        results = {
+            "metrics_div": agg,
+            "num_trajectories_div": len(per_traj_metrics),
+        }
+
+        if save_files:
+            with open(self.output_dir / "evaluation_results_div.json", "w") as f:
+                json.dump({"metrics_div": agg, "num_trajectories_div": len(per_traj_metrics)}, f, indent=2)
+
+        if print_results:
+            print("Diverging Evaluation Results:")
+            print(f"  trajectories: {len(per_traj_metrics)}")
+            for key, value in agg.items():
+                print(f"  {key}_div: {value:.6f}")
+
+        return results
+
     def analyze_errors(
         self,
         e_hat: np.ndarray,  # predicted output

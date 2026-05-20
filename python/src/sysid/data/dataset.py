@@ -1,6 +1,6 @@
 """PyTorch Dataset for time series data."""
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -108,3 +108,37 @@ class TimeSeriesDataset(Dataset):
             initial_state = self.states[idx, 0] if self.states is not None else None
 
         return input_seq, output_seq, initial_state
+
+
+class VariableLengthDataset(Dataset):
+    """Dataset for variable-length trajectories.
+
+    Each item is a full trajectory of its own length (T_i, n_features). Use
+    with batch_size=1 — different lengths can't be stacked into a single
+    batch tensor, and the trainer's diverging path runs one trajectory per
+    forward pass anyway.
+    """
+
+    def __init__(
+        self,
+        inputs: List[np.ndarray],
+        outputs: List[np.ndarray],
+        states: Optional[List[np.ndarray]] = None,
+    ):
+        assert len(inputs) == len(outputs), "inputs and outputs must have same length"
+        if states is not None:
+            assert len(states) == len(inputs), "states must have same length as inputs"
+        self.inputs = [torch.as_tensor(a, dtype=torch.get_default_dtype()) for a in inputs]
+        self.outputs = [torch.as_tensor(a, dtype=torch.get_default_dtype()) for a in outputs]
+        self.states = (
+            [torch.as_tensor(a, dtype=torch.get_default_dtype()) for a in states]
+            if states is not None
+            else None
+        )
+
+    def __len__(self) -> int:
+        return len(self.inputs)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        initial_state = self.states[idx][0] if self.states is not None else None
+        return self.inputs[idx], self.outputs[idx], initial_state

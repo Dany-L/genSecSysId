@@ -206,8 +206,9 @@ def main():
                 if state_col and len(state_col) == 0:  # Empty list means no state
                     state_col = None
 
-                # Load only test data
-                _, _, _, _, test_inputs, test_outputs, _, _, test_states = load_split_data(
+                # Load only test data (plus optional test_div)
+                use_div = getattr(config.data, "use_diverging_trajectories", False)
+                result = load_split_data(
                     data_dir=str(test_path),
                     input_col=getattr(config.data, "input_col", ["d"]),
                     output_col=getattr(config.data, "output_col", ["e"]),
@@ -216,10 +217,22 @@ def main():
                     load_train=False,  # Don't load training data
                     load_val=False,  # Don't load validation data
                     load_test=True,  # Only load test data
+                    load_div=use_div,
                 )
+                (
+                    _, _,
+                    _, _,
+                    test_inputs, test_outputs,
+                    _, _, test_states,
+                    _, _, _,
+                    _, _, _,
+                    test_div_inputs, test_div_outputs, test_div_states,
+                ) = result
                 logger.info(f"Loaded test data: {test_inputs.shape[0]} sequences")
                 if test_states is not None:
                     logger.info(f"State information loaded: {test_states.shape}")
+                if use_div and test_div_inputs is not None:
+                    logger.info(f"Loaded test_div data: {len(test_div_inputs)} sequences")
             else:
                 # Single folder with CSV files (backward compatibility)
                 logger.info("Loading directly from CSV folder...")
@@ -240,12 +253,14 @@ def main():
                 logger.info(f"Loaded {len(filenames)} files from test set")
                 if test_states is not None:
                     logger.info(f"State information loaded: {test_states.shape}")
+                test_div_inputs = test_div_outputs = test_div_states = None
 
         elif test_path.suffix == ".csv":
             # Fallback: Load from single CSV file
             logger.info("Loading from single CSV file...")
             test_inputs, test_outputs = DataLoader.load_from_csv(args.test_data, delimiter=",")
             test_states = None
+            test_div_inputs = test_div_outputs = test_div_states = None
 
         elif test_path.suffix == ".npy":
             # Legacy: Load from NPY files
@@ -254,6 +269,7 @@ def main():
                 args.test_data, args.test_data.replace("_inputs.npy", "_outputs.npy")
             )
             test_states = None
+            test_div_inputs = test_div_outputs = test_div_states = None
         else:
             raise ValueError(
                 f"Unsupported data format: {args.test_data}\n"
@@ -305,7 +321,7 @@ def main():
 
     from torch.utils.data import DataLoader as TorchDataLoader
 
-    from sysid.data import TimeSeriesDataset
+    from sysid.data import TimeSeriesDataset, VariableLengthDataset
 
     # Always use full sequences for testing (sequence_length=None)
     test_dataset = TimeSeriesDataset(
@@ -322,6 +338,28 @@ def main():
         shuffle=False,
         collate_fn=collate_with_optional_states,
     )
+
+    # Optional diverging test loader: variable-length trajectories, batch_size=1.
+    # test_div_inputs is a list of per-trajectory 2D arrays.
+    test_div_loader = None
+    if test_div_inputs is not None:
+        if normalizer is not None:
+            test_div_inputs_norm = [normalizer.transform_inputs(a) for a in test_div_inputs]
+            test_div_outputs_norm = [normalizer.transform_outputs(a) for a in test_div_outputs]
+        else:
+            test_div_inputs_norm = test_div_inputs
+            test_div_outputs_norm = test_div_outputs
+        test_div_dataset = VariableLengthDataset(
+            test_div_inputs_norm,
+            test_div_outputs_norm,
+            test_div_states,
+        )
+        test_div_loader = TorchDataLoader(
+            test_div_dataset,
+            batch_size=getattr(config.data, "diverging_batch_size", 1),
+            shuffle=False,
+            collate_fn=collate_with_optional_states,
+        )
 
     # Load model
     logger.info("Loading model...")
@@ -401,6 +439,20 @@ def main():
                         mlflow.log_metric(f"eval_{metric}", value)
                         logger.info(f"{metric}: {value:.6f}")
 
+                # Diverging test evaluation (no warmup skipping, batch_size=1)
+                if test_div_loader is not None:
+                    div_results = evaluator.evaluate_diverging(
+                        test_div_loader=test_div_loader,
+                        normalizer=normalizer,
+                    )
+                    div_metrics = filter_metrics(
+                        div_results.get("metrics_div", {}), config.evaluation.metrics
+                    )
+                    for metric, value in div_metrics.items():
+                        if isinstance(value, (int, float)) and metric != "per_step":
+                            mlflow.log_metric(f"eval_{metric}_div", value)
+                            logger.info(f"{metric}_div: {value:.6f}")
+
                 # Generate plots
                 logger.info("Generating plots and analysis...")
                 print("\nGenerating plots...")
@@ -441,6 +493,11 @@ def main():
                 test_loader=test_loader,
                 normalizer=normalizer,
             )
+            if test_div_loader is not None:
+                evaluator.evaluate_diverging(
+                    test_div_loader=test_div_loader,
+                    normalizer=normalizer,
+                )
 
             # Filter metrics based on config
             all_metrics = results.get("metrics", {})

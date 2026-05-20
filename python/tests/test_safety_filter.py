@@ -305,14 +305,15 @@ def test_safety_filter_clamps_real_duffing_trajectory():
             load_test=False,
         )
         (train_inputs, train_outputs, val_inputs, val_outputs,
-         _, _, train_states, val_states, _) = result
+         _, _, train_states, val_states, _,
+         _, _, _, _, _, _, _, _, _) = result
 
         # 2. Compute delta / max_norm_x0 the same way train.py does
         max_norm_x0 = float(np.max(np.linalg.norm(train_states[:, 0, :], 2, axis=1)))
         delta = np.max(np.abs(train_inputs), axis=(0, 1))
 
         # 3. Build dataloaders to get the normalizer
-        _, _, _, normalizer = create_dataloaders(
+        *_, normalizer = create_dataloaders(
             train_inputs=train_inputs, train_outputs=train_outputs,
             train_states=train_states,
             val_inputs=val_inputs, val_outputs=val_outputs,
