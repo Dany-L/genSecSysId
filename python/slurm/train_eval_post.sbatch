@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=genSecSysId-pipeline
-#SBATCH --partition=gpu-dev
-#SBATCH --time=08:00:00
+#SBATCH --partition=gpu
+#SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --nodes=1
 #SBATCH --mem=16GB
@@ -46,6 +46,12 @@ mkdir -p ./Report/genSecSysId
 # -----------------------------------------------------------------------------
 # Environment
 # -----------------------------------------------------------------------------
+# /data/scratch is a shared partition that can fill up from other users.
+# Override TMPDIR so PyTorch and MLflow don't write temp files there.
+export TMPDIR="/data/work/${USER}/tmp/${SLURM_JOB_ID}"
+mkdir -p "${TMPDIR}"
+trap 'rm -rf "${TMPDIR}"' EXIT
+
 source "${VENV_DIR}/bin/activate"
 export PYTHONPATH="${REPO_DIR}/src:${PYTHONPATH:-}"
 cd "${REPO_DIR}"
