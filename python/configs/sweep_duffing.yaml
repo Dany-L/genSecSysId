@@ -1,0 +1,25 @@
+# Hyperparameter sweep definition for the Duffing experiment.
+#
+# Submit with:
+#   cd ~/01_git/genSecSysId/python
+#   bash slurm/submit_sweep.sh configs/sweep_duffing.yaml
+
+sweep_name: duffing
+
+# Base config — overrides are deep-merged on top of this file.
+base_config: /data/work/ac137967/Duffing/config/crnn_gen-sec_duffing.yaml
+
+# Number of independent runs per parameter combination (different random seeds).
+# Seeds used: 0, 1, ..., n_seeds-1.
+n_seeds: 3
+
+# Optional: pass --true-dynamics to post_process.py for each run.
+# true_dynamics: duffing
+
+# Search space: dot-notation keys into the base config, list of values to try.
+# Total array tasks = product of all list lengths × n_seeds.
+# Current: 2 × 2 × 5 = 20 tasks (array indices 0–19).
+search_space:
+  model.nw: [10, 20]
+  optimizer.learning_rate: [0.002, 0.001]
+  data.use_diverging_trajectories: [false, true]
