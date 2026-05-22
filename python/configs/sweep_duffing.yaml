@@ -20,6 +20,7 @@ n_seeds: 3
 # Total array tasks = product of all list lengths × n_seeds.
 # Current: 2 × 2 × 5 = 20 tasks (array indices 0–19).
 search_space:
-  model.nw: [10, 20]
-  optimizer.learning_rate: [0.002, 0.001]
+  model.nw: [10]
+  optimizer.learning_rate: [0.002]
   data.use_diverging_trajectories: [false, true]
+  model.type: ["crnn", "crnn_safe"]
