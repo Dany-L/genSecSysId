@@ -98,7 +98,6 @@ def get_scheduler(
             mode="min",
             factor=kwargs.get("factor", 0.5),
             patience=kwargs.get("patience", 10),
-            verbose=True,
         )
     elif scheduler_type == "cosine":
         return CosineAnnealingLR(
