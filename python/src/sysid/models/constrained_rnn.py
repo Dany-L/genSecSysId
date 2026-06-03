@@ -619,13 +619,15 @@ class SimpleLure(nn.Module):
             missing             -> Gaussian with default_std
         """
         spec = self._identity_init_cfg.get(name, {}) or {}
+        target = getattr(self, name)
+        device, dtype = target.device, target.dtype
 
         if "load_from" in spec:
             path = Path(os.path.expanduser(str(spec["load_from"])))
             if not path.exists():
                 raise FileNotFoundError(f"Init file for '{name}' not found: {path}")
             arr = np.load(path)
-            tensor = torch.tensor(arr)
+            tensor = torch.tensor(arr, device=device, dtype=dtype)
             if tuple(tensor.shape) != tuple(shape):
                 raise ValueError(
                     f"Loaded '{name}' from {path} has shape {tuple(tensor.shape)}, "
@@ -635,7 +637,7 @@ class SimpleLure(nn.Module):
             return tensor
 
         if "value" in spec:
-            tensor = torch.tensor(spec["value"])
+            tensor = torch.tensor(spec["value"], device=device, dtype=dtype)
             if tuple(tensor.shape) != tuple(shape):
                 raise ValueError(
                     f"Fixed init for '{name}' has shape {tuple(tensor.shape)}, "
@@ -646,7 +648,7 @@ class SimpleLure(nn.Module):
 
         std = float(spec.get("std", default_std))
         logger.info(f"  {name}: random N(0, {std}^2)")
-        return std * torch.randn(*shape)
+        return std * torch.randn(*shape, device=device, dtype=dtype)
 
     def _set_param_data(self, name: str, init_data: torch.Tensor):
         """Assign init_data to parameter `name`, respecting partial constraints."""
@@ -680,9 +682,10 @@ class SimpleLure(nn.Module):
                 A_init = self._resolve_init_spec('A', (self.nx, self.nx), default_std=0.0)
             else:
                 A_scale = float(A_spec.get('scale', 1.0))
-                A_ct = torch.tensor([[0.0, 1.0], [0.0, 0.0]])
-                A_ct[1, :] = -A_scale * torch.rand((1, self.nx))
-                A_init = torch.eye(self.nx) + A_ct * self.ts  # Euler discretization
+                device, dtype = self.A.device, self.A.dtype
+                A_ct = torch.tensor([[0.0, 1.0], [0.0, 0.0]], device=device, dtype=dtype)
+                A_ct[1, :] = -A_scale * torch.rand((1, self.nx), device=device, dtype=dtype)
+                A_init = torch.eye(self.nx, device=device, dtype=dtype) + A_ct * self.ts  # Euler discretization
                 logger.info(f"  A: scale={A_scale}, |eig|={torch.linalg.eigvals(A_init).abs().tolist()}")
             self._set_param_data('A', A_init)
 
@@ -697,7 +700,9 @@ class SimpleLure(nn.Module):
                     input_std = getattr(normalizer, 'input_std', None)
                     if input_std is not None:
                         input_scale = input_std.squeeze()
-                B_init = input_scale * self.ts * torch.tensor([[0.0], [1.0]])
+                B_init = input_scale * self.ts * torch.tensor(
+                    [[0.0], [1.0]], device=self.B.device, dtype=self.B.dtype
+                )
             self._set_param_data('B', B_init)
 
         # --- B2, C2, D21: random (configurable std) ---
@@ -715,7 +720,15 @@ class SimpleLure(nn.Module):
             if 'value' in C_spec or 'load_from' in C_spec:
                 C_init = self._resolve_init_spec('C', (self.ne, self.nx), default_std=0.0)
             else:
-                C_init = (1.0 / normalizer.output_std.squeeze()) * torch.tensor([[1.0, 0.0]])
+                if normalizer is None or getattr(normalizer, 'output_std', None) is None:
+                    raise ValueError(
+                        "Identity initialization of 'C' requires a normalizer with "
+                        "'output_std', or an explicit 'identity_init.C.value' / "
+                        "'identity_init.C.load_from' override in custom_params."
+                    )
+                C_init = (1.0 / normalizer.output_std.squeeze()) * torch.tensor(
+                    [[1.0, 0.0]], device=self.C.device, dtype=self.C.dtype
+                )
             self._set_param_data('C', C_init)
 
         # --- D, D12: zero direct feedthrough ---
@@ -728,9 +741,9 @@ class SimpleLure(nn.Module):
             D21_init = self._resolve_init_spec('D21', (self.nz, self.nd), default_std=1.0)
             self._set_param_data('D21', D21_init)
 
-        logger.info(f"  ||A||={np.linalg.norm(self.A.detach().numpy()):.4f}")
-        logger.info(f"  ||C||={np.linalg.norm(self.C.detach().numpy()):.4f}")
-        logger.info(f"  ||C2||={np.linalg.norm(self.C2.detach().numpy()):.4f}")
+        logger.info(f"  ||A||={np.linalg.norm(self.A.detach().cpu().numpy()):.4f}")
+        logger.info(f"  ||C||={np.linalg.norm(self.C.detach().cpu().numpy()):.4f}")
+        logger.info(f"  ||C2||={np.linalg.norm(self.C2.detach().cpu().numpy()):.4f}")
 
     def _init_n4sid(self, train_inputs, train_states, train_outputs, data_dir: Optional[str] = None) -> bool:
         """
