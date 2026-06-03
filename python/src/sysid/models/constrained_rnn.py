@@ -69,6 +69,7 @@ class SimpleLure(nn.Module):
             self.dual_penalty_growth = custom_params.get("dual_penalty_growth", 1.1)
             self.dual_penalty_shrink = custom_params.get("dual_penalty_shrink", 0.9)
             self.l_nonzero_weight = custom_params.get("l_nonzero_weight", 0.0)
+            self._identity_init_cfg = custom_params.get("identity_init", {}) or {}
         else:
             learn_L = True
             self.regularization_method = "interior_point"
@@ -76,6 +77,7 @@ class SimpleLure(nn.Module):
             self.dual_penalty_growth = 1.1
             self.dual_penalty_shrink = 0.9
             self.l_nonzero_weight = 0.0
+            self._identity_init_cfg = {}
 
         self.learn_L = learn_L
 
@@ -600,137 +602,130 @@ class SimpleLure(nn.Module):
 
         
 
+    def _resolve_init_spec(
+        self,
+        name: str,
+        shape: tuple,
+        default_std: float,
+    ) -> torch.Tensor:
+        """
+        Build initialization tensor for parameter `name` from identity_init config.
+
+        Config (under custom_params['identity_init'][name]):
+            {std: float}        -> Gaussian: std * randn(shape)
+            {value: [[...]]}    -> Inline fixed start value
+            {load_from: "*.npy"}-> Load from file (supports ~ expansion)
+            missing             -> Gaussian with default_std
+        """
+        spec = self._identity_init_cfg.get(name, {}) or {}
+
+        if "load_from" in spec:
+            path = Path(os.path.expanduser(str(spec["load_from"])))
+            if not path.exists():
+                raise FileNotFoundError(f"Init file for '{name}' not found: {path}")
+            arr = np.load(path)
+            tensor = torch.tensor(arr)
+            if tuple(tensor.shape) != tuple(shape):
+                raise ValueError(
+                    f"Loaded '{name}' from {path} has shape {tuple(tensor.shape)}, "
+                    f"expected {tuple(shape)}"
+                )
+            logger.info(f"  {name}: loaded from {path}")
+            return tensor
+
+        if "value" in spec:
+            tensor = torch.tensor(spec["value"])
+            if tuple(tensor.shape) != tuple(shape):
+                raise ValueError(
+                    f"Fixed init for '{name}' has shape {tuple(tensor.shape)}, "
+                    f"expected {tuple(shape)}"
+                )
+            logger.info(f"  {name}: fixed value from config")
+            return tensor
+
+        std = float(spec.get("std", default_std))
+        logger.info(f"  {name}: random N(0, {std}^2)")
+        return std * torch.randn(*shape)
+
+    def _set_param_data(self, name: str, init_data: torch.Tensor):
+        """Assign init_data to parameter `name`, respecting partial constraints."""
+        if name in self.structural_constraints:
+            self._apply_partial_initialization(name, init_data)
+        else:
+            getattr(self, name).data = init_data
+
     def _init_identity(self, normalizer: Optional[DataNormalizer] = None):
         """
-        Identity initialization: predefined simple linear system.
+        Identity initialization: stable Euler-discretized A, identity-like C,
+        configurable random B2/C2/D21.
 
-        Sets:
-        - α = 0.99
-        - A = 0.9I (stable, diagonal)
-        - C2 = Rand(-1,1) (random measurement matrix)
-        - C = [I, 0] (identity-like output matrix, padded if nx > ne)
-        - B2 = D = D12 = 0 (no direct feedthrough, all nonlinearity from C2)
-        - B = 0 (can be learned during training)
+        Configurable via ``custom_params['identity_init']``. Each entry accepts:
+            {std: float}             -> Gaussian random (B2, C2, D21)
+            {scale: float}           -> Uniform random magnitude (A's last row only)
+            {value: [[...]]}         -> Inline fixed start value
+            {load_from: "*.npy"}     -> Load fixed start value from file
 
-        This provides a simple stable starting point.
-        
-        Respects structural constraints: only updates learnable parameters/elements.
+        Defaults reproduce the previous behavior (A_scale=1, B2_std=ts,
+        C2_std=1, D21_std=1). Respects ``structural_constraints``: only
+        learnable parts are touched.
         """
-        logger.info("Identity initialization: α=0.99, A=0.9I, random C2, identity-like C")
+        logger.info("Identity initialization")
+        cfg = self._identity_init_cfg
 
-        # self.alpha.data = torch.tensor(0.9999)
-        
-        # A matrix - only update if not fully fixed
+        # --- A: I + ts * A_ct, with last row of A_ct = -scale * U(0,1) ---
         if not self._should_skip_initialization('A'):
-            A_ct = torch.tensor([[0,1.0], [0.0,0.0]])
-            A_ct[1,:] = -torch.rand((1, self.nx))
-            A_dt = torch.eye(self.nx) + A_ct * self.ts # euler discretizatioin
-            A_init = A_dt
-            # torch.nn.init.normal_(A_init, std=1)
-            # A_init = torch.tensor([
-            #     [ 1.   ,  0.05 ],
-            #     [-0.05 ,  0.985]
-            # ])
-            logger.info(f'Absolute eigenvalues of A_init: {torch.linalg.eigvals(A_init).abs()}')
-            if 'A' in self.structural_constraints:
-                self._apply_partial_initialization('A', A_init)
+            A_spec = cfg.get('A', {}) or {}
+            if 'value' in A_spec or 'load_from' in A_spec:
+                A_init = self._resolve_init_spec('A', (self.nx, self.nx), default_std=0.0)
             else:
-                self.A.data = A_init
-        
+                A_scale = float(A_spec.get('scale', 1.0))
+                A_ct = torch.tensor([[0.0, 1.0], [0.0, 0.0]])
+                A_ct[1, :] = -A_scale * torch.rand((1, self.nx))
+                A_init = torch.eye(self.nx) + A_ct * self.ts  # Euler discretization
+                logger.info(f"  A: scale={A_scale}, |eig|={torch.linalg.eigvals(A_init).abs().tolist()}")
+            self._set_param_data('A', A_init)
+
+        # --- B: deterministic input_scale * ts * [0; 1] (override via value/load_from) ---
         if not self._should_skip_initialization('B'):
-            # B_init = torch.tensor([
-            #     [0.0],
-            #     [0.0039662]
-            # ])
-            input_scale = 1.0
-            if normalizer is not None:
-                input_std = getattr(normalizer, 'input_std', None)
-                if input_std is not None:
-                    input_scale = input_std.squeeze()
-            B_init = input_scale * self.ts * torch.tensor([
-                [0.0],
-                [1.0]
-            ])
-            if 'B' in self.structural_constraints:
-                self._apply_partial_initialization('B', B_init)
+            B_spec = cfg.get('B', {}) or {}
+            if 'value' in B_spec or 'load_from' in B_spec:
+                B_init = self._resolve_init_spec('B', (self.nx, self.nd), default_std=0.0)
             else:
-                self.B.data = B_init
-        
+                input_scale = 1.0
+                if normalizer is not None:
+                    input_std = getattr(normalizer, 'input_std', None)
+                    if input_std is not None:
+                        input_scale = input_std.squeeze()
+                B_init = input_scale * self.ts * torch.tensor([[0.0], [1.0]])
+            self._set_param_data('B', B_init)
+
+        # --- B2, C2, D21: random (configurable std) ---
         if not self._should_skip_initialization('B2'):
-            # B2_init = torch.zeros(self.nx, self.nw)
-            B2_init = self.ts * torch.randn((self.nx, self.nw))
-            self.B2.data = B2_init
-            # self.B2.data = torch.zeros(self.nx, self.nw)
-            # self.B2.data = torch.randn(self.nx, self.nw) *0.1
-            # self.B2.data = torch.tensor([
-            #     [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-            #     [
-            #         0.00556457, 0.01755953, 0.04252413, 0.07508705, 0.11689463, 0.16913675, 0.22928246, 0.30034822, 0.37948621, 0.46870539, 0.56760693, 0.67407641, 0.79379072, 0.91629349, 1.05828194, 1.19480956, 1.36282576, 1.50314181, 1.73255    , 0.        
-            #     ]
-            # ])
-            # self.B2.data += torch.randn(self.nx, self.nw) * 0.01 
-            # self.B2.data = torch.tensor(np.random.uniform(-1.1, 1.1, size=(self.nx, self.nw)))
-        
-        # C2 matrix - random initialization
+            B2_init = self._resolve_init_spec('B2', (self.nx, self.nw), default_std=float(self.ts))
+            self._set_param_data('B2', B2_init)
+
         if not self._should_skip_initialization('C2'):
-            C2_init = torch.randn(self.nz, self.nx)
-            # C2_init = torch.tensor(np.random.uniform(-1, 1, size=(self.nz, self.nx)))
-            # C2_init = torch.randn(self.nz, self.nx)*0.9
-            # C2_init = torch.tensor([
-            #     [4.,         0.        ],
-            #     [2.,         0.        ],
-            #     [1.33333333, 0.        ],
-            #     [1.,         0.        ],
-            #     [0.8,        0.        ],
-            #     [0.66666667, 0.        ],
-            #     [0.57142857, 0.        ],
-            #     [0.5,        0.        ],
-            #     [0.44444444, 0.        ],
-            #     [0.4,        0.        ],
-            #     [0.36363636, 0.        ],
-            #     [0.33333333, 0.        ],
-            #     [0.30769231, 0.        ],
-            #     [0.28571429, 0.        ],
-            #     [0.26666667, 0.        ],
-            #     [0.25,       0.        ],
-            #     [0.23529412, 0.        ],
-            #     [0.22222222, 0.        ],
-            #     [0.21052632, 0.        ],
-            #     [0.2,        0.        ]
-            # ])
-            # C2_init += torch.randn(self.nz, self.nx) * 0.01 
-            if 'C2' in self.structural_constraints:
-                self._apply_partial_initialization('C2', C2_init)
-            else:
-                self.C2.data = C2_init
+            C2_init = self._resolve_init_spec('C2', (self.nz, self.nx), default_std=1.0)
+            self._set_param_data('C2', C2_init)
 
+        # --- C: identity-like / output_std (override via value/load_from) ---
         if not self._should_skip_initialization('C'):
-            # C_init_tensor = torch.tensor([
-            #     [6.58489445, 0.0        ]
-            # ])
-            C_init_tensor = 1/normalizer.output_std.squeeze()*torch.tensor([
-                [1.0, 0.0        ]
-            ])
-            if 'C' in self.structural_constraints:
-                self._apply_partial_initialization('C', C_init_tensor)
+            C_spec = cfg.get('C', {}) or {}
+            if 'value' in C_spec or 'load_from' in C_spec:
+                C_init = self._resolve_init_spec('C', (self.ne, self.nx), default_std=0.0)
             else:
-                self.C.data = C_init_tensor
+                C_init = (1.0 / normalizer.output_std.squeeze()) * torch.tensor([[1.0, 0.0]])
+            self._set_param_data('C', C_init)
 
-        # D matrix - initialize to zeros
+        # --- D, D12: zero direct feedthrough ---
         if not self._should_skip_initialization('D'):
             self.D.data = torch.zeros_like(self.D)
-        
-        # D12 matrix - initialize to zeros
         if not self._should_skip_initialization('D12'):
             self.D12.data = torch.zeros_like(self.D12)
 
-        # Random D21 for measurement noise
         if not self._should_skip_initialization('D21'):
-            D21_init = torch.randn(self.nz, self.nd)
-            if 'D21' in self.structural_constraints:
-                self._apply_partial_initialization('D21', D21_init)
-            else:
-                self.D21.data = D21_init
+            D21_init = self._resolve_init_spec('D21', (self.nz, self.nd), default_std=1.0)
+            self._set_param_data('D21', D21_init)
 
         logger.info(f"  ||A||={np.linalg.norm(self.A.detach().numpy()):.4f}")
         logger.info(f"  ||C||={np.linalg.norm(self.C.detach().numpy()):.4f}")

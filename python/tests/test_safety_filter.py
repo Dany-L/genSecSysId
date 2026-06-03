@@ -286,12 +286,14 @@ def test_safety_filter_clamps_real_duffing_trajectory():
 
     # Match train.py's global dtype, and pick a seed under which the random
     # part of the identity init (C2, B2) drives the state out of the safe set
-    # within one trajectory so the filter actually engages. The conftest seed
-    # of 42 happens to keep the state inside the ellipsoid for all 4000 steps.
+    # within one trajectory so the filter actually engages. The chosen seed
+    # is sensitive to changes in _init_identity's RNG consumption order: if
+    # the test starts reporting "Safety filter did not engage", sweep seeds
+    # (e.g. 7, 11, 13, 17, 23, 42, 99) and pick one that produces clamps.
     prev_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.float64)
-    torch.manual_seed(7)
-    np.random.seed(7)
+    torch.manual_seed(42)
+    np.random.seed(42)
     try:
         config = Config.from_yaml(str(DUFFING_CONFIG))
 
