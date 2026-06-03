@@ -95,7 +95,8 @@ class SimpleLure(nn.Module):
             self.s = nn.Parameter(torch.tensor(1.0), requires_grad=True)
             # self.s = nn.Parameter(torch.tensor(1.0), requires_grad=False)
         else:
-            self.L = torch.zeros((nz, nx))  # Coupling matrix, not learnable
+            # Register as buffer so .to(device) moves it with the module
+            self.register_buffer("L", torch.zeros((nz, nx)))
             # self.alpha = nn.Parameter(torch.tensor(0.9999), requires_grad=False)
             self.tau = nn.Parameter(torch.tensor(np.log(alpha_0/(1-alpha_0))), requires_grad=False)  # 
             self.s = nn.Parameter(torch.tensor(1.0), requires_grad=False)
