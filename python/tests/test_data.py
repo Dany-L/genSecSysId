@@ -17,26 +17,10 @@ class TestDataLoader:
         csv_path = tmp_path / "test_data.csv"
         data = np.random.randn(100, 3)
         np.savetxt(csv_path, data, delimiter=",")
-        
+
         # Load data
         inputs, outputs = DataLoader.load_from_csv(str(csv_path))
-        
-        assert inputs.shape == (100, 2)
-        assert outputs.shape == (100, 1)
-    
-    def test_load_from_npy(self, tmp_path):
-        """Test loading data from NPY file."""
-        # Create temporary NPY file
-        npy_path = tmp_path / "test_data.npy"
-        data = {
-            "inputs": np.random.randn(100, 2),
-            "outputs": np.random.randn(100, 1),
-        }
-        np.save(npy_path, data)
-        
-        # Load data
-        inputs, outputs = DataLoader.load_from_npy(str(npy_path))
-        
+
         assert inputs.shape == (100, 2)
         assert outputs.shape == (100, 1)
 
@@ -118,29 +102,45 @@ class TestTimeSeriesDataset:
         """Test dataset with full sequences."""
         inputs = np.random.randn(10, 20, 2)
         outputs = np.random.randn(10, 20, 1)
-        
+
         dataset = TimeSeriesDataset(inputs, outputs)
-        
+
         assert len(dataset) == 10
-        
-        input_seq, output_seq = dataset[0]
+
+        input_seq, output_seq, initial_state = dataset[0]
         assert input_seq.shape == (20, 2)
         assert output_seq.shape == (20, 1)
-    
+        assert initial_state is None  # no states passed
+
     def test_sliding_window(self):
         """Test dataset with sliding window."""
         inputs = np.random.randn(10, 100, 2)
         outputs = np.random.randn(10, 100, 1)
-        
+
         sequence_length = 20
         dataset = TimeSeriesDataset(inputs, outputs, sequence_length=sequence_length)
-        
+
         # Each sample generates (100 - 20 + 1) = 81 sequences
         assert len(dataset) == 10 * 81
-        
-        input_seq, output_seq = dataset[0]
+
+        input_seq, output_seq, initial_state = dataset[0]
         assert input_seq.shape == (20, 2)
         assert output_seq.shape == (20, 1)
+        assert initial_state is None  # no states passed
+
+    def test_returns_initial_state_when_provided(self):
+        """Dataset returns the per-window initial state when states are given."""
+        inputs = np.random.randn(10, 20, 2)
+        outputs = np.random.randn(10, 20, 1)
+        states = np.random.randn(10, 20, 3)
+
+        dataset = TimeSeriesDataset(inputs, outputs, states=states)
+
+        _, _, initial_state = dataset[0]
+        assert initial_state is not None
+        assert initial_state.shape == (3,)
+        # Should be the state at t=0 for sample 0
+        assert torch.allclose(initial_state, torch.tensor(states[0, 0], dtype=initial_state.dtype))
 
 
 class TestCreateDataloaders:

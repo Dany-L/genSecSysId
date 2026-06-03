@@ -248,7 +248,7 @@ class TestInitializationMethods:
                 "C": {"fixed": True, "value": [[1.0, 0.0]]},
             }
         }
-        
+
         model = SimpleLure(
             nd=1,
             ne=1,
@@ -258,12 +258,15 @@ class TestInitializationMethods:
             delta=0.1,
             custom_params=custom_params,
         )
-        
-        # Call identity initialization
-        train_inputs = np.random.randn(2, 50, 1)
-        train_outputs = np.random.randn(2, 50, 1)
-        model._init_identity(train_inputs, None, train_outputs)
-        
+
+        # _init_identity needs a normalizer to scale C and B. Build a minimal
+        # stand-in with the only attributes the method touches.
+        class _MockNormalizer:
+            input_std = np.array([[1.0]])
+            output_std = np.array([[1.0]])
+
+        model._init_identity(normalizer=_MockNormalizer())
+
         # Check constraints are still respected
         assert torch.allclose(model.B[0, :], torch.zeros(1))
         assert torch.allclose(model.C, torch.tensor([[1.0, 0.0]]))
