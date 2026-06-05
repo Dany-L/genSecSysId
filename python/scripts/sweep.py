@@ -30,26 +30,55 @@ def _load_yaml(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _search_space_groups(sweep_cfg: dict) -> list:
+    """Return ``search_space`` as a list of group dicts.
+
+    Two YAML forms are accepted:
+      - dict: ``search_space: {key: [...], ...}`` -> single group (legacy).
+      - list of dicts: ``search_space: [{...}, {...}]`` -> tasks from each
+        group are concatenated, not multiplied. Use this when some keys are
+        only meaningful for a subset of runs (e.g. LMI-only params).
+    """
+    ss = sweep_cfg["search_space"]
+    if isinstance(ss, dict):
+        return [ss]
+    if isinstance(ss, list):
+        for i, g in enumerate(ss):
+            if not isinstance(g, dict):
+                raise ValueError(
+                    f"search_space[{i}] must be a dict of param -> [values], "
+                    f"got {type(g).__name__}"
+                )
+        return ss
+    raise ValueError(
+        f"search_space must be a dict or list of dicts, got {type(ss).__name__}"
+    )
+
+
 def enumerate_tasks(sweep_cfg: dict) -> list:
     """Return ordered list of (overrides, seed) for every array task."""
-    search_space = sweep_cfg["search_space"]
+    groups = _search_space_groups(sweep_cfg)
     n_seeds = sweep_cfg.get("n_seeds", 1)
-    keys = list(search_space.keys())
-    combos = list(itertools.product(*[search_space[k] for k in keys]))
     tasks = []
-    for combo in combos:
-        overrides = dict(zip(keys, combo))
-        for seed in range(n_seeds):
-            tasks.append((overrides, seed))
+    for group in groups:
+        keys = list(group.keys())
+        combos = list(itertools.product(*[group[k] for k in keys]))
+        for combo in combos:
+            overrides = dict(zip(keys, combo))
+            for seed in range(n_seeds):
+                tasks.append((overrides, seed))
     return tasks
 
 
 def n_tasks(sweep_cfg: dict) -> int:
-    search_space = sweep_cfg["search_space"]
-    n = 1
-    for v in search_space.values():
-        n *= len(v)
-    return n * sweep_cfg.get("n_seeds", 1)
+    groups = _search_space_groups(sweep_cfg)
+    total = 0
+    for group in groups:
+        n = 1
+        for v in group.values():
+            n *= len(v)
+        total += n
+    return total * sweep_cfg.get("n_seeds", 1)
 
 
 def deep_merge(base: dict, overrides: dict) -> dict:
@@ -92,14 +121,25 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sweep-config", required=True,
                         help="Path to sweep YAML (e.g. configs/sweep_duffing.yaml)")
-    parser.add_argument("--task-id", type=int, required=True,
+    parser.add_argument("--task-id", type=int, default=None,
                         help="0-based task index (set to $SLURM_ARRAY_TASK_ID by sbatch)")
     parser.add_argument("--device", type=str, default="cuda",
                         choices=["cuda", "cpu", "mps", "auto"],
                         help="Training device (default: cuda)")
+    parser.add_argument("--count", action="store_true",
+                        help="Print total task count and exit (used by submit_sweep.sh)")
     args = parser.parse_args()
 
     sweep_cfg = _load_yaml(args.sweep_config)
+
+    if args.count:
+        print(n_tasks(sweep_cfg))
+        return
+
+    if args.task_id is None:
+        print("ERROR: --task-id is required (omit only with --count)", file=sys.stderr)
+        sys.exit(2)
+
     tasks = enumerate_tasks(sweep_cfg)
     total = len(tasks)
 
