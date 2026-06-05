@@ -83,6 +83,15 @@ def main():
         default=None,
         help="Path to write the MLflow run_id to (so downstream scripts can pick it up).",
     )
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help="Attach to an existing MLflow run instead of starting a new one. "
+        "sweep.py uses this to pre-create and tag the run so sweep metadata is "
+        "visible even if training fails before it would have created the run "
+        "(e.g. an infeasible initial parameter set).",
+    )
     args = parser.parse_args()
 
     # Load configuration
@@ -360,7 +369,17 @@ def main():
     mlflow.set_experiment(config.mlflow.experiment_name)
     logger.info(f"MLflow experiment: {config.mlflow.experiment_name}")
 
-    with mlflow.start_run(run_name=config.mlflow.run_name):
+    # Attach to a run pre-created (and tagged) by sweep.py when --run-id is
+    # given; otherwise start a fresh run. Resuming an existing run keeps the
+    # sweep tags and marks the run FAILED (via the context manager) if training
+    # raises, so a failed sweep task is still visible with its metadata.
+    if args.run_id:
+        logger.info(f"Attaching to existing MLflow run: {args.run_id}")
+        run_context = mlflow.start_run(run_id=args.run_id)
+    else:
+        run_context = mlflow.start_run(run_name=config.mlflow.run_name)
+
+    with run_context:
         run_id = mlflow.active_run().info.run_id
         logger.info(f"MLflow run ID: {run_id}")
 

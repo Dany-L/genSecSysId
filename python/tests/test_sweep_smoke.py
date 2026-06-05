@@ -132,6 +132,30 @@ def test_multi_group_seeds_replicate_within_each_group(tmp_path):
     assert seeds_for_b == [0, 1, 2, 3]
 
 
+# --- sweep tags (set before training so they survive a failed run) ---------
+
+def test_build_sweep_tags_includes_metadata_and_stringifies():
+    """Tags carry sweep identity; ids/seeds are stringified for MLflow."""
+    tags = sweep.build_sweep_tags(
+        {"sweep_name": "duffing"},
+        task_id=7,
+        seed=2,
+        overrides={"optimizer.learning_rate": 5e-3, "model.model_type": "crnn"},
+    )
+    assert tags["sweep_name"] == "duffing"
+    assert tags["sweep_task_id"] == "7"
+    assert tags["sweep_seed"] == "2"
+    # Overrides are carried through under their full dot-keys, floats shortened.
+    assert tags["optimizer.learning_rate"] == "0.005"
+    assert tags["model.model_type"] == "crnn"
+
+
+def test_build_sweep_tags_defaults_sweep_name():
+    """Missing sweep_name falls back to the same default used elsewhere."""
+    tags = sweep.build_sweep_tags({}, task_id=0, seed=0, overrides={})
+    assert tags["sweep_name"] == "sweep"
+
+
 # --- error surface ---------------------------------------------------------
 
 def test_invalid_search_space_type_rejected(tmp_path):
