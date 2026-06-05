@@ -18,19 +18,13 @@ if [[ -z "${VIRTUAL_ENV:-}" ]]; then
     source "${HOME}/venv/genSecSysId/bin/activate"
 fi
 
-# Compute total number of tasks (product of all param list lengths × n_seeds).
-N=$(python - <<EOF
-import yaml, math
-with open("${SWEEP_CONFIG}") as f:
-    cfg = yaml.safe_load(f)
-ss = cfg["search_space"]
-n = math.prod(len(v) for v in ss.values())
-print(n * cfg.get("n_seeds", 1) - 1)
-EOF
-)
+# Compute total number of tasks via sweep.py so the schema lives in one place
+# (single-group dict or multi-group list both supported).
+TOTAL=$(python "${REPO_DIR}/scripts/sweep.py" --sweep-config "${SWEEP_CONFIG}" --count)
+N=$((TOTAL - 1))
 
 echo "Sweep config : ${SWEEP_CONFIG}"
-echo "Total tasks  : $((N + 1))  (array 0–${N})"
+echo "Total tasks  : ${TOTAL}  (array 0–${N})"
 echo
 
 sbatch \

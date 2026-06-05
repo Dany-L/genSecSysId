@@ -19,8 +19,23 @@ n_seeds: 3
 # Search space: dot-notation keys into the base config, list of values to try.
 # Total array tasks = product of all list lengths × n_seeds.
 # Current: 2 × 2 × 5 = 20 tasks (array indices 0–19).
+#
+# Two YAML forms are supported:
+#   1) Single group (dict)  -> full cartesian product of all keys (default).
+#   2) Multiple groups (list of dicts) -> tasks from each group are
+#      *concatenated*, not multiplied. Use this when some keys are only
+#      meaningful for a subset of runs and would otherwise produce duplicate
+#      tasks (e.g. LMI-only params like model.custom_params.learn_L make
+#      no difference when training.use_custom_regularization is false).
+#
+# Example multi-group sweep (uncomment to use instead of the dict below):
 search_space:
-  model.nw: [10]
-  optimizer.learning_rate: [0.002]
-  data.use_diverging_trajectories: [false, true]
-  model.type: ["crnn", "crnn_safe"]
+  - training.use_custom_regularization: [true]
+    model.custom_params.learn_L: [true, false]
+    model.custom_params.regularization_method: ["interior_point", "dual"]
+  - training.use_custom_regularization: [false]
+# search_space:
+#   model.nw: [10]
+#   optimizer.learning_rate: [0.002]
+#   data.use_diverging_trajectories: [false, true]
+#   model.type: ["crnn", "crnn_safe"]

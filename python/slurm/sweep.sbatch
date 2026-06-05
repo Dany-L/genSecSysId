@@ -7,6 +7,7 @@
 #SBATCH --mem=16GB
 #SBATCH --gres=gpu:1
 #SBATCH --gpus=1
+#SBATCH --exclude=wolfgang-gpu02
 #SBATCH --output=/home/ac137967/Report/genSecSysId/sweep_%A_%a.out
 
 # Usage (via submit_sweep.sh — sets --array automatically):

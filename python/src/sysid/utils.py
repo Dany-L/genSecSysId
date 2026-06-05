@@ -38,6 +38,11 @@ def get_device(device: str = "auto") -> torch.device:
             return torch.device("mps")
         else:
             return torch.device("cpu")
+    elif device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "Device 'cuda' was requested but no CUDA GPUs are available on this node. "
+            "Check GPU allocation (nvidia-smi) or use --device auto to fall back to CPU."
+        )
     else:
         return torch.device(device)
 
