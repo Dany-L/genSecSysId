@@ -10,6 +10,7 @@ Does NOT exercise train/evaluate/post_process — those are covered by
 normalization, which is pure config handling and runs in milliseconds.
 """
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -20,9 +21,21 @@ import yaml
 REPO_PY = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_PY / "scripts"
 
-# Make ``sweep.py`` importable for the in-process tests below.
-sys.path.insert(0, str(SCRIPTS))
-import sweep  # noqa: E402
+
+def _load_script_module(name: str, path: Path):
+    """Import a scripts/ module by file path without mutating sys.path.
+
+    sys.path.insert would persist for the whole pytest session and give
+    scripts/ priority over every other import (its modules have generic names
+    like train/compare/evaluate), so we load by spec instead.
+    """
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+sweep = _load_script_module("sweep", SCRIPTS / "sweep.py")
 
 
 def _write_sweep(tmp_path: Path, search_space, n_seeds: int = 1) -> Path:

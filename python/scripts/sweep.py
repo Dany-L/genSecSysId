@@ -205,10 +205,13 @@ def main():
             mlflow.set_tracking_uri(mlflow_cfg["tracking_uri"])
         if mlflow_cfg.get("experiment_name"):
             mlflow.set_experiment(mlflow_cfg["experiment_name"])
-        active_run = mlflow.start_run(run_name=run_name)
-        run_id = active_run.info.run_id
-        mlflow.set_tags(tags)
-        mlflow.end_run()
+        # Use a context manager so the run is always ended, even if set_tags()
+        # raises. Otherwise a run left active in this process would make the
+        # fallback start_run(run_id=...) below fail with "run already active",
+        # and would also leave the run dangling as RUNNING on the server.
+        with mlflow.start_run(run_name=run_name) as active_run:
+            run_id = active_run.info.run_id
+            mlflow.set_tags(tags)
         run_id_file.write_text(run_id)
         print(f"  pre-created and tagged run_id: {run_id}")
     except Exception as e:
