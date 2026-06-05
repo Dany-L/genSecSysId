@@ -205,8 +205,8 @@ def main():
             mlflow.set_tracking_uri(mlflow_cfg["tracking_uri"])
         if mlflow_cfg.get("experiment_name"):
             mlflow.set_experiment(mlflow_cfg["experiment_name"])
-        run = mlflow.start_run(run_name=run_name)
-        run_id = run.info.run_id
+        active_run = mlflow.start_run(run_name=run_name)
+        run_id = active_run.info.run_id
         mlflow.set_tags(tags)
         mlflow.end_run()
         run_id_file.write_text(run_id)
