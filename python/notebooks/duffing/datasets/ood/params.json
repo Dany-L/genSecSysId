@@ -1,0 +1,33 @@
+{
+  "dataset": "ood",
+  "description": "Out-of-distribution Duffing oscillator dataset for generalisation testing",
+  "system": {
+    "delta_d": 0.3,
+    "Ts": 0.05
+  },
+  "generation": {
+    "rng_seed": 99,
+    "T_traj": 4000,
+    "U_amp_max": 4.5,
+    "LP_cutoff_Hz": 3.0,
+    "LP_order": 4,
+    "env_decay": 0.95,
+    "SNR_dB": 30.0,
+    "N_zero_conv": 0,
+    "N_zero_div": 15,
+    "N_rand_conv": 30,
+    "N_rand_div": 0,
+    "x0_rand_range": [
+      -0.6,
+      0.6
+    ],
+    "diverge_thresh": 5.0
+  },
+  "split": {
+    "folders": [
+      "test",
+      "test_div"
+    ],
+    "note": "No training or validation splits for OOD dataset"
+  }
+}
