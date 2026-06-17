@@ -118,7 +118,7 @@ class LureSystem(Linear):
         # Otherwise sqrt(...) produces NaN gradients near/outside the safe-set boundary,
         # and the model can't recover. The optimizer still gets the right signal because
         # clamping increases prediction error, which the loss already penalizes.
-        eps = 1e-6
+        eps = 0
         with torch.no_grad():
             X_x_squared = torch.stack([x_k_i.T @ X @ x_k_i for x_k_i in x_k])
             radicand = torch.clamp(s**2 - alpha**2 * X_x_squared, min=0.0)

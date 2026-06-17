@@ -324,4 +324,5 @@ docs/_templates/
 mlruns_backup
 .claude
 CLAUDE.md
+results/
 
