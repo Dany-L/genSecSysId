@@ -258,12 +258,23 @@ def _write_csvs(folder: Path, n_files: int, n_steps: int, seed: int):
 
 @pytest.fixture(scope="module")
 def sweep_integration_root(tmp_path_factory):
-    """Hermetic data root + sweep config for the full-pipeline smoke test."""
+    """Hermetic data root + sweep config for the full-pipeline smoke test.
+
+    Data lives under SmokeData/id/ so that find_ood_sibling detects the
+    parallel SmokeData/ood/ directory and the OOD evaluation pass runs.
+    This lets the test assert that both evaluation/id and evaluation/ood
+    artefact directories are produced.
+    """
     root = tmp_path_factory.mktemp("sweep_int")
-    data_dir = root / "data" / "SmokeData"
+    data_dir = root / "data" / "SmokeData" / "id"
 
     for split, n, seed in [("train", 4, 0), ("validation", 2, 1), ("test", 2, 2)]:
         _write_csvs(data_dir / split, n_files=n, n_steps=200, seed=seed)
+
+    # OOD data: flat CSV folder (no train/test split needed — evaluate.py
+    # loads directly from the directory when there is no test/ subfolder).
+    ood_dir = root / "data" / "SmokeData" / "ood"
+    _write_csvs(ood_dir, n_files=2, n_steps=200, seed=99)
 
     base_cfg = {
         "data": {
@@ -362,4 +373,5 @@ def test_sweep_full_pipeline_single_task(sweep_integration_root):
     run_dir = run_dirs[0]
     assert (run_dir / "best_model.pt").exists(), "best_model.pt missing"
     eval_dir = root / "outputs" / "crnn" / run_dir.name / "evaluation"
-    assert eval_dir.exists(), "evaluation/ artefact dir missing"
+    assert (eval_dir / "id").exists(), "evaluation/id artefact dir missing"
+    assert (eval_dir / "ood").exists(), "evaluation/ood artefact dir missing"

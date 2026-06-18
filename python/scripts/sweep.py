@@ -288,7 +288,9 @@ def main():
     parser.add_argument("--sweep-config", required=True,
                         help="Path to sweep YAML (e.g. configs/sweep_duffing.yaml)")
     parser.add_argument("--task-id", type=int, default=None,
-                        help="0-based task index (set to $SLURM_ARRAY_TASK_ID by sbatch)")
+                        help="0-based task index to run (set to $SLURM_ARRAY_TASK_ID "
+                             "by sbatch). Omit to run all tasks sequentially on this "
+                             "machine — useful for local debugging or non-SLURM clusters.")
     parser.add_argument("--device", type=str, default="cuda",
                         choices=["cuda", "cpu", "mps", "auto"],
                         help="Training device (default: cuda)")

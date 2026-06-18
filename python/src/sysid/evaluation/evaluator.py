@@ -102,15 +102,17 @@ class Evaluator:
             d = normalizer.inverse_transform_inputs(d)
 
         # Compute metrics
+        output_scale = normalizer.get_output_scale() if normalizer is not None else None
         metrics = compute_metrics(
             e_hat[:, self.warmup_steps:, :].reshape(-1, e_hat.shape[-1]),
             e[:, self.warmup_steps:, :].reshape(-1, e.shape[-1]),
+            output_scale=output_scale,
         )
 
         # Compute per-step metrics for sequences
-        if e_hat.ndim == 3:
-            sim_metrics = compute_simulation_metrics(e_hat, e)
-            metrics.update(sim_metrics)
+        # if e_hat.ndim == 3:
+        #     sim_metrics = compute_simulation_metrics(e_hat, e)
+        #     metrics.update(sim_metrics)
 
         # Save results
         results = {
@@ -167,6 +169,7 @@ class Evaluator:
         flat_preds = []  # list of (T_i, n_out) per trajectory
         flat_targs = []
         flat_inputs = []  # list of (T_i, n_in) per trajectory
+        output_scale = normalizer.get_output_scale() if normalizer is not None else None
 
         with torch.no_grad():
             for batch in test_div_loader:
@@ -191,7 +194,7 @@ class Evaluator:
                     d_np = normalizer.inverse_transform_inputs(d_np)
 
                 for b in range(e_np.shape[0]):
-                    per_traj_metrics.append(compute_metrics(e_hat_np[b], e_np[b]))
+                    per_traj_metrics.append(compute_metrics(e_hat_np[b], e_np[b], output_scale=output_scale))
                     flat_preds.append(e_hat_np[b])
                     flat_targs.append(e_np[b])
                     flat_inputs.append(d_np[b])
@@ -200,7 +203,7 @@ class Evaluator:
         pooled_preds = np.concatenate(flat_preds, axis=0) if flat_preds else None
         pooled_targs = np.concatenate(flat_targs, axis=0) if flat_targs else None
         pooled_metrics = (
-            compute_metrics(pooled_preds, pooled_targs) if flat_preds else {}
+            compute_metrics(pooled_preds, pooled_targs, output_scale=output_scale) if flat_preds else {}
         )
 
         # Per-trajectory averaged metrics (kept for reference / comparison).

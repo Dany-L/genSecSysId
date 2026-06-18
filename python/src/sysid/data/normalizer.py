@@ -212,6 +212,21 @@ class DataNormalizer:
 
         return denormalized
 
+    def get_output_scale(self) -> float:
+        """Return a scalar denominator for NRMSE based on training output statistics.
+
+        Uses std for standard/scale_only and range (max-min) for minmax,
+        averaged across output features so a single scalar is returned.
+        Normalizing by training-data statistics follows the convention in
+        Ljung, "System Identification: Theory for the User", 2nd ed., 1999.
+        """
+        if not self.is_fitted:
+            raise RuntimeError("Normalizer must be fitted before get_output_scale")
+        if self.method in ("standard", "scale_only"):
+            return float(np.mean(self.output_std))
+        elif self.method == "minmax":
+            return float(np.mean(self.output_max - self.output_min))
+
     def save(self, path: str):
         """Save normalizer parameters to JSON."""
         params = {

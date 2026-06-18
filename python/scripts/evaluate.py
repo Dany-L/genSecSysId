@@ -81,6 +81,15 @@ def filter_metrics(metrics: dict, allowed_metrics: list) -> dict:
     return filtered
 
 
+def metric_category_for_path(test_path: Path) -> str:
+    """Return 'ood' if any path component is exactly 'ood' (case-insensitive), else 'id'.
+
+    Exact component matching prevents paths like /data/good_runs/... from being
+    misclassified as OOD due to the substring 'ood' appearing inside 'good'.
+    """
+    return "ood" if any(p.lower() == "ood" for p in test_path.parts) else "id"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate trained RNN model")
     parser.add_argument(
@@ -150,7 +159,7 @@ def main():
 
     # Route metrics into "id/" or "ood/" MLflow categories so both evaluation
     # passes can coexist in the same run and show up as separate groups in the UI.
-    metric_category = "ood" if "ood" in str(test_path).lower() else "id"
+    metric_category = metric_category_for_path(test_path)
     if metric_category == "ood":
         logger.info("OOD data detected — metrics and artefacts logged under 'ood/'")
 
@@ -445,8 +454,9 @@ def main():
                 e_div_pool = div_results["e_div"]
                 e_hat_all = np.concatenate([e_hat_conv_pool, e_hat_div_pool], axis=0)
                 e_all = np.concatenate([e_conv_pool, e_div_pool], axis=0)
+                overall_scale = normalizer.get_output_scale() if normalizer is not None else None
                 metrics_overall = filter_metrics(
-                    compute_metrics(e_hat_all, e_all), config.evaluation.metrics
+                    compute_metrics(e_hat_all, e_all, output_scale=overall_scale), config.evaluation.metrics
                 )
                 for metric, value in metrics_overall.items():
                     if isinstance(value, (int, float)) and metric != "per_step":
