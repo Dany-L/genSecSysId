@@ -1,0 +1,27 @@
+# Debug sweep for the Duffing experiment — exactly 1 task (1 combo × 1 seed).
+#
+# Use this to verify the full train → evaluate → post_process pipeline locally
+# before submitting a real sweep to SLURM.
+#
+# Run with:
+#   python scripts/sweep.py --sweep-config configs/sweep_duffing_debug.yaml --device cpu
+
+sweep_name: duffing_debug
+
+base_config: ~/genSecSysId-Data/configs/crnn_gen-sec_duffing.yaml
+
+n_seeds: 1
+
+# Keep regional-verification fast when running locally.
+post_process_args:
+  - "--rv-num-trajectories"
+  - "2"
+  - "--rv-horizon"
+  - "50"
+
+# Single fixed combo — mirrors the first row of the production sweep so the
+# output is directly comparable, but produces only 1 task.
+search_space:
+  - training.use_custom_regularization: [true]
+    model.custom_params.learn_L: [true]
+    model.custom_params.regularization_method: ["dual"]

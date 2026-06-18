@@ -1,0 +1,38 @@
+{
+  "dataset": "id",
+  "description": "In-distribution Duffing oscillator dataset",
+  "system": {
+    "delta_d": 0.3,
+    "Ts": 0.05
+  },
+  "generation": {
+    "rng_seed": 42,
+    "T_traj": 4000,
+    "U_amp_max": 3.5,
+    "LP_cutoff_Hz": 2.0,
+    "LP_order": 4,
+    "env_decay": 0.9,
+    "SNR_dB": 30.0,
+    "N_zero_conv": 0,
+    "N_zero_div": 50,
+    "N_rand_conv": 100,
+    "N_rand_div": 0,
+    "x0_rand_range": [
+      -0.6,
+      0.6
+    ],
+    "diverge_thresh": 5.0
+  },
+  "split": {
+    "conv_ratio": "60/10/30",
+    "div_ratio": "60/10/30",
+    "folders": [
+      "train",
+      "validation",
+      "test",
+      "train_div",
+      "validation_div",
+      "test_div"
+    ]
+  }
+}

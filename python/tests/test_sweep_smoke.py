@@ -1,13 +1,14 @@
-"""Smoke tests for the sweep schema (single-group dict and multi-group list).
+"""Smoke tests for the sweep pipeline.
 
-Covers the two consumers of the schema:
-  - ``sweep.py --count`` (used by ``slurm/submit_sweep.sh`` to size the
-    SLURM array)
-  - ``enumerate_tasks`` (used inside ``sweep.py`` to map task-id -> overrides)
+Schema tests (fast, no subprocesses):
+  - Single-group dict and multi-group list counting / enumeration
+  - Tag building
+  - find_ood_sibling path resolution
+  - Error surface
 
-Does NOT exercise train/evaluate/post_process — those are covered by
-``test_scripts_smoke.py``. The new code path here is the schema
-normalization, which is pure config handling and runs in milliseconds.
+Integration test (slow, full subprocess pipeline):
+  - test_sweep_full_pipeline_single_task: runs sweep.py --task-id 0 against
+    synthetic data and asserts the model + evaluation artefacts exist.
 """
 
 import importlib.util
@@ -15,6 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 import yaml
 
@@ -193,3 +196,182 @@ def test_invalid_group_element_rejected(tmp_path):
     )
     with pytest.raises(ValueError, match=r"search_space\[1\]"):
         sweep._search_space_groups(sweep._load_yaml(str(sweep_path)))
+
+
+# --- find_ood_sibling ----------------------------------------------------------
+
+def test_find_ood_sibling_returns_ood_when_present(tmp_path):
+    """Path with an 'id' component maps to its 'ood' sibling when that dir exists."""
+    id_dir = tmp_path / "Duffing" / "id"
+    ood_dir = tmp_path / "Duffing" / "ood"
+    id_dir.mkdir(parents=True)
+    ood_dir.mkdir(parents=True)
+    result = sweep.find_ood_sibling(str(id_dir))
+    assert result == ood_dir.resolve()
+
+
+def test_find_ood_sibling_returns_none_when_ood_missing(tmp_path):
+    """No 'ood' sibling on disk → None (no directory creation side-effects)."""
+    id_dir = tmp_path / "Duffing" / "id"
+    id_dir.mkdir(parents=True)
+    assert sweep.find_ood_sibling(str(id_dir)) is None
+
+
+def test_find_ood_sibling_returns_none_when_no_id_component(tmp_path):
+    """Paths without an 'id' component are left untouched."""
+    data_dir = tmp_path / "Duffing" / "train"
+    data_dir.mkdir(parents=True)
+    assert sweep.find_ood_sibling(str(data_dir)) is None
+
+
+def test_find_ood_sibling_case_insensitive(tmp_path):
+    """Component matching is case-insensitive ('ID', 'Id' all match)."""
+    id_dir = tmp_path / "Duffing" / "ID"
+    ood_dir = tmp_path / "Duffing" / "ood"
+    id_dir.mkdir(parents=True)
+    ood_dir.mkdir(parents=True)
+    result = sweep.find_ood_sibling(str(id_dir))
+    assert result == ood_dir.resolve()
+
+
+# --- integration: full train → evaluate → post_process pipeline ---------------
+
+def _make_traj(rng, n_steps):
+    u = rng.standard_normal(n_steps).astype(np.float64) * 0.2
+    q = np.zeros(n_steps, dtype=np.float64)
+    q_dot = np.zeros(n_steps, dtype=np.float64)
+    for k in range(n_steps - 1):
+        q[k + 1] = q[k] + 0.05 * q_dot[k]
+        q_dot[k + 1] = q_dot[k] + 0.05 * (-q[k] - 0.3 * q_dot[k] + u[k])
+    return u, q, q_dot
+
+
+def _write_csvs(folder: Path, n_files: int, n_steps: int, seed: int):
+    folder.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    for i in range(n_files):
+        u, q, q_dot = _make_traj(rng, n_steps)
+        pd.DataFrame({"u": u, "q": q, "q_dot": q_dot}).to_csv(
+            folder / f"traj_{i:03d}.csv", index=False
+        )
+
+
+@pytest.fixture(scope="module")
+def sweep_integration_root(tmp_path_factory):
+    """Hermetic data root + sweep config for the full-pipeline smoke test.
+
+    Data lives under SmokeData/id/ so that find_ood_sibling detects the
+    parallel SmokeData/ood/ directory and the OOD evaluation pass runs.
+    This lets the test assert that both evaluation/id and evaluation/ood
+    artefact directories are produced.
+    """
+    root = tmp_path_factory.mktemp("sweep_int")
+    data_dir = root / "data" / "SmokeData" / "id"
+
+    for split, n, seed in [("train", 4, 0), ("validation", 2, 1), ("test", 2, 2)]:
+        _write_csvs(data_dir / split, n_files=n, n_steps=200, seed=seed)
+
+    # OOD data: flat CSV folder (no train/test split needed — evaluate.py
+    # loads directly from the directory when there is no test/ subfolder).
+    ood_dir = root / "data" / "SmokeData" / "ood"
+    _write_csvs(ood_dir, n_files=2, n_steps=200, seed=99)
+
+    base_cfg = {
+        "data": {
+            "train_path": str(data_dir),
+            "input_col": ["u"],
+            "output_col": ["q"],
+            "state_col": ["q", "q_dot"],
+            "pattern": "*.csv",
+            "normalize": True,
+            "normalization_method": "scale_only",
+            "batch_size": 2,
+            "train_sequence_length": 50,
+            "sequence_stride": 50,
+            "shuffle": True,
+            "num_workers": 0,
+            "sampling_time": 0.05,
+        },
+        "model": {
+            "model_type": "crnn",
+            "nw": 4,
+            "nx": 2,
+            "activation": "dzn",
+            "custom_params": {
+                "learn_L": True,
+                "structural_constraints": {
+                    "D": {"fixed": True, "value": 0.0},
+                    "D12": {"fixed": True, "value": 0.0},
+                },
+            },
+            "initialization": {"method": "identity"},
+        },
+        "optimizer": {
+            "optimizer_type": "adam",
+            "learning_rate": 0.005,
+            "use_scheduler": True,
+            "scheduler_type": "reduce_on_plateau",
+            "scheduler_patience": 5,
+            "scheduler_factor": 0.5,
+        },
+        "training": {
+            "max_epochs": 2,
+            "gradient_clip_value": 10.0,
+            "loss_type": "mse",
+            "use_custom_regularization": True,
+            "min_regularization_weight": 1e-7,
+            "regularization_weight": 1e-2,
+            "decay_regularization_weight": True,
+            "regularization_decay_factor": 0.5,
+            "device": "cpu",
+            "log_gradients": True,
+            "warmup_steps": 10,
+            "input_regularization_weight": 1e-2,
+        },
+        "mlflow": {
+            "tracking_uri": f"file:{root}/mlruns",
+            "experiment_name": "sweep_smoke",
+            "run_name": None,
+        },
+        "evaluation": {"metrics": ["rmse", "nrmse"]},
+        "root_dir": str(root),
+        "seed": 42,
+    }
+    base_cfg_path = root / "base_config.yaml"
+    with open(base_cfg_path, "w") as f:
+        yaml.safe_dump(base_cfg, f, sort_keys=False)
+
+    sweep_cfg = {
+        "sweep_name": "smoke",
+        "base_config": str(base_cfg_path),
+        "n_seeds": 1,
+        "post_process_args": ["--rv-num-trajectories", "2", "--rv-horizon", "50"],
+        "search_space": {"training.use_custom_regularization": [True]},
+    }
+    sweep_cfg_path = root / "sweep_debug.yaml"
+    with open(sweep_cfg_path, "w") as f:
+        yaml.safe_dump(sweep_cfg, f, sort_keys=False)
+
+    return root, sweep_cfg_path
+
+
+def test_sweep_full_pipeline_single_task(sweep_integration_root):
+    """sweep.py --task-id 0 must exit 0 and produce model + evaluation artefacts."""
+    root, sweep_cfg_path = sweep_integration_root
+    subprocess.run(
+        [sys.executable, str(SCRIPTS / "sweep.py"),
+         "--sweep-config", str(sweep_cfg_path),
+         "--task-id", "0",
+         "--device", "cpu"],
+        check=True,
+        cwd=str(root),
+    )
+    models_dir = root / "models" / "crnn"
+    assert models_dir.exists(), "models/crnn/ not created"
+    run_dirs = list(models_dir.iterdir())
+    assert run_dirs, "No run directory under models/crnn/"
+    run_dir = run_dirs[0]
+    assert (run_dir / "best_model.pt").exists(), "best_model.pt missing"
+    eval_dir = root / "outputs" / "crnn" / run_dir.name / "evaluation"
+    assert (eval_dir / "id").exists(), "evaluation/id artefact dir missing"
+    assert (eval_dir / "ood").exists(), "evaluation/ood artefact dir missing"

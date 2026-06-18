@@ -124,6 +124,23 @@ def build_sweep_tags(sweep_cfg: dict, task_id: int, seed: int, overrides: dict) 
     }
 
 
+def find_ood_sibling(train_path: str) -> "Path | None":
+    """Return the OOD sibling dir if an 'id' component exists in *train_path*.
+
+    E.g. .../Duffing/id  ->  .../Duffing/ood  (returned only if that dir exists).
+    """
+    p = Path(os.path.expanduser(train_path)).resolve()
+    parts = list(p.parts)
+    for i, part in enumerate(parts):
+        if part.lower() == "id":
+            ood_parts = parts[:]
+            ood_parts[i] = "ood"
+            ood_path = Path(*ood_parts)
+            if ood_path.is_dir():
+                return ood_path
+    return None
+
+
 def run(cmd: list, label: str) -> None:
     print(f"\n{'='*60}", flush=True)
     print(f"  {label}", flush=True)
@@ -132,44 +149,14 @@ def run(cmd: list, label: str) -> None:
     subprocess.run(cmd, check=True)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sweep-config", required=True,
-                        help="Path to sweep YAML (e.g. configs/sweep_duffing.yaml)")
-    parser.add_argument("--task-id", type=int, default=None,
-                        help="0-based task index (set to $SLURM_ARRAY_TASK_ID by sbatch)")
-    parser.add_argument("--device", type=str, default="cuda",
-                        choices=["cuda", "cpu", "mps", "auto"],
-                        help="Training device (default: cuda)")
-    parser.add_argument("--count", action="store_true",
-                        help="Print total task count and exit (used by submit_sweep.sh)")
-    args = parser.parse_args()
-
-    sweep_cfg = _load_yaml(args.sweep_config)
-
-    if args.count:
-        print(n_tasks(sweep_cfg))
-        return
-
-    if args.task_id is None:
-        print("ERROR: --task-id is required (omit only with --count)", file=sys.stderr)
-        sys.exit(2)
-
+def run_task(task_id: int, total: int, sweep_cfg: dict, device: str,
+             repo_dir: Path, py: str) -> None:
+    """Execute the full train → evaluate → post_process pipeline for one task."""
     tasks = enumerate_tasks(sweep_cfg)
-    total = len(tasks)
-
-    if args.task_id >= total:
-        print(
-            f"ERROR: --task-id {args.task_id} is out of range "
-            f"(total tasks: {total})",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    overrides, seed = tasks[args.task_id]
+    overrides, seed = tasks[task_id]
     run_name = make_run_name(sweep_cfg.get("sweep_name", "sweep"), overrides, seed)
 
-    print(f"Sweep task {args.task_id}/{total - 1}")
+    print(f"Sweep task {task_id}/{total - 1}")
     print(f"  overrides : {overrides}")
     print(f"  seed      : {seed}")
     print(f"  run_name  : {run_name}")
@@ -180,14 +167,12 @@ def main():
 
     tmp_dir = Path(os.environ.get("TMPDIR", "/tmp"))
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    tmp_config = tmp_dir / f"sweep_task{args.task_id}_seed{seed}.yaml"
+    tmp_config = tmp_dir / f"sweep_task{task_id}_seed{seed}.yaml"
     with open(tmp_config, "w") as f:
         yaml.safe_dump(merged_cfg, f, default_flow_style=False, sort_keys=False)
 
-    run_id_file = tmp_dir / f"sweep_run_id_task{args.task_id}.txt"
+    run_id_file = tmp_dir / f"sweep_run_id_task{task_id}.txt"
 
-    repo_dir = Path(__file__).resolve().parent.parent
-    py = sys.executable
     data_root = merged_cfg.get("root_dir", ".")
     mlflow_cfg = merged_cfg.get("mlflow", {}) or {}
 
@@ -197,7 +182,7 @@ def main():
     # attaches to this run via --run-id and marks it FAILED on error, keeping
     # the tags. If pre-creation fails (e.g. tracking server unreachable), we
     # fall back to letting train.py create the run and tag it afterwards.
-    tags = build_sweep_tags(sweep_cfg, args.task_id, seed, overrides)
+    tags = build_sweep_tags(sweep_cfg, task_id, seed, overrides)
     run_id = None
     try:
         import mlflow
@@ -223,7 +208,7 @@ def main():
         py, str(repo_dir / "scripts" / "train.py"),
         "--config", str(tmp_config),
         "--seed", str(seed),
-        "--device", args.device,
+        "--device", device,
         "--run-name", run_name,
     ]
     if run_id is not None:
@@ -251,15 +236,33 @@ def main():
             print(f"Warning: could not set MLflow sweep tags: {e}", flush=True)
     print(f"  run_id: {run_id}")
 
-    # --- Step 2: evaluate ---
+    # --- Step 2: evaluate (ID) ---
     run(
         [
             py, str(repo_dir / "scripts" / "evaluate.py"),
             "--run-id", run_id,
             "--data-root", data_root,
         ],
-        "Step 2/3: evaluate.py",
+        "Step 2/3: evaluate.py (ID)",
     )
+
+    # --- Step 2b: evaluate (OOD) — only if an ood/ sibling exists ---
+    train_path = merged_cfg.get("data", {}).get("train_path", "")
+    ood_path = find_ood_sibling(train_path) if train_path else None
+    if ood_path is not None:
+        print(f"  OOD data found at {ood_path} — running OOD evaluation", flush=True)
+        run(
+            [
+                py, str(repo_dir / "scripts" / "evaluate.py"),
+                "--run-id", run_id,
+                "--data-root", data_root,
+                "--test-data", str(ood_path),
+            ],
+            "Step 2b/3: evaluate.py (OOD)",
+        )
+    else:
+        print(f"  No ood/ sibling found for '{train_path}' — skipping OOD evaluation",
+              flush=True)
 
     # --- Step 3: post_process ---
     post_cmd = [
@@ -270,9 +273,60 @@ def main():
     true_dynamics = sweep_cfg.get("true_dynamics")
     if true_dynamics:
         post_cmd += ["--true-dynamics", true_dynamics]
+    # Optional extra args forwarded verbatim to post_process.py (e.g. to shrink
+    # the regional-verification workload in debug/smoke runs):
+    #   post_process_args: ["--rv-num-trajectories", "2", "--rv-horizon", "50"]
+    for extra in sweep_cfg.get("post_process_args", []):
+        post_cmd.append(str(extra))
     run(post_cmd, "Step 3/3: post_process.py")
 
-    print(f"\nTask {args.task_id} complete — run_id: {run_id}", flush=True)
+    print(f"\nTask {task_id} complete — run_id: {run_id}", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sweep-config", required=True,
+                        help="Path to sweep YAML (e.g. configs/sweep_duffing.yaml)")
+    parser.add_argument("--task-id", type=int, default=None,
+                        help="0-based task index to run (set to $SLURM_ARRAY_TASK_ID "
+                             "by sbatch). Omit to run all tasks sequentially on this "
+                             "machine — useful for local debugging or non-SLURM clusters.")
+    parser.add_argument("--device", type=str, default="cuda",
+                        choices=["cuda", "cpu", "mps", "auto"],
+                        help="Training device (default: cuda)")
+    parser.add_argument("--count", action="store_true",
+                        help="Print total task count and exit (used by submit_sweep.sh)")
+    args = parser.parse_args()
+
+    sweep_cfg = _load_yaml(args.sweep_config)
+
+    if args.count:
+        print(n_tasks(sweep_cfg))
+        return
+
+    tasks = enumerate_tasks(sweep_cfg)
+    total = len(tasks)
+    repo_dir = Path(__file__).resolve().parent.parent
+    py = sys.executable
+
+    if args.task_id is None:
+        # No SLURM array task id — run all tasks sequentially on this machine.
+        print(f"No --task-id given: running all {total} task(s) sequentially "
+              f"on device={args.device}", flush=True)
+        for task_id in range(total):
+            run_task(task_id, total, sweep_cfg, args.device, repo_dir, py)
+        print(f"\nSweep complete ({total} task(s))", flush=True)
+        return
+
+    if args.task_id >= total:
+        print(
+            f"ERROR: --task-id {args.task_id} is out of range "
+            f"(total tasks: {total})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    run_task(args.task_id, total, sweep_cfg, args.device, repo_dir, py)
 
 
 if __name__ == "__main__":

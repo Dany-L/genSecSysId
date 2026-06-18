@@ -81,6 +81,15 @@ def filter_metrics(metrics: dict, allowed_metrics: list) -> dict:
     return filtered
 
 
+def metric_category_for_path(test_path: Path) -> str:
+    """Return 'ood' if any path component is exactly 'ood' (case-insensitive), else 'id'.
+
+    Exact component matching prevents paths like /data/good_runs/... from being
+    misclassified as OOD due to the substring 'ood' appearing inside 'good'.
+    """
+    return "ood" if any(p.lower() == "ood" for p in test_path.parts) else "id"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate trained RNN model")
     parser.add_argument(
@@ -121,13 +130,6 @@ def main():
     output_dir = base / "outputs" / model_type / args.run_id
     log_dir = base / "logs" / model_type / args.run_id
 
-    # Eval artefacts go into a dedicated subfolder so they don't mingle with
-    # the training-time artefacts (e.g. <output_dir>/predictions/epoch_*.png)
-    # that were already logged to MLflow during training. Defined here (before
-    # any plot-saving code) so the ellipse/polytope plot block below can use it.
-    eval_dir = output_dir / "evaluation"
-    eval_dir.mkdir(parents=True, exist_ok=True)
-
     # Now switch to file+console logging in the run directory.
     logger = setup_file_logging(log_dir, "evaluation")
 
@@ -154,6 +156,17 @@ def main():
         logger.info(f"--test-data not provided, defaulting to {test_path}")
     else:
         test_path = Path(os.path.expanduser(args.test_data))
+
+    # Route metrics into "id/" or "ood/" MLflow categories so both evaluation
+    # passes can coexist in the same run and show up as separate groups in the UI.
+    metric_category = metric_category_for_path(test_path)
+    if metric_category == "ood":
+        logger.info("OOD data detected — metrics and artefacts logged under 'ood/'")
+
+    # Artefacts go into evaluation/<id|ood>/ so ID and OOD plots never overwrite
+    # each other and MLflow groups them under the same category as the metrics.
+    eval_dir = output_dir / "evaluation" / metric_category
+    eval_dir.mkdir(parents=True, exist_ok=True)
 
     # Load test data
     logger.info("Loading test data...")
@@ -408,11 +421,7 @@ def main():
             metrics_conv = filter_metrics(results.get("metrics", {}), config.evaluation.metrics)
             for metric, value in metrics_conv.items():
                 if isinstance(value, (int, float)) and metric != "per_step":
-                    mlflow.log_metric(f"eval_conv_{metric}", value)
-                    # Also log under the legacy `eval_<metric>` name (historically
-                    # that was the conv-only metric) so existing dashboards keep
-                    # working and old runs compare directly to new ones.
-                    mlflow.log_metric(f"eval_{metric}", value)
+                    mlflow.log_metric(f"{metric_category}/conv/eval_{metric}", value)
                     logger.info(f"conv {metric}: {value:.6f}")
 
             # Conv pooled samples (post-warmup) so we can combine with div.
@@ -434,10 +443,10 @@ def main():
                 )
                 for metric, value in metrics_div.items():
                     if isinstance(value, (int, float)) and metric != "per_step":
-                        mlflow.log_metric(f"eval_div_{metric}", value)
+                        mlflow.log_metric(f"{metric_category}/div/eval_{metric}", value)
                         logger.info(f"div {metric}: {value:.6f}")
                 mlflow.log_metric(
-                    "eval_div_num_trajectories", div_results["num_trajectories_div"]
+                    f"{metric_category}/div/eval_num_trajectories", div_results["num_trajectories_div"]
                 )
 
                 # --- Overall (conv post-warmup + div, pooled) ---------------------
@@ -445,12 +454,13 @@ def main():
                 e_div_pool = div_results["e_div"]
                 e_hat_all = np.concatenate([e_hat_conv_pool, e_hat_div_pool], axis=0)
                 e_all = np.concatenate([e_conv_pool, e_div_pool], axis=0)
+                overall_scale = normalizer.get_output_scale() if normalizer is not None else None
                 metrics_overall = filter_metrics(
-                    compute_metrics(e_hat_all, e_all), config.evaluation.metrics
+                    compute_metrics(e_hat_all, e_all, output_scale=overall_scale), config.evaluation.metrics
                 )
                 for metric, value in metrics_overall.items():
                     if isinstance(value, (int, float)) and metric != "per_step":
-                        mlflow.log_metric(f"eval_overall_{metric}", value)
+                        mlflow.log_metric(f"{metric_category}/overall/eval_{metric}", value)
                         logger.info(f"overall {metric}: {value:.6f}")
             else:
                 logger.info(
@@ -502,7 +512,7 @@ def main():
                 except Exception as e_err:
                     logger.warning(f"Failed to generate div plot: {e_err}")
 
-            mlflow.log_artifacts(str(eval_dir), "evaluation")
+            mlflow.log_artifacts(str(eval_dir), f"evaluation/{metric_category}")
             logger.info("Evaluation artifacts logged to MLflow")
 
         logger.info(f"Predictions plot: {eval_dir / 'predictions_plot.png'}")

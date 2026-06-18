@@ -5,13 +5,20 @@ from typing import Dict
 import numpy as np
 
 
-def compute_metrics(e_hat: np.ndarray, e: np.ndarray) -> Dict[str, float]:
+def compute_metrics(
+    e_hat: np.ndarray,
+    e: np.ndarray,
+    output_scale: float = None,
+) -> Dict[str, float]:
     """
     Compute various evaluation metrics, ignoring NaN values.
 
     Args:
         e_hat: Predicted output values (may contain NaN for invalid regions)
         e: Output (target) values (may contain NaN for invalid regions)
+        output_scale: Denominator for NRMSE. When provided (e.g. training-data
+            std or range), NRMSE is scale-invariant across train/test splits.
+            When None, falls back to the test-data range (max - min).
 
     Returns:
         Dictionary of metrics (computed only on finite values)
@@ -48,8 +55,11 @@ def compute_metrics(e_hat: np.ndarray, e: np.ndarray) -> Dict[str, float]:
     ss_tot = np.sum((e_valid - np.mean(e_valid)) ** 2)
     r2 = 1 - (ss_res / (ss_tot + 1e-10))
 
-    # Normalized RMSE (NRMSE)
-    nrmse = rmse / (np.max(e_valid) - np.min(e_valid) + 1e-10)
+    # Normalized RMSE (NRMSE) — Ljung, "System Identification: Theory for the User", 2nd ed., 1999
+    if output_scale is not None:
+        nrmse = rmse / (float(output_scale) + 1e-10)
+    else:
+        nrmse = rmse / (np.max(e_valid) - np.min(e_valid) + 1e-10)
 
     # Max error
     max_error = np.max(np.abs(e_hat_valid - e_valid))
