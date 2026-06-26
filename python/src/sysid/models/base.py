@@ -193,8 +193,8 @@ class LureSystemSafe(LureSystem):
         warmup_steps: int = 0,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         def clamp_step(k: int, x_k: torch.Tensor, d_k: torch.Tensor) -> torch.Tensor:
-            if k < warmup_steps:
-                return d_k
+            # if k < warmup_steps:
+            #     return d_k
             return self.input_filter(X, s, alpha, x_k, d_k)
 
         return self._rollout(d, x0, clamp_step=clamp_step)

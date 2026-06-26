@@ -101,6 +101,7 @@ class Trainer:
         self.early_stopping_patience = early_stopping_patience
         self.warmup_steps = warmup_steps  # Number of steps to skip before computing loss
         self.input_regularization_weight = input_regularization_weight  # Weight for input constraint regularization
+        self.initial_input_regularization_weight = input_regularization_weight  # Store initial value
 
         # Rollback tracking
         self.rollback_count = 0
@@ -300,20 +301,34 @@ class Trainer:
 
     def decay_regularization(self):
         """
-        Decay regularization weight (Interior Point Method).
+        Decay regularization weights (Interior Point Method).
 
         In interior point methods for convex optimization, the barrier parameter
-        is reduced as we approach the solution. Here we decay the regularization
-        weight whenever the learning rate is reduced.
+        is reduced as we approach the solution. Here we decay both the feasibility
+        regularization weight and the input-constraint regularization weight
+        whenever the learning rate is reduced.
         """
-        if self.decay_regularization_weight and self.regularization_weight > 0:
+        if not self.decay_regularization_weight:
+            return
+
+        if self.regularization_weight > 0:
             old_weight = self.regularization_weight
             self.regularization_weight *= self.regularization_decay_factor
             # Ensure we don't go below minimum threshold
             if self.regularization_weight < self.min_regularization_weight:
                 self.regularization_weight = self.min_regularization_weight
-            print(
-                f"  Regularization weight decayed: {old_weight:.6e} → {self.regularization_weight:.6e}"
+            logging.info(
+                f"Regularization weight decayed: {old_weight:.6e} → {self.regularization_weight:.6e}"
+            )
+
+        if self.input_regularization_weight > 0:
+            old_input_weight = self.input_regularization_weight
+            self.input_regularization_weight *= self.regularization_decay_factor
+            # Ensure we don't go below minimum threshold
+            if self.input_regularization_weight < self.min_regularization_weight:
+                self.input_regularization_weight = self.min_regularization_weight
+            logging.info(
+                f"Input regularization weight decayed: {old_input_weight:.6e} → {self.input_regularization_weight:.6e}"
             )
 
     def reduce_lr_on_rollback(self, factor: float = 0.5):
@@ -328,7 +343,7 @@ class Trainer:
             old_lr = param_group["lr"]
             param_group["lr"] *= factor
             new_lr = param_group["lr"]
-            print(f"  Learning rate reduced due to rollbacks: {old_lr:.6e} → {new_lr:.6e}")
+            logging.info(f"Learning rate reduced due to rollbacks: {old_lr:.6e} → {new_lr:.6e}")
 
     def _train_diverging_epoch(self) -> float:
         """One pass over the diverging-trajectory loader.
@@ -732,6 +747,12 @@ class Trainer:
                 if self.regularization_weight > 0:
                     mlflow.log_metric(
                         "regularization_weight", self.regularization_weight, step=epoch
+                    )
+                if self.input_regularization_weight > 0:
+                    mlflow.log_metric(
+                        "input_regularization_weight",
+                        self.input_regularization_weight,
+                        step=epoch,
                     )
 
                 # Gradient statistics (if enabled)
