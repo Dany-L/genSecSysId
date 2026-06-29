@@ -1885,11 +1885,15 @@ class SimpleLure(nn.Module):
         eps = 0  # small epsilon for numerical stability
         c = u_norm_sq - s**2 + alpha**2 * x_quad_form + eps
 
-        # Apply ReLU (only penalize violations, i.e., c > 0)
-        # and square for smooth penalty
-        # Mean over all timesteps and batch samples
-        # reg_loss = torch.relu(c).pow(2).mean()
-        reg_loss = torch.relu(c).mean()
+        # Coverage is a worst-case property: the safe set must contain each
+        # trajectory's peak excursion, so penalize the largest per-trajectory
+        # violation (peak over time) averaged over the batch, rather than the
+        # mean over all steps which dilutes the few steps that actually breach s.
+        # relu is still needed (after amax): a satisfied trajectory has a
+        # negative peak c, and without relu minimizing it would reward pushing c
+        # ever more negative (inflating s) even when the constraint already holds.
+        # relu is monotone, so relu(max_k c_k) == max_k relu(c_k).
+        reg_loss = torch.relu(c.amax(dim=1)).mean()
 
         if return_c:
             return reg_loss, c
