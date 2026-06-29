@@ -296,6 +296,35 @@ def plot_ellipse(
         ax.plot(ellipse[0, :], ellipse[1, :], linetype, linewidth=2, label=name)
 
 
+def _mask_nonfinite(arr: np.ndarray) -> np.ndarray:
+    """Return a float copy with non-finite (NaN/Inf) entries set to NaN.
+
+    matplotlib skips NaN points when drawing and autoscaling, so masking a
+    diverged trajectory keeps its finite portion visible instead of letting
+    Inf leak into the axis limits.
+    """
+    arr = np.asarray(arr, dtype=float)
+    return np.where(np.isfinite(arr), arr, np.nan)
+
+
+def _ensure_finite_axis_limits(axes, default: Tuple[float, float] = (-1.0, 1.0)) -> None:
+    """Force finite limits on any axis left with no finite data.
+
+    When a model diverges, a whole trajectory can be non-finite, leaving the
+    axis with no data to autoscale from. matplotlib then produces non-finite
+    limits and older versions crash inside the tick locator
+    (``MaxNLocator._raw_ticks``: ``np.nonzero(steps >= raw_step)[0][0]`` on an
+    empty array). Plotting must never abort a training run, so we clamp such
+    axes to a finite default. Axes that already have finite data are untouched.
+    """
+    for ax in axes:
+        x0, y0, x1, y1 = ax.dataLim.extents  # [xmin, ymin, xmax, ymax]
+        if not np.isfinite([x0, x1]).all():
+            ax.set_xlim(*default)
+        if not np.isfinite([y0, y1]).all():
+            ax.set_ylim(*default)
+
+
 def plot_predictions(
     output_dir: str,
     e_hat: np.ndarray,  # predicted output
@@ -354,15 +383,17 @@ def plot_predictions(
             # Sequence data (unused: seq_len = e_hat.shape[1])
             for feat in range(e_hat.shape[2]):
                 ax_pred.plot(
-                    e_hat[idx, :, feat], label=f"e_hat (predicted output, feat {feat})", alpha=0.7
+                    _mask_nonfinite(e_hat[idx, :, feat]),
+                    label=f"e_hat (predicted output, feat {feat})", alpha=0.7
                 )
                 ax_pred.plot(
-                    e[idx, :, feat], label=f"e (output, feat {feat})", linestyle="--", alpha=0.7
+                    _mask_nonfinite(e[idx, :, feat]),
+                    label=f"e (output, feat {feat})", linestyle="--", alpha=0.7
                 )
         else:
             # Single-step data
-            ax_pred.plot(e_hat[idx], label="e_hat (predicted output)", alpha=0.7)
-            ax_pred.plot(e[idx], label="e (output)", linestyle="--", alpha=0.7)
+            ax_pred.plot(_mask_nonfinite(e_hat[idx]), label="e_hat (predicted output)", alpha=0.7)
+            ax_pred.plot(_mask_nonfinite(e[idx]), label="e (output)", linestyle="--", alpha=0.7)
 
         ax_pred.set_xlabel("Time Step")
         ax_pred.set_ylabel("Output (e)")
@@ -377,15 +408,20 @@ def plot_predictions(
             if d.ndim == 3:
                 # Sequence data
                 for feat in range(d.shape[2]):
-                    ax_input.plot(d[idx, :, feat], label=f"d (input, feat {feat})", alpha=0.7)
+                    ax_input.plot(_mask_nonfinite(d[idx, :, feat]),
+                                  label=f"d (input, feat {feat})", alpha=0.7)
             else:
-                ax_input.plot(d[idx], label="d (input)", alpha=0.7)
+                ax_input.plot(_mask_nonfinite(d[idx]), label="d (input)", alpha=0.7)
 
             ax_input.set_xlabel("Time Step")
             ax_input.set_ylabel("Input (d)")
             ax_input.set_title(f"Sample {idx}: Input Signal")
             ax_input.legend()
             ax_input.grid(True, alpha=0.3)
+
+    # Guard against fully non-finite trajectories leaving an axis with no data:
+    # otherwise tight_layout() crashes in the tick locator on older matplotlib.
+    _ensure_finite_axis_limits(np.atleast_1d(np.asarray(axes, dtype=object)).ravel())
 
     plt.tight_layout()
 
