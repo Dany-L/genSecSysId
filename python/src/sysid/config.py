@@ -247,6 +247,11 @@ class Config:
     # Set to an integer (e.g., 42) for reproducible results
     seed: Optional[int] = None
 
+    # Logging verbosity: one of DEBUG, INFO, WARNING, ERROR, CRITICAL.
+    # DEBUG surfaces per-step diagnostics (e.g. solve_max_s's s updates).
+    # The --debug CLI flag overrides this to DEBUG for a single run.
+    log_level: str = "INFO"
+
     def __post_init__(self):
         """Initialize evaluation config if not provided."""
         if self.evaluation is None:
@@ -321,6 +326,7 @@ class Config:
             log_dir=config_dict.get("log_dir", "logs"),
             root_dir=config_dict.get("root_dir", None),
             seed=config_dict.get("seed", None),
+            log_level=config_dict.get("log_level", "INFO"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -337,6 +343,7 @@ class Config:
             "log_dir": self.log_dir,
             "root_dir": self.root_dir,
             "seed": self.seed,
+            "log_level": self.log_level,
         }
 
     def save_yaml(self, path: str):
