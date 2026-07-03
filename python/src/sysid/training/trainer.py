@@ -46,6 +46,7 @@ class Trainer:
         log_gradients: bool = True,
         warmup_steps: int = 0,
         input_regularization_weight: float = 0.01,
+        solve_max_s_on_violation: bool = False,
         train_div_loader: Optional[DataLoader] = None,
         val_div_loader: Optional[DataLoader] = None,
     ):
@@ -102,6 +103,10 @@ class Trainer:
         self.warmup_steps = warmup_steps  # Number of steps to skip before computing loss
         self.input_regularization_weight = input_regularization_weight  # Weight for input constraint regularization
         self.initial_input_regularization_weight = input_regularization_weight  # Store initial value
+        # When True, after each training epoch re-solve the max-s SDP if the
+        # training data violates the input constraint (c > 0). Default False:
+        # no SDP is solved during training. See _maybe_maximize_s.
+        self.solve_max_s_on_violation = solve_max_s_on_violation
 
         # Rollback tracking
         self.rollback_count = 0
@@ -627,6 +632,67 @@ class Trainer:
 
         return {"val_loss": avg_loss, "val_loss_div": val_loss_div}
 
+    def _maybe_maximize_s(self, epoch: int) -> Optional[float]:
+        """Re-solve the max-s SDP (once per epoch) if the training data violates
+        the input constraint.
+
+        Runs in two steps so the SDP is decoupled from the mini-batching:
+
+        1. Scan *all* training batches (no grad) and track the peak
+           input-constraint margin ``c_k = ||u_k||^2 - s^2 + alpha^2 V(x_k)``
+           over every step of every batch. This tells us whether the current
+           certified safe set covers the whole training set.
+        2. Only if the constraint is breached somewhere (``max_k c_k > 0``) do we
+           solve the max-s SDP a single time via ``model.solve_max_s``. The SDP
+           is data-independent (it fixes the prediction parameters and optimizes
+           the certificate P, L, Λ, s), so one solve certifies an enlarged ``s``
+           for the entire dataset.
+
+        This replaces the earlier per-batch loop, which solved an SDP inside the
+        batch iteration and therefore effectively used only the last violating
+        batch — a stochastic-gradient-descent-like update on ``s``.
+
+        Returns the new ``s`` if the SDP was solved, else ``None`` (constraint
+        already satisfied everywhere, or the SDP failed). Only meaningful for
+        SimpleLure models; a no-op otherwise.
+        """
+        if not isinstance(self.model, SimpleLure):
+            return None
+
+        self.model.eval()
+        try:
+            # Step 1: peak constraint margin over the whole training set.
+            c_max = float("-inf")
+            with torch.no_grad():
+                for batch in self.train_loader:
+                    if len(batch) == 3:
+                        d, _, _ = batch
+                    else:
+                        d, _ = batch
+                    d = d.to(self.device)
+                    _, (x, _), _ = self.model(d, x0=None, warmup_steps=self.warmup_steps)
+                    _, c = self.model.get_regularization_input(d, x, return_c=True)
+                    # NaN positions come from padded trajectories; ignore them.
+                    batch_c_max = torch.nan_to_num(c, nan=float("-inf")).max()
+                    c_max = max(c_max, float(batch_c_max))
+
+            # Step 2: solve once, only if the constraint is violated somewhere.
+            if c_max <= 0:
+                return None
+
+            new_s = self.model.solve_max_s()
+            if new_s is not None:
+                logging.info(
+                    f"Epoch {epoch}: input constraint violated (max c={c_max:.6f}), "
+                    f"solved max-s SDP, s={new_s:.6f}"
+                )
+                if self.mlflow_tracking:
+                    mlflow.log_metric("max_s_solved", 1, step=epoch)
+                    mlflow.log_metric("max_s_value", new_s, step=epoch)
+            return new_s
+        finally:
+            self.model.train()
+
     def train(self, max_epochs: int, normalizer=None) -> Dict[str, Any]:
         """
         Train the model.
@@ -680,6 +746,13 @@ class Trainer:
             self.train_reg_inputs.append(train_results["reg_input"])
             if train_pred_loss_div is not None:
                 self.train_div_losses.append(train_pred_loss_div)
+
+            # Optionally repair s: if the training inputs violate the input
+            # constraint (c > 0), re-solve the max-s SDP so the certified safe
+            # set covers them. Disabled by default (solve_max_s_on_violation).
+            # Done before validation so val reflects the (possibly) updated model.
+            if self.solve_max_s_on_violation:
+                self._maybe_maximize_s(epoch)
 
             # Validate
             val_results = self.validate()

@@ -511,6 +511,7 @@ def main():
             log_gradients=getattr(config.training, "log_gradients", True),
             warmup_steps=config.training.warmup_steps,
             input_regularization_weight=getattr(config.training, "input_regularization_weight", 0.01),
+            solve_max_s_on_violation=getattr(config.training, "solve_max_s_on_violation", False),
         )
 
         if scheduler is not None:

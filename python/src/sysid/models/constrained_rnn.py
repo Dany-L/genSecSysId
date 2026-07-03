@@ -576,6 +576,9 @@ class SimpleLure(nn.Module):
             train_inputs = normalizer.transform_inputs(train_inputs)
         u_squared_norm = np.sum(train_inputs**2, axis=2)
         max_input_n = np.max(u_squared_norm)
+        # max_input = np.sqrt(normalizer.inverse_transform_inputs(max_input_n)).squeeze()
+        # alpha = 1/(1+ np.exp(-self.tau.cpu().detach().numpy()))
+        # self.s.data = torch.tensor(max_input/(1-alpha**2))
         # self.s.data = torch.tensor(np.sqrt(normalizer.inverse_transform_inputs(max_input_n))).squeeze()
         # self.s.data = torch.tensor(4.0)
 
@@ -1058,97 +1061,33 @@ class SimpleLure(nn.Module):
             logger.info(f"  ||D12||={torch.norm(self.D12).item():.6f}")
 
 
-    def analysis_problem(self, learn_B_and_D21: bool = False) -> bool:
+    def analysis_problem(self) -> bool:
+        """Repair the certificate by PROJECTING ``s`` onto the feasible set
+        (within-epoch fallback).
 
-        P = cp.Variable((self.nx, self.nx), symmetric=True)
-        la = cp.Variable((self.nz, 1))
-        M = cp.diag(la)
-        # s_hat = cp.Variable((1,1))
-        if learn_B_and_D21:
-            B = cp.Variable(self.B.shape)
-            D21 = cp.Variable(self.D21.shape)
-        else:
-            B = self.B.cpu().detach().numpy()
-            D21 = self.D21.cpu().detach().numpy()
-        A = self.A.cpu().detach().numpy()
-        B2 = self.B2.cpu().detach().numpy()
-        C2 = self.C2.cpu().detach().numpy()
-        alpha = 1/(1+ np.exp(-self.tau.cpu().detach().numpy()))
-        # alpha = self.alpha.cpu().detach().numpy()
-        s = self.s.cpu().detach().numpy()
-        # S_hat = cp.Variable((1,1))
-        # if alpha >= 1:
-        #     self.alpha.data = torch.tensor(0.99)
-        # if alpha < 0.9:
+        When a gradient step produces an infeasible certificate, solve the shared
+        max-s SDP (:meth:`_max_s_sdp`) with ``s_upper`` set to the current ``s``,
+        optimizing P, L, M (=Λ ⪰ 0) and ``s``. The result is
+        ``s = min(s_current, s_max(theta))``: keep the current ``s`` when it is
+        feasible, and clamp it down to the max feasible ``s`` when it has
+        overshot. The new P, L, Λ, s are written back and True is returned.
 
-        # if self.get_scalar_inequalities()[0]() < 0 and self.learn_L:
-        #     logger.info("Condition on inputs is not satisfied")
-        #     self.reset_s()
-        #
+        Projecting (rather than a *fixed-s* feasibility solve) avoids the common
+        rollback where ``s`` has drifted above the dynamics' max feasible ``s`` —
+        in that case the fixed-s problem is infeasible and training stalls,
+        whereas the projection simply clamps ``s`` down and continues. It returns
+        False (→ the trainer rolls the step back) only when the dynamics are
+        uncertifiable at *any* ``s`` (genuine infeasibility).
 
-        multiplier_constraints = []
-        if self.learn_L:
-            L = cp.Variable((self.nz, self.nx))
-        else:
-            L = self.L.cpu().detach().numpy()
-
-        for li in L:
-            if self.learn_L:
-                li = li.reshape((1, -1), "C")
-            else:
-                li = li.reshape((1, -1))
-            multiplier_constraints.append(
-                cp.bmat(
-                    [
-                        [np.array([[1 / s**2]]), li],
-                        [li.T, P],
-                    ]
-                )
-                # cp.bmat(
-                #     [
-                #         [S_hat, li],
-                #         [li.T, P],
-                #     ]
-                # )
-                >> EPS * np.eye(self.nx + 1)
-            )
-
-
-        F = cp.bmat(
-            [
-                [-(alpha**2) * P, np.zeros((self.nx, self.nd)), P @ C2.T + L.T, P @ A.T],
-                [np.zeros((self.nd, self.nx)), -np.eye(self.nd), D21.T, B.T],
-                [C2 @ P + L, D21, -2 * M, M @ B2.T],
-                [A @ P, B, B2 @ M, -P],
-            ]
-        )
-
-        # init_constraints = [-P + self.max_norm_x0**2/s**2 * np.eye(self.nx)<< 0]
-
-        nF = F.shape[0]
-        problem = cp.Problem(cp.Minimize([None]), [F << -EPS * np.eye(nF), *multiplier_constraints])
-        try:
-            problem.solve(solver=cp.MOSEK)
-        except Exception:
-            return False  # SDP failed due to solver error
-        if not problem.status == "optimal":
-            return False  # SDP failed to find feasible solution
-        # logger.info(f"SDP analysis problem solved: {problem.status}")
-
-        # self.s.data = 1/torch.sqrt(torch.tensor(S_hat.value).squeeze())
-        device, dtype = self.P.device, self.P.dtype
-        self.P.data = torch.tensor(P.value, device=device, dtype=dtype)
-        # self.M.data = torch.tensor(M.value)
-        self.la.data = torch.tensor(np.diag(M.value), device=device, dtype=dtype)
-        if self.learn_L:
-            self.L.data = torch.tensor(L.value, device=device, dtype=dtype)
-        if learn_B_and_D21:
-            self.B.data = torch.tensor(B.value, device=device, dtype=dtype)
-            self.D21.data = torch.tensor(D21.value, device=device, dtype=dtype)
-
-        # self.s.data = torch.tensor(np.sqrt(1/s_hat.value).squeeze())
-
-        return True  # SDP successfully found feasible solution
+        The complementary *after-epoch* step, which enlarges ``s`` when the
+        training data is not covered, is :meth:`solve_max_s` (unbounded max-s).
+        """
+        s_current = float(self.s.cpu().detach().numpy())
+        sol = self._max_s_sdp(s_upper=s_current)
+        if sol is None:
+            return False
+        self._apply_certificate_solution(sol)
+        return True
 
     def analysis_problem_init(self, learn_B: bool= False, learn_D21: bool = False) -> bool:
 
@@ -1169,6 +1108,7 @@ class SimpleLure(nn.Module):
         alpha = 1/(1+ np.exp(-self.tau.cpu().detach().numpy()))
         if self.learn_L:
             s_hat = cp.Variable((1,1))
+            # s_hat = np.array([[1/self.s.cpu().detach().numpy()**2]])
         else:
             s = self.s
 
@@ -1227,6 +1167,13 @@ class SimpleLure(nn.Module):
                     *multiplier_constraints, 
                 ],
             )
+            # problem = cp.Problem(
+            #     cp.Minimize(None),
+            #     [
+            #         F << -EPS * np.eye(nF), 
+            #         *multiplier_constraints, 
+            #     ],
+            # )
         else:
             problem = cp.Problem(
                 cp.Minimize([None]),
@@ -1509,86 +1456,30 @@ class SimpleLure(nn.Module):
 
         logger.info(f"Current alpha = {alpha:.6f}, s = {s_original:.6f}")
 
-        # Decision variables
-        P = cp.Variable((self.nx, self.nx), symmetric=True)
-        L = cp.Variable((self.nz, self.nx))
-        m = cp.Variable((self.nz, 1))
-        M = cp.diag(m)
+        # Max-s SDP (shared with training via solve_max_s): fix the prediction
+        # parameters, optimize P, L, M (=Λ) and s, then write the solution back.
+        sol = self._max_s_sdp()
+        if sol is None:
+            return {"success": False, "status": "max_s_sdp_failed"}
 
-        # S_hat for optimizing s
-        S_hat = cp.Variable((1, 1))
+        P_star = sol["P"]
+        L_star = sol["L"]
+        s_star = sol["s"]
+        max_eig_F = sol["max_eig_F"]
 
-        # Constraints
-        constraints = []
+        self._apply_certificate_solution(sol)
 
-        # Main LMI: F <= -eps*I
-        F = cp.bmat(
-            [
-                [-(alpha**2) * P, np.zeros((self.nx, self.nd)), P @ C2.T + L.T, P @ A.T],
-                [np.zeros((self.nd, self.nx)), -np.eye(self.nd), D21.T, B.T],
-                [C2 @ P + L, D21, -2 * M, M @ B2.T],
-                [A @ P, B, B2 @ M, -P],
-            ]
-        )
-        nF = F.shape[0]
-        constraints.append(F << -EPS * np.eye(nF))
-
-        # Locality constraints: [S_hat, li; li', P] >= EPS*I for each row of L
-        Gs = []
-        for i in range(self.nz):
-            li = L[i, :].reshape((1, -1), order="C")
-            locality_lmi = cp.bmat([[S_hat, li], [li.T, P]])
-            Gs.append(locality_lmi)
-            constraints.append(locality_lmi >> EPS * np.eye(self.nx + 1))
-
-        # Objective
-        objective = cp.Minimize(S_hat)
-
-        # Solve
-        problem = cp.Problem(objective, constraints)
-        logger.info(f"Solving SDP with {len(constraints)} constraints using MOSEK...")
-
-        try:
-            problem.solve(solver=cp.MOSEK, verbose=False)
-        except Exception as e:
-            logger.error(f"SDP solver failed: {e}")
-            return {"success": False, "error": str(e)}
-
-        # Check solution status
-        if problem.status not in ["optimal", "optimal_inaccurate"]:
-            logger.error(f"SDP failed with status: {problem.status}")
-            return {"success": False, "status": problem.status}
-
-        logger.info(f"✓ SDP state set solved successfully: {problem.status}")
-
-        S_hat_opt = S_hat.value[0, 0] if hasattr(S_hat.value, "__len__") else S_hat.value
-        s_star = np.sqrt(1.0 / S_hat_opt)
-
-        # Verify solution
-        max_eig_F = np.max(np.real(np.linalg.eigvals(F.value)))
+        logger.info("✓ max-s SDP solved successfully")
         logger.info(f"Max eigenvalue of F: {max_eig_F:.6e}")
-
-        for Gi in Gs:
-            min_eig_Gi = np.min(np.real(np.linalg.eigvals(Gi.value)))
+        for min_eig_Gi in sol["locality_min_eigs"]:
             if min_eig_Gi < 0:
                 logger.warning(f"Locality LMI violated: min eigenvalue = {min_eig_Gi:.6e}")
             else:
                 logger.info(f"Locality LMI satisfied: min eigenvalue = {min_eig_Gi:.6e}")
 
-        # update model parameters
-        device, dtype = self.P.device, self.P.dtype
-        self.P.data = torch.tensor(P.value, device=device, dtype=dtype)
-        self.L.data = torch.tensor(L.value, device=device, dtype=dtype)
-        self.la.data = torch.tensor(np.diag(M.value), device=device, dtype=dtype)
-        # self.M = torch.diag(self.la)
-        self.s.data = torch.tensor(s_star, device=device, dtype=dtype)
-
-
         # calculate output bound
         C = self.C.cpu().detach().numpy()
-        P_star = P.value
         X_star = np.linalg.inv(P_star)
-        L_star = L.value
 
         # Y_tilde = cp.Variable((self.ne,self.ne), symmetric=True)
         Y = cp.Variable((self.ne, self.ne), symmetric=True)
@@ -1681,6 +1572,154 @@ class SimpleLure(nn.Module):
             "constraints_satisfied": constraints_satisfied,
             "summary": summary,
         }
+
+    def _max_s_sdp(self, s_upper: Optional[float] = None) -> Optional[dict]:
+        """Solve the max-feasible-``s`` SDP for the current (fixed) prediction
+        parameters. Pure — does NOT mutate the model.
+
+        Fixes everything that influences the predictions (A, B, B2, C2, D21 and
+        alpha) and optimizes the certificate variables P, L, M (=Λ) and
+        ``S_hat = 1/s^2``. Objective: ``minimize S_hat`` (i.e. maximize ``s``)
+        subject to the stability LMI ``F ⪯ -εI`` and the locality LMIs
+        ``[S_hat, l_i; l_i^T, P] ⪰ εI``. ``s`` **is** an optimization variable.
+        This single SDP backs both training entry points:
+
+        * ``s_upper=None`` → pure max-s. Used by :meth:`post_process` /
+          :meth:`solve_max_s` and, after each epoch, when the training data is
+          not covered by the current ``s``.
+        * ``s_upper`` given → add ``S_hat >= 1/s_upper^2`` (i.e. ``s <=
+          s_upper``). With the minimize-``S_hat`` objective the solver returns
+          ``S_hat = max(1/s_upper^2, S_hat_min(theta))`` — i.e. ``s = min(
+          s_upper, s_max(theta))``, the projection of ``s_upper`` onto the
+          feasible interval ``(0, s_max]``. This is the within-epoch fallback
+          (:meth:`analysis_problem`): it keeps a feasible ``s`` where it is and
+          clamps an overshooting ``s`` down to ``s_max`` instead of failing, so
+          it only returns ``None`` when the dynamics are uncertifiable at *any*
+          ``s`` (genuine infeasibility).
+
+        Returns a dict with the numpy solution (``P``, ``L``, ``M``, ``s``,
+        ``max_eig_F``, ``locality_min_eigs``) or ``None`` if the solver fails.
+        """
+        A = self.A.cpu().detach().numpy()
+        B = self.B.cpu().detach().numpy()
+        B2 = self.B2.cpu().detach().numpy()
+        C2 = self.C2.cpu().detach().numpy()
+        D21 = self.D21.cpu().detach().numpy()
+        alpha = 1 / (1 + np.exp(-self.tau.cpu().detach().numpy()))
+
+        # Decision variables: P, L, M=diag(m), S_hat = 1/s^2.
+        P_current = self.P.cpu().detach().numpy()
+        P = cp.Variable((self.nx, self.nx), symmetric=True)
+        L = cp.Variable((self.nz, self.nx))
+        m = cp.Variable((self.nz, 1))
+        M = cp.diag(m)
+        S_hat = cp.Variable((1, 1))
+
+        # Stability LMI: F <= -eps*I (does not depend on s).
+        F = cp.bmat(
+            [
+                [-(alpha**2) * P, np.zeros((self.nx, self.nd)), P @ C2.T + L.T, P @ A.T],
+                [np.zeros((self.nd, self.nx)), -np.eye(self.nd), D21.T, B.T],
+                [C2 @ P + L, D21, -2 * M, M @ B2.T],
+                [A @ P, B, B2 @ M, -P],
+            ]
+        )
+        nF = F.shape[0]
+        # M = diag(m) is the IQC/sector multiplier and must be ⪰ 0. This is in
+        # fact already implied by F ⪯ -εI (the -2·diag(m) block sits on F's
+        # diagonal, forcing m_i > ε/2), but we state it explicitly for
+        # correctness and robustness to future formulation changes.
+        constraints = [F << -EPS * np.eye(nF), m >= 0]
+
+        # Locality LMIs: [S_hat, l_i; l_i^T, P] >= eps*I for each row of L.
+        Gs = []
+        for i in range(self.nz):
+            li = L[i, :].reshape((1, -1), order="C")
+            locality_lmi = cp.bmat([[S_hat, li], [li.T, P]])
+            Gs.append(locality_lmi)
+            constraints.append(locality_lmi >> EPS * np.eye(self.nx + 1))
+
+        # Projection: cap s at s_upper (S_hat >= 1/s_upper^2). With the
+        # minimize-S_hat objective this yields s = min(s_upper, s_max(theta)).
+        if s_upper is not None and s_upper > 0:
+            constraints.append(S_hat >= 1.0 / float(s_upper) ** 2 + 1.0e-7)
+
+        problem = cp.Problem(cp.Minimize(S_hat), constraints)
+        try:
+            problem.solve(solver=cp.MOSEK, verbose=False)
+        except Exception as e:
+            logger.error(f"max-s SDP solver failed: {e}")
+            return None
+        if problem.status != "optimal":
+            logger.error(f"max-s SDP failed with status: {problem.status}")
+            return None
+
+        S_hat_opt = S_hat.value[0, 0] if hasattr(S_hat.value, "__len__") else float(S_hat.value)
+        if S_hat_opt <= 0:
+            logger.error(f"max-s SDP returned non-positive S_hat ({S_hat_opt})")
+            return None
+        s_star = float(np.sqrt(1.0 / S_hat_opt))
+
+        min_eig_diff = float(np.min(np.real(np.linalg.eigvals(P_current - P.value))))
+        logger.debug(
+            f"max-s SDP solved: s = {s_star:.6f} (s_upper = {s_upper}), "
+            f"min eig(P_current - P_opt) = {min_eig_diff:.6e}"
+        )
+
+        return {
+            "P": P.value,
+            "L": L.value,
+            "M": M.value,
+            "s": s_star,
+            "max_eig_F": float(np.max(np.real(np.linalg.eigvals(F.value)))),
+            "locality_min_eigs": [
+                float(np.min(np.real(np.linalg.eigvals(g.value)))) for g in Gs
+            ],
+        }
+
+    def _apply_certificate_solution(self, sol: dict) -> None:
+        """Write a :meth:`_max_s_sdp` solution back into the model (P, L, la, s)."""
+        device, dtype = self.P.device, self.P.dtype
+        self.P.data = torch.tensor(sol["P"], device=device, dtype=dtype)
+        self.L.data = torch.tensor(sol["L"], device=device, dtype=dtype)
+        self.la.data = torch.tensor(np.diag(sol["M"]), device=device, dtype=dtype)
+        self.s.data = torch.tensor(sol["s"], device=device, dtype=dtype)
+
+    def solve_max_s(self) -> Optional[float]:
+        """Find the largest feasible input bound ``s`` for the current model.
+
+        Solves the same SDP as :meth:`post_process` (via the shared
+        :meth:`_max_s_sdp`): fix the prediction parameters, optimize the
+        certificate P, L, Λ and ``s``. Updates the model in place and returns the
+        new ``s``; returns ``None`` if the SDP fails.
+        """
+        sol = self._max_s_sdp()
+        if sol is None:
+            return None
+        s_original = float(self.s.cpu().detach().numpy())
+        self._apply_certificate_solution(sol)
+        # debug level: post_process and _maybe_maximize_s emit their own info logs.
+        logger.debug(f"solve_max_s: s {s_original:.6f} → {sol['s']:.6f}")
+        return sol["s"]
+
+    def maximize_s_on_violation(
+        self, u: torch.Tensor, x: torch.Tensor
+    ) -> Optional[float]:
+        """Re-solve for the max feasible ``s`` only when the input constraint is
+        currently violated.
+
+        Computes the per-step margin ``c_k = ||u_k||^2 - s^2 + alpha^2 V(x_k)``
+        for the current model; if any ``c_k > 0`` (the data breaches the current
+        ``s``) it calls :meth:`solve_max_s` to enlarge ``s`` (and update P, L,
+        Λ). Returns the new ``s`` on success, or ``None`` when the constraint
+        already holds (no SDP solved) or the SDP fails.
+        """
+        with torch.no_grad():
+            _, c = self.get_regularization_input(u, x, return_c=True)
+            c_max = torch.nan_to_num(c, nan=float("-inf")).max()
+        if float(c_max) <= 0:
+            return None
+        return self.solve_max_s()
 
     def get_regularization_loss(self, method: Optional[str] = None, return_components: bool = False):
         """

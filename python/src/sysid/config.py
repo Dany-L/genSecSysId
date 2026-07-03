@@ -163,6 +163,11 @@ class TrainingConfig:
     # Input constraint regularization weight
     input_regularization_weight: float = 0.01  # Weight for input constraint loss
 
+    # When True, after each training epoch re-solve the max-s SDP if the training
+    # data violates the input constraint (c > 0), enlarging s (and P, L, Λ) to
+    # cover the inputs. Default False: no SDP is solved during training.
+    solve_max_s_on_violation: bool = False
+
     # Gradient monitoring
     log_gradients: bool = True  # Log gradient statistics to MLflow
 
