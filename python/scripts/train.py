@@ -341,8 +341,7 @@ def main():
             train_states,
             train_outputs,
             init_config=config.model.initialization,
-            data_dir=data_config.train_path,
-            normalizer = normalizer
+            normalizer=normalizer,
         )
     print_model_summary(model)
 
@@ -541,7 +540,16 @@ def main():
             log_gradients=getattr(config.training, "log_gradients", True),
             warmup_steps=config.training.warmup_steps,
             input_regularization_weight=getattr(config.training, "input_regularization_weight", 0.01),
-            solve_max_s_on_violation=getattr(config.training, "solve_max_s_on_violation", False),
+            output_regularization_weight=(
+                getattr(config.training, "output_regularization_weight", 0.0)
+                if config.training.use_custom_regularization
+                else 0.0
+            ),
+            output_std=(
+                float(np.asarray(normalizer.output_std).reshape(-1)[0])
+                if normalizer is not None and getattr(normalizer, "output_std", None) is not None
+                else 1.0
+            ),
         )
 
         if scheduler is not None:

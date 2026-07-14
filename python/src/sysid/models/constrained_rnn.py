@@ -1,14 +1,14 @@
 import logging
 import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Literal, Optional, Tuple, Union, overload
 
 import cvxpy as cp
 import numpy as np
 import torch
 import torch.nn as nn
 
-from sysid.utils import plot_ellipse_and_parallelogram, torch_bmat
+from sysid.utils import max_abs_output, plot_ellipse_and_parallelogram, torch_bmat
 
 from .base import DznActivation, LureSystem, LureSystemClass, LureSystemSafe
 from ..data import DataNormalizer
@@ -29,8 +29,8 @@ class SimpleLure(nn.Module):
         nw: int,
         activation: str,  # saturation nonlinearity
         custom_params: Optional[dict] = None,
-        delta: np.float64 = 0.1,
-        max_norm_x0: np.float64 = 1.0,
+        delta: float = 0.1,
+        max_norm_x0: float = 1.0,
         ts: float = 0.1,
     ):
         """
@@ -59,30 +59,26 @@ class SimpleLure(nn.Module):
         self.register_buffer("max_norm_x0_buffer", torch.tensor(max_norm_x0))
         self.max_norm_x0 = max_norm_x0  # Keep as attribute for compatibility
 
+        # Safe output level y_max = max_{i,k} |y_k^(i)| in PHYSICAL units (it has
+        # a physical meaning, so it is stored unnormalized). The model's C/P/s
+        # live in normalized output units, so the output-coverage machinery
+        # scales the certified image up to physical by ``output_std`` (the
+        # coverage floor is (output_std·s)²·CPCᵀ ⪰ y_max²). y_max NaN = unset ->
+        # the output-coverage penalty is a no-op. Both are persistent=False: set
+        # from the data each run, never break loading old checkpoints that
+        # predate these buffers.
+        self.register_buffer("y_max", torch.tensor(float("nan")), persistent=False)
+        self.register_buffer("output_std", torch.tensor(1.0), persistent=False)
+
         self.P = nn.Parameter(torch.eye(self.nx))  # Lyapunov matrix
         if custom_params is not None:
             learn_L = custom_params.get("learn_L", True)
-            self.regularization_method = custom_params.get(
-                "regularization_method", "interior_point"
-            )
-            self.dual_penalty_init = custom_params.get("dual_penalty_init", 1.0)
-            self.dual_penalty_growth = custom_params.get("dual_penalty_growth", 1.1)
-            self.dual_penalty_shrink = custom_params.get("dual_penalty_shrink", 0.9)
-            self.l_nonzero_weight = custom_params.get("l_nonzero_weight", 0.0)
             self._identity_init_cfg = custom_params.get("identity_init", {}) or {}
         else:
             learn_L = True
-            self.regularization_method = "interior_point"
-            self.dual_penalty_init = 1.0
-            self.dual_penalty_growth = 1.1
-            self.dual_penalty_shrink = 0.9
-            self.l_nonzero_weight = 0.0
             self._identity_init_cfg = {}
 
         self.learn_L = learn_L
-
-        # Dual penalty coefficient (not a parameter, updated manually)
-        self.register_buffer("dual_penalty", torch.tensor(self.dual_penalty_init))
 
         # Parse structural constraints
         self.structural_constraints = self._parse_structural_constraints(custom_params)
@@ -144,6 +140,7 @@ class SimpleLure(nn.Module):
             self.structural_constraints.get('D22')
         )
 
+        Delta: nn.Module
         if activation == "sat":
             Delta = nn.Hardtanh(min_val=-1.0, max_val=1.0)
         elif activation == "dzn":
@@ -179,7 +176,25 @@ class SimpleLure(nn.Module):
 
         # self.initialize_parameters()
 
-    def _parse_structural_constraints(self, custom_params: dict) -> dict:
+    # Buffers/parameters retired from the state_dict but tolerated when loading
+    # older checkpoints. ``dual_penalty`` was a buffer of the removed dual
+    # constrained-learning method; checkpoints saved before its removal still
+    # carry it.
+    _LEGACY_STATE_KEYS: Tuple[str, ...] = ("dual_penalty",)
+
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        """Load a state dict, silently dropping retired keys (see
+        ``_LEGACY_STATE_KEYS``) so pre-existing checkpoints keep loading.
+
+        Everything else is still loaded strictly — unknown or missing keys
+        other than the retired ones raise as usual.
+        """
+        filtered = {
+            k: v for k, v in state_dict.items() if k not in self._LEGACY_STATE_KEYS
+        }
+        return super().load_state_dict(filtered, *args, **kwargs)
+
+    def _parse_structural_constraints(self, custom_params: Optional[dict]) -> dict:
         """
         Parse and validate structural constraints from custom_params.
         
@@ -538,73 +553,70 @@ class SimpleLure(nn.Module):
         train_states,
         train_outputs,
         init_config=None,
-        data_dir: Optional[str] = None,
-        normalizer: Optional[DataNormalizer] = None
+        normalizer: Optional[DataNormalizer] = None,
     ):
-        """
-        Initialize model parameters using the specified method.
+        """Initialize model parameters with the **identity** strategy.
 
-        Supports three initialization strategies:
-        1. ESN (Echo State Network): Random reservoirs with least-squares fitting
-        2. N4SID: Load from n4sid_params.mat file if available
-        3. Identity: Predefined diagonal A, random C2, identity-like C
+        Sets a stable diagonal A, identity-like C, and configurable random
+        B2/C2/D21 (see :meth:`_init_identity`), then establishes the certificate
+        (P, L, s) via MinTrProb (step 2 of the algorithm). ESN / N4SID inits were
+        removed — ``identity`` is the only supported method.
 
         Args:
-            train_inputs: Training input data (B, N, nd)
-            train_states: Training state data (B, N, nx) or None
-            train_outputs: Training output data (B, N, ne)
-            init_config: InitializationConfig object specifying the method.
-                        If None, defaults to ESN with 5 restarts.
-            data_dir: Directory to search for n4sid_params.mat
-            normalizer: Data normalizer to use for scaling inputs/outputs
+            train_inputs: Training input data (B, N, nd).
+            train_states: Training state data (unused by the identity init; kept
+                for API symmetry with the loaders).
+            train_outputs: Training output data (B, N, ne) — used for y_max.
+            init_config: InitializationConfig; ``method`` must be ``'identity'``.
+            normalizer: Data normalizer used to scale C/B and derive y_max.
         """
-        # Set defaults
-        if init_config is None:
-            init_method = "esn"
-            n_restarts = 5
-        else:
-            init_method = getattr(init_config, "method", "esn").lower()
-            n_restarts = getattr(init_config, "esn_n_restarts", 5)
+        init_method = (
+            getattr(init_config, "method", "identity").lower()
+            if init_config is not None else "identity"
+        )
+        if init_method != "identity":
+            raise ValueError(
+                f"Unknown initialization method: {init_method!r}. Only 'identity' "
+                "is supported (esn/n4sid were removed)."
+            )
 
         logger.info("=" * 80)
-        logger.info(f"INITIALIZATION: Using '{init_method}' method")
+        logger.info("INITIALIZATION: Using 'identity' method")
         logger.info("=" * 80)
 
-        # set initial according to (u^k)^T u^k <= s^2 - alpha^2 * V(x^k)
-        # The maximum s follow by setting x^k = 0 and then getting (u^k)^T u^k <= s^2 for all k, where u^k is the input at time k
+        # Normalize inputs for the MinTrProb init below (initialize_s_from_conditions
+        # expects normalized inputs).
         if normalizer is not None:
             train_inputs = normalizer.transform_inputs(train_inputs)
-        u_squared_norm = np.sum(train_inputs**2, axis=2)
-        max_input_n = np.max(u_squared_norm)
-        # max_input = np.sqrt(normalizer.inverse_transform_inputs(max_input_n)).squeeze()
-        # alpha = 1/(1+ np.exp(-self.tau.cpu().detach().numpy()))
-        # self.s.data = torch.tensor(max_input/(1-alpha**2))
-        # self.s.data = torch.tensor(np.sqrt(normalizer.inverse_transform_inputs(max_input_n))).squeeze()
-        # self.s.data = torch.tensor(4.0)
 
-        if init_method == "n4sid":
-            success = self._init_n4sid(train_inputs, train_states, train_outputs, data_dir)
-            if not success:
-                logger.warning("N4SID initialization failed or file not found. Falling back to ESN.")
-                self._init_esn(train_inputs, train_states, train_outputs, n_restarts)
-        elif init_method == "identity":
-            self._init_identity(normalizer)
-        elif init_method == "esn":
-            self._init_esn(train_inputs, train_states, train_outputs, n_restarts)
-        else:
-            raise ValueError(f"Unknown initialization method: {init_method}")
+        self._init_identity(normalizer)
 
         # Common post-initialization
         constraints_ok = self.check_constraints()
         logger.info(f"Initialization complete. Constraints satisfied: {constraints_ok}")
         logger.info("=" * 80)
-        if not constraints_ok:
+
+        # Step 2 of the clean algorithm: establish the certificate (P, L, s) via
+        # MinTrProb from the output + input conditions. This also guarantees
+        # feasibility, so no separate analysis_problem_init bootstrap is needed
+        # on this path. y_max is PHYSICAL (max |raw training output|); output_std
+        # relates the model's normalized C/P/s to physical units.
+        init_s = bool(getattr(init_config, "init_s_from_conditions", True)) if init_config is not None else True
+        if init_s and self.learn_L and normalizer is not None:
+            y_max = max_abs_output(train_outputs)
+            output_std = float(np.asarray(normalizer.output_std).reshape(-1)[0])
+            self.set_output_coverage_level(y_max, output_std)
+            n_grid = int(getattr(init_config, "init_s_grid_size", 15))
+            s_max = float(getattr(init_config, "init_s_max", 20.0))
+            self.initialize_s_from_conditions(train_inputs, y_max, n_grid=n_grid, s_max=s_max)
+        elif not constraints_ok:
+            # No MinTrProb init (learn_L=False, or disabled): fall back to a
+            # feasibility bootstrap so training starts from a valid certificate.
             b_feasible = self.analysis_problem_init(learn_B=False, learn_D21=True)
             if not b_feasible:
                 raise ValueError("Initialization did not satisfy constraints and problem is infeasible. Please check your initialization method and structural constraints.")
-            # self.analysis_problem_init(learn_B=True, learn_D21=True)
 
-        
+
 
     def _resolve_init_spec(
         self,
@@ -706,6 +718,9 @@ class SimpleLure(nn.Module):
                 B_init = input_scale * self.ts * torch.tensor(
                     [[0.0], [1.0]], device=self.B.device, dtype=self.B.dtype
                 )
+                # B_init = 0.01*self.ts * torch.tensor(
+                #     [[0.0], [1.0]], device=self.B.device, dtype=self.B.dtype
+                # )
             self._set_param_data('B', B_init)
 
         # --- B2, C2, D21: random (configurable std) ---
@@ -729,9 +744,13 @@ class SimpleLure(nn.Module):
                         "'output_std', or an explicit 'identity_init.C.value' / "
                         "'identity_init.C.load_from' override in custom_params."
                     )
+                assert normalizer is not None and normalizer.output_std is not None
                 C_init = (1.0 / normalizer.output_std.squeeze()) * torch.tensor(
                     [[1.0, 0.0]], device=self.C.device, dtype=self.C.dtype
                 )
+                # C_init = 0.01 * torch.tensor(
+                #     [[1.0, 0.0]], device=self.C.device, dtype=self.C.dtype
+                # )
             self._set_param_data('C', C_init)
 
         # --- D, D12: zero direct feedthrough ---
@@ -748,345 +767,83 @@ class SimpleLure(nn.Module):
         logger.info(f"  ||C||={np.linalg.norm(self.C.detach().cpu().numpy()):.4f}")
         logger.info(f"  ||C2||={np.linalg.norm(self.C2.detach().cpu().numpy()):.4f}")
 
-    def _init_n4sid(self, train_inputs, train_states, train_outputs, data_dir: Optional[str] = None) -> bool:
+    def _feasibility_sdp(self, s: float) -> Optional[dict]:
+        """**Feasibility** — fixed-``s`` certificate feasibility SDP. Pure — does
+        NOT mutate the model.
+
+        Given the (fixed) prediction parameters, ``alpha`` and a fixed ``s``,
+        find certificate variables P ≻ 0, M = diag(m) ⪰ 0, L satisfying the
+        stability LMI ``F ⪯ -εI`` and the locality LMIs
+        ``[1/s², l_i; l_i^T, P] ⪰ εI`` (with ``1/s²`` a *constant*, so this is a
+        convex feasibility SDP — ``s`` is not optimized). A small size objective
+        ``min t`` with ``‖P‖ ≤ t, ‖M‖ ≤ t`` keeps the solution well conditioned.
+
+        Returns ``{P, L, M}`` (numpy) or ``None`` if infeasible / the solver
+        fails. This is the within-epoch repair: ``s`` stays where gradient +
+        the input/output penalties put it; only P, M, L are repaired.
         """
-        Initialize from N4SID system identification results.
+        A = self.A.cpu().detach().numpy()
+        B = self.B.cpu().detach().numpy()
+        B2 = self.B2.cpu().detach().numpy()
+        C2 = self.C2.cpu().detach().numpy()
+        D21 = self.D21.cpu().detach().numpy()
+        alpha = 1 / (1 + np.exp(-self.tau.cpu().detach().numpy()))
+        s_hat = 1.0 / float(s) ** 2
 
-        Loads A, B, C, D from n4sid_params.mat. If N4SID state dimension < nx,
-        pads matrices (A top-left block, B top rows, C left columns).
-        Runs SDP to find feasible P and L.
+        P = cp.Variable((self.nx, self.nx), symmetric=True)
+        L = cp.Variable((self.nz, self.nx))
+        m = cp.Variable((self.nz, 1))
+        M = cp.diag(m)
 
-        Note: Respects structural constraints - fixed parameters are not modified.
-
-        Args:
-            train_inputs: Training inputs (B, N, nd)
-            train_states: Training states (B, N, nx_data)
-            train_outputs: Training outputs (B, N, ne)
-            data_dir: Directory containing n4sid_params.mat
-
-        Returns:
-            True if successful, False otherwise
-        """
-        if data_dir is None:
-            return False
-
-        from scipy.io import loadmat
-
-        mat_path = Path(os.path.expanduser(data_dir)) / "n4sid_params.mat"
-        if not mat_path.exists():
-            logger.info(f"N4SID file not found at {mat_path}")
-            return False
-
-        logger.info(f"Loading N4SID parameters from {mat_path}")
-
-        try:
-            mat = loadmat(str(mat_path), squeeze_me=True, struct_as_record=False)
-
-            # Support both direct keys and nested struct
-            def _extract(key):
-                if key in mat:
-                    return np.atleast_2d(np.array(mat[key], dtype=np.float64))
-                for v in mat.values():
-                    if hasattr(v, key):
-                        return np.atleast_2d(np.array(getattr(v, key), dtype=np.float64))
-                raise KeyError(f"Key '{key}' not found in {mat_path}")
-
-            A_n4 = _extract("A")
-            B_n4 = _extract("B")
-            C_n4 = _extract("C")
-            D_n4 = _extract("D")
-
-            def _maybe_transpose_to_match(mat: np.ndarray, target_shape: tuple, name: str) -> np.ndarray:
-                if mat.shape == target_shape:
-                    return mat
-                if mat.T.shape == target_shape:
-                    logger.info(f"Transposing N4SID {name} from {mat.shape} to {mat.T.shape}")
-                    return mat.T
-                return mat
-
-            B_n4 = _maybe_transpose_to_match(B_n4, (A_n4.shape[0], self.nd), "B")
-            C_n4 = _maybe_transpose_to_match(C_n4, (self.ne, A_n4.shape[0]), "C")
-            D_n4 = _maybe_transpose_to_match(D_n4, (self.ne, self.nd), "D")
-
-            # Validate
-            if A_n4.shape[0] != A_n4.shape[1]:
-                raise ValueError(f"N4SID A must be square, got {A_n4.shape}")
-            if A_n4.shape[0] > self.nx:
-                raise ValueError(
-                    f"N4SID state dim ({A_n4.shape[0]}) > model nx ({self.nx})"
-                )
-            if B_n4.shape[1] != self.nd or C_n4.shape[0] != self.ne:
-                raise ValueError("N4SID input/output dimensions mismatch")
-            if D_n4.shape != (self.ne, self.nd):
-                raise ValueError(f"N4SID D has wrong shape: {D_n4.shape}")
-
-            # Pad if needed
-            n4_nx = A_n4.shape[0]
-            A_init = np.zeros((self.nx, self.nx), dtype=np.float64)
-            A_init[:n4_nx, :n4_nx] = A_n4
-
-            B_init = np.zeros((self.nx, self.nd), dtype=np.float64)
-            B_init[:B_n4.shape[0], :] = B_n4
-
-            C_init = np.zeros((self.ne, self.nx), dtype=np.float64)
-            C_init[:, :C_n4.shape[1]] = C_n4
-
-            if n4_nx < self.nx:
-                logger.info(
-                    f"Padding N4SID state dim {n4_nx} → {self.nx} "
-                    "(A top-left, B top rows, C left cols)"
-                )
-
-            # Set parameters (skip fixed parameters)
-            if not self._should_skip_initialization('A'):
-                self.A.data = torch.tensor(A_init)
-            if not self._should_skip_initialization('B'):
-                self.B.data = torch.tensor(B_init)
-            if not self._should_skip_initialization('C'):
-                self.C.data = torch.tensor(C_init)
-            if not self._should_skip_initialization('B2'):
-                self.B2.data = torch.zeros_like(self.B2)
-            if not self._should_skip_initialization('C2'):
-                self.C2.data = torch.tensor(np.random.randn(self.nz, self.nx))
-            if not self._should_skip_initialization('D21'):
-                self.D21.data = torch.tensor(np.random.randn(self.nz, self.nd) * 0.01)
-
-            logger.info(f"N4SID loaded: ||A||={np.linalg.norm(A_init):.4f}, "
-                       f"||B||={np.linalg.norm(B_init):.4f}, "
-                       f"||C||={np.linalg.norm(C_init):.4f}")
-
-            # Run SDP for feasibility
-            self.analysis_problem_init(learn_B=False, learn_D21=True)
-
-            # Refit C, D, D12 with new B, D21
-            self._refit_output_matrices(train_inputs, train_states, train_outputs)
-            return True
-
-        except Exception as e:
-            logger.warning(f"N4SID initialization failed: {e}")
-            return False
-
-    def _init_esn(
-        self,
-        train_inputs,
-        train_states,
-        train_outputs,
-        n_restarts: int = 5,
-    ):
-        """
-        Echo State Network initialization: Random reservoirs + Least Squares.
-
-        For each restart:
-        1. Sample random A (spectral radius ≈ α), B, C2, D21
-        2. Simulate to get x, w states
-        3. Fit C, D, D12 via least squares (masking NaN-padded rows)
-        4. Keep the best (lowest training MSE on valid entries)
-
-        Then run SDP once on the best reservoir to find feasible B, D21, P, L.
-        Finally, refit C, D, D12 with the SDP-updated B, D21.
-
-        Note: Respects structural constraints - fixed parameters are not modified.
-
-        Args:
-            train_inputs: (B, N, nd)
-            train_states: (B, N, nx_data) or None
-            train_outputs: (B, N, ne)
-            n_restarts: Number of random reservoirs to try
-        """
-        logger.info(f"ESN initialization with {n_restarts} random restarts")
-
-        Bs, N, _ = train_inputs.shape
-        alpha_val = 0.9
-        delta_val = float(self.delta.item())
-
-        # Prepare data
-        x0s = torch.zeros(Bs, self.nx, 1)
-        if train_states is not None:
-            x0s_data = torch.tensor(train_states[:, 0, :].reshape(Bs, self.nx_data, 1))
-            x0s[:, :self.nx_data, :] = x0s_data
-        else:
-            x0s = torch.randn(Bs, self.nx, 1) * self.max_norm_x0
-
-        ds = torch.tensor(train_inputs.reshape(Bs, N, self.nd, 1))
-        y_target = torch.tensor(train_outputs.reshape(Bs * N, self.ne))
-        valid_target_rows = torch.isfinite(y_target).all(dim=1)
-
-        best_mse = float("inf")
-        best_reservoir = None
-
-        for trial in range(n_restarts):
-            # Random A: spectral radius = alpha_val
-            A_rand = np.random.randn(self.nx, self.nx)
-            rho = np.max(np.abs(np.linalg.eigvals(A_rand)))
-            A_rand = (alpha_val / max(rho, 1e-8)) * A_rand
-
-            # B2 = 0: keep linear (nonlinearity optimized during training)
-            B2_rand = np.zeros((self.nx, self.nw))
-
-            # Random B: scaled by input amplitude
-            B_rand = np.random.randn(self.nx, self.nd) * (delta_val / max(np.sqrt(self.nx), 1.0))
-
-            # Random C2: scaled to keep pre-activation ~ O(1)
-            C2_rand = np.random.randn(self.nz, self.nx) / np.sqrt(self.nx)
-
-            # Small D21
-            D21_rand = np.random.randn(self.nz, self.nd) * 0.01
-
-            # Set temporarily (skip fixed parameters)
-            if not self._is_parameter_fixed('A'):
-                self.A.data = torch.tensor(A_rand)
-            if not self._is_parameter_fixed('B'):
-                self.B.data = torch.tensor(B_rand)
-            if not self._is_parameter_fixed('B2'):
-                self.B2.data = torch.tensor(B2_rand)
-            if not self._is_parameter_fixed('C2'):
-                self.C2.data = torch.tensor(C2_rand)
-            if not self._is_parameter_fixed('D21'):
-                self.D21.data = torch.tensor(D21_rand)
-
-            # Simulate
-            with torch.no_grad():
-                _, (xs, ws) = self.lure.forward(x0=x0s, d=ds, return_states=True)
-
-            # Least squares: fit C, D, D12 on valid rows only
-            x_flat = xs[:, :N, :, :].squeeze(-1).reshape(Bs * N, self.nx)
-            w_flat = ws.squeeze(-1).reshape(Bs * N, self.nw)
-            u_flat = ds.squeeze(-1).reshape(Bs * N, self.nd)
-            regr = torch.cat([x_flat, u_flat, w_flat], dim=1)
-            valid_rows = valid_target_rows & torch.isfinite(regr).all(dim=1)
-
-            if int(valid_rows.sum()) <= regr.shape[1]:
-                logger.info(f"  Trial {trial + 1}/{n_restarts}: skipped (not enough valid rows)")
-                continue
-
-            regr_valid = regr[valid_rows]
-            y_valid = y_target[valid_rows]
-            sol = torch.linalg.lstsq(regr_valid, y_valid).solution
-            y_hat = regr_valid @ sol
-            mse = float(torch.mean((y_hat - y_valid) ** 2))
-
-            logger.info(f"  Trial {trial + 1}/{n_restarts}: MSE = {mse:.6e}")
-
-            if mse < best_mse:
-                best_mse = mse
-                best_reservoir = dict(
-                    A=A_rand.copy(),
-                    B=B_rand.copy(),
-                    B2=B2_rand.copy(),
-                    C2=C2_rand.copy(),
-                    D21=D21_rand.copy(),
-                )
-
-        if best_reservoir is None:
-            raise ValueError(
-                "ESN initialization failed: no trial had enough finite rows for least squares"
+        F = cp.bmat(
+            [
+                [-(alpha**2) * P, np.zeros((self.nx, self.nd)), P @ C2.T + L.T, P @ A.T],
+                [np.zeros((self.nd, self.nx)), -np.eye(self.nd), D21.T, B.T],
+                [C2 @ P + L, D21, -2 * M, M @ B2.T],
+                [A @ P, B, B2 @ M, -P],
+            ]
+        )
+        nF = F.shape[0]
+        constraints = [F << -EPS * np.eye(nF), m >= 0]
+        for i in range(self.nz):
+            li = L[i, :].reshape((1, -1), order="C")
+            constraints.append(
+                cp.bmat([[np.array([[s_hat]]), li], [li.T, P]]) >> EPS * np.eye(self.nx + 1)
             )
 
-        logger.info(f"Best reservoir MSE: {best_mse:.6e}")
+        # Well-conditioning objective (keep P, M bounded).
+        t = cp.Variable((1, 1))
+        constraints += [cp.norm(P) <= t, cp.norm(M) <= t]
 
-        # Set best reservoir (skip fixed parameters)
-        if not self._is_parameter_fixed('A'):
-            self.A.data = torch.tensor(best_reservoir["A"])
-        if not self._is_parameter_fixed('B'):
-            self.B.data = torch.tensor(best_reservoir["B"])
-        if not self._is_parameter_fixed('B2'):
-            self.B2.data = torch.tensor(best_reservoir["B2"])
-        if not self._is_parameter_fixed('C2'):
-            self.C2.data = torch.tensor(best_reservoir["C2"])
-        if not self._is_parameter_fixed('D21'):
-            self.D21.data = torch.tensor(best_reservoir["D21"])
+        problem = cp.Problem(cp.Minimize(t), constraints)
+        try:
+            problem.solve(solver=cp.MOSEK, verbose=False)
+        except Exception as e:
+            logger.debug(f"feasibility SDP failed at s={s:.4f}: {e}")
+            return None
+        if problem.status not in ("optimal", "optimal_inaccurate"):
+            return None
+        return {"P": P.value, "L": L.value, "M": M.value, "s": float(s)}
 
-        # Run SDP for feasibility
-        logger.info("Running SDP for feasibility...")
-        self.analysis_problem_init(learn_B=True, learn_D21=True)
+    def feasibility_problem(self) -> bool:
+        """Repair the certificate at the **current** (fixed) ``s`` — the
+        within-epoch step 3.1.
 
-        # Refit C, D, D12
-        self._refit_output_matrices(train_inputs, train_states, train_outputs)
-
-    def _refit_output_matrices(self, train_inputs, train_states, train_outputs):
+        When a gradient update breaks the LMIs, solve :meth:`_feasibility_sdp`
+        at ``self.s`` (unchanged) for feasible P, M, L and write them back.
+        Returns ``True`` on success; ``False`` when no feasible P, M, L exists
+        at that ``s`` (→ the trainer rolls the step back). ``s`` is owned by
+        gradient + the input/output penalties and is never modified here.
         """
-        Re-simulate with current A, B, B2, C2, D21 and fit output matrices C, D, D12.
-
-        This is called after SDP initialization to refine output matrices with
-        the updated system matrices.
-
-        Note: Respects structural constraints - fixed output matrices are not modified.
-        """
-        Bs, N, _ = train_inputs.shape
-
-        # Prepare data
-        x0s = torch.zeros(Bs, self.nx, 1)
-        if train_states is not None:
-            x0s_data = torch.tensor(train_states[:, 0, :].reshape(Bs, self.nx_data, 1))
-            x0s[:, :self.nx_data, :] = x0s_data
-        else:
-            x0s = torch.randn(Bs, self.nx, 1) * self.max_norm_x0
-
-        ds = torch.tensor(train_inputs.reshape(Bs, N, self.nd, 1))
-        y_flat = torch.tensor(train_outputs.reshape(Bs * N, self.ne))
-
-        # Simulate
-        with torch.no_grad():
-            _, (xs, ws) = self.lure.forward(x0=x0s, d=ds, return_states=True)
-
-            x_flat = xs[:, :N, :, :].squeeze(-1).reshape(Bs * N, self.nx)
-            w_flat = ws.squeeze(-1).reshape(Bs * N, self.nw)
-            u_flat = ds.squeeze(-1).reshape(Bs * N, self.nd)
-            regression_matrix = torch.cat([x_flat, u_flat, w_flat], dim=1)
-            valid_rows = torch.isfinite(y_flat).all(dim=1) & torch.isfinite(
-                regression_matrix
-            ).all(dim=1)
-
-            if int(valid_rows.sum()) <= regression_matrix.shape[1]:
-                raise ValueError(
-                    "Refit failed: not enough valid rows for least squares"
-                )
-
-            regression_valid = regression_matrix[valid_rows]
-            y_valid = y_flat[valid_rows]
-            solution = torch.linalg.lstsq(regression_valid, y_valid).solution
-
-            # Only update learnable output matrices
-            if not self._should_skip_initialization('C'):
-                self.C.data = solution[: self.nx, :].T
-            if not self._should_skip_initialization('D'):
-                self.D.data = solution[self.nx : self.nx + self.nd, :].T
-            if not self._should_skip_initialization('D12'):
-                self.D12.data = solution[self.nx + self.nd :, :].T
-
-            final_mse = float(torch.mean((regression_valid @ solution - y_valid) ** 2))
-            logger.info(f"Output matrix refit MSE: {final_mse:.6e}")
-            logger.info(f"  ||C||={torch.norm(self.C).item():.6f}")
-            logger.info(f"  ||D||={torch.norm(self.D).item():.6f}")
-            logger.info(f"  ||D12||={torch.norm(self.D12).item():.6f}")
-
-
-    def analysis_problem(self) -> bool:
-        """Repair the certificate by PROJECTING ``s`` onto the feasible set
-        (within-epoch fallback).
-
-        When a gradient step produces an infeasible certificate, solve the shared
-        max-s SDP (:meth:`_max_s_sdp`) with ``s_upper`` set to the current ``s``,
-        optimizing P, L, M (=Λ ⪰ 0) and ``s``. The result is
-        ``s = min(s_current, s_max(theta))``: keep the current ``s`` when it is
-        feasible, and clamp it down to the max feasible ``s`` when it has
-        overshot. The new P, L, Λ, s are written back and True is returned.
-
-        Projecting (rather than a *fixed-s* feasibility solve) avoids the common
-        rollback where ``s`` has drifted above the dynamics' max feasible ``s`` —
-        in that case the fixed-s problem is infeasible and training stalls,
-        whereas the projection simply clamps ``s`` down and continues. It returns
-        False (→ the trainer rolls the step back) only when the dynamics are
-        uncertifiable at *any* ``s`` (genuine infeasibility).
-
-        The complementary *after-epoch* step, which enlarges ``s`` when the
-        training data is not covered, is :meth:`solve_max_s` (unbounded max-s).
-        """
-        s_current = float(self.s.cpu().detach().numpy())
-        sol = self._max_s_sdp(s_upper=s_current)
+        s = float(self.s.cpu().detach().numpy())
+        sol = self._feasibility_sdp(s)
         if sol is None:
             return False
-        self._apply_certificate_solution(sol)
+        # Write back P, L, Λ only — s stays fixed.
+        device, dtype = self.P.device, self.P.dtype
+        self.P.data = torch.tensor(sol["P"], device=device, dtype=dtype)
+        self.L.data = torch.tensor(sol["L"], device=device, dtype=dtype)
+        self.la.data = torch.tensor(np.diag(sol["M"]), device=device, dtype=dtype)
         return True
 
     def analysis_problem_init(self, learn_B: bool= False, learn_D21: bool = False) -> bool:
@@ -1118,7 +875,7 @@ class SimpleLure(nn.Module):
         else:
             L = self.L.cpu().detach().numpy()
 
-        for li in L:
+        for li in L:  # type: ignore[attr-defined]  # cvxpy Variable is iterable at runtime
             if self.learn_L:
                 li = li.reshape((1, -1), "C")
                 multiplier_constraints.append(
@@ -1456,7 +1213,7 @@ class SimpleLure(nn.Module):
 
         logger.info(f"Current alpha = {alpha:.6f}, s = {s_original:.6f}")
 
-        # Max-s SDP (shared with training via solve_max_s): fix the prediction
+        # Max-s SDP (MaxS, _max_s_sdp): fix the prediction
         # parameters, optimize P, L, M (=Λ) and s, then write the solution back.
         sol = self._max_s_sdp()
         if sol is None:
@@ -1513,6 +1270,7 @@ class SimpleLure(nn.Module):
         else:
             # Y = np.linalg.inv(Y_tilde.value)
             Y_star = Y.value
+            assert Y_star is not None
             if self.ne == 1:
                 y_bar_n = np.sqrt(1/Y_star[0,0])
             else:
@@ -1573,29 +1331,18 @@ class SimpleLure(nn.Module):
             "summary": summary,
         }
 
-    def _max_s_sdp(self, s_upper: Optional[float] = None) -> Optional[dict]:
-        """Solve the max-feasible-``s`` SDP for the current (fixed) prediction
-        parameters. Pure — does NOT mutate the model.
+    def _max_s_sdp(self) -> Optional[dict]:
+        """**MaxS** — the max-feasible-``s`` SDP for the current (fixed)
+        prediction parameters. Pure — does NOT mutate the model.
 
         Fixes everything that influences the predictions (A, B, B2, C2, D21 and
         alpha) and optimizes the certificate variables P, L, M (=Λ) and
         ``S_hat = 1/s^2``. Objective: ``minimize S_hat`` (i.e. maximize ``s``)
         subject to the stability LMI ``F ⪯ -εI`` and the locality LMIs
         ``[S_hat, l_i; l_i^T, P] ⪰ εI``. ``s`` **is** an optimization variable.
-        This single SDP backs both training entry points:
 
-        * ``s_upper=None`` → pure max-s. Used by :meth:`post_process` /
-          :meth:`solve_max_s` and, after each epoch, when the training data is
-          not covered by the current ``s``.
-        * ``s_upper`` given → add ``S_hat >= 1/s_upper^2`` (i.e. ``s <=
-          s_upper``). With the minimize-``S_hat`` objective the solver returns
-          ``S_hat = max(1/s_upper^2, S_hat_min(theta))`` — i.e. ``s = min(
-          s_upper, s_max(theta))``, the projection of ``s_upper`` onto the
-          feasible interval ``(0, s_max]``. This is the within-epoch fallback
-          (:meth:`analysis_problem`): it keeps a feasible ``s`` where it is and
-          clamps an overshooting ``s`` down to ``s_max`` instead of failing, so
-          it only returns ``None`` when the dynamics are uncertifiable at *any*
-          ``s`` (genuine infeasibility).
+        Used to bracket the sweep in :meth:`solve_output_coverage_certificate`
+        (its ``s_max``) and as the ``post_process`` diagnostic.
 
         Returns a dict with the numpy solution (``P``, ``L``, ``M``, ``s``,
         ``max_eig_F``, ``locality_min_eigs``) or ``None`` if the solver fails.
@@ -1639,11 +1386,6 @@ class SimpleLure(nn.Module):
             Gs.append(locality_lmi)
             constraints.append(locality_lmi >> EPS * np.eye(self.nx + 1))
 
-        # Projection: cap s at s_upper (S_hat >= 1/s_upper^2). With the
-        # minimize-S_hat objective this yields s = min(s_upper, s_max(theta)).
-        if s_upper is not None and s_upper > 0:
-            constraints.append(S_hat >= 1.0 / float(s_upper) ** 2 + 1.0e-7)
-
         problem = cp.Problem(cp.Minimize(S_hat), constraints)
         try:
             problem.solve(solver=cp.MOSEK, verbose=False)
@@ -1654,6 +1396,7 @@ class SimpleLure(nn.Module):
             logger.error(f"max-s SDP failed with status: {problem.status}")
             return None
 
+        assert S_hat.value is not None
         S_hat_opt = S_hat.value[0, 0] if hasattr(S_hat.value, "__len__") else float(S_hat.value)
         if S_hat_opt <= 0:
             logger.error(f"max-s SDP returned non-positive S_hat ({S_hat_opt})")
@@ -1662,7 +1405,7 @@ class SimpleLure(nn.Module):
 
         min_eig_diff = float(np.min(np.real(np.linalg.eigvals(P_current - P.value))))
         logger.debug(
-            f"max-s SDP solved: s = {s_star:.6f} (s_upper = {s_upper}), "
+            f"max-s SDP solved: s = {s_star:.6f}, "
             f"min eig(P_current - P_opt) = {min_eig_diff:.6e}"
         )
 
@@ -1685,82 +1428,297 @@ class SimpleLure(nn.Module):
         self.la.data = torch.tensor(np.diag(sol["M"]), device=device, dtype=dtype)
         self.s.data = torch.tensor(sol["s"], device=device, dtype=dtype)
 
-    def solve_max_s(self) -> Optional[float]:
-        """Find the largest feasible input bound ``s`` for the current model.
+    def _coverage_sdp(self, s: float, y_max: float) -> Optional[dict]:
+        """Fixed-``s`` convex SDP for the binding-Corollary-1 certificate.
 
-        Solves the same SDP as :meth:`post_process` (via the shared
-        :meth:`_max_s_sdp`): fix the prediction parameters, optimize the
-        certificate P, L, Λ and ``s``. Updates the model in place and returns the
-        new ``s``; returns ``None`` if the SDP fails.
+        ``y_max`` is the **physical** safe output level and stays physical. The
+        model's C/P/s live in normalized output units, so the certified image is
+        scaled up to physical by ``σ = output_std``; the coverage floor is then a
+        statement about the physical certified half-width
+        ``ȳ = σ·s·√(CPCᵀ) ≥ y_max``. With ``s`` fixed the only nonconvex term
+        (``P/s²``) becomes a constant scaling, so this is a genuine convex SDP:
+
+            min tr((σ·s)²·C P Cᵀ)
+            s.t.  (5a) F ⪯ -εI,  P ≻ 0,  M = diag(m) ⪰ 0
+                  (5b) [1/s², lⁱ; (lⁱ)ᵀ, P] ⪰ εI     (locality, 1/s² constant)
+                  (cov) (σ·s)²·C P Cᵀ ⪰ y_max²·I     (coverage-on-image, physical)
+
+        Returns the numpy solution (``P``, ``L``, ``M``, ``s``, ``y_bar`` — the
+        PHYSICAL certified half-width ``σ·s·√(CPCᵀ)``) or ``None`` if infeasible
+        / the solver fails.
         """
-        sol = self._max_s_sdp()
-        if sol is None:
+        A = self.A.cpu().detach().numpy()
+        B = self.B.cpu().detach().numpy()
+        B2 = self.B2.cpu().detach().numpy()
+        C = self.C.cpu().detach().numpy()
+        C2 = self.C2.cpu().detach().numpy()
+        D21 = self.D21.cpu().detach().numpy()
+        alpha = 1 / (1 + np.exp(-self.tau.cpu().detach().numpy()))
+        s2 = float(s) ** 2
+
+        P = cp.Variable((self.nx, self.nx), symmetric=True)
+        L = cp.Variable((self.nz, self.nx))
+        m = cp.Variable((self.nz, 1))
+        M = cp.diag(m)
+
+        F = cp.bmat(
+            [
+                [-(alpha**2) * P, np.zeros((self.nx, self.nd)), P @ C2.T + L.T, P @ A.T],
+                [np.zeros((self.nd, self.nx)), -np.eye(self.nd), D21.T, B.T],
+                [C2 @ P + L, D21, -2 * M, M @ B2.T],
+                [A @ P, B, B2 @ M, -P],
+            ]
+        )
+        nF = F.shape[0]
+        constraints = [F << -EPS * np.eye(nF)]
+
+        for i in range(self.nz):
+            li = L[i, :].reshape((1, -1), order="C")
+            constraints.append(
+                cp.bmat([[np.array([[1.0 / s2]]), li], [li.T, P]])
+                >> EPS * np.eye(self.nx + 1)
+            )
+
+        # Coverage-on-image (bind Corollary 1) in PHYSICAL units: the physical
+        # certified image (σ·s)²·CPCᵀ must reach y_max² (σ = output_std). y_max
+        # stays physical; σ scales the normalized model image up to physical.
+        # Uses ne (output dim) — the dimension of C P Cᵀ.
+        sigma = float(self.output_std)
+        constraints.append(
+            (sigma ** 2) * s2 * C @ P @ C.T - float(y_max) ** 2 * np.eye(self.ne)
+            >> EPS * np.eye(self.ne)
+        )
+
+        problem = cp.Problem(cp.Minimize(cp.trace((sigma ** 2) * s2 * C @ P @ C.T)), constraints)
+        try:
+            problem.solve(solver=cp.MOSEK, verbose=False)
+        except Exception as e:
+            logger.debug(f"coverage SDP failed at s={s:.4f}: {e}")
             return None
-        s_original = float(self.s.cpu().detach().numpy())
-        self._apply_certificate_solution(sol)
-        # debug level: post_process and _maybe_maximize_s emit their own info logs.
-        logger.debug(f"solve_max_s: s {s_original:.6f} → {sol['s']:.6f}")
-        return sol["s"]
+        if problem.status not in ("optimal", "optimal_inaccurate"):
+            return None
 
-    def maximize_s_on_violation(
-        self, u: torch.Tensor, x: torch.Tensor
-    ) -> Optional[float]:
-        """Re-solve for the max feasible ``s`` only when the input constraint is
-        currently violated.
+        P_val = P.value
+        CPCt = C @ P_val @ C.T
+        # Physical certified half-width: y_bar = output_std * s * sqrt(CPCᵀ).
+        y_bar = float(sigma * s * np.sqrt(CPCt.item())) if self.ne == 1 else None
+        return {
+            "P": P_val,
+            "L": L.value,
+            "M": M.value,
+            "s": float(s),
+            "y_bar": y_bar,
+        }
 
-        Computes the per-step margin ``c_k = ||u_k||^2 - s^2 + alpha^2 V(x_k)``
-        for the current model; if any ``c_k > 0`` (the data breaches the current
-        ``s``) it calls :meth:`solve_max_s` to enlarge ``s`` (and update P, L,
-        Λ). Returns the new ``s`` on success, or ``None`` when the constraint
-        already holds (no SDP solved) or the SDP fails.
-        """
+    def _count_input_violations(
+        self, inputs: torch.Tensor, x0: Optional[torch.Tensor], warmup_steps: int
+    ) -> int:
+        """Number of trajectories whose *unfiltered* rollout breaches the input
+        constraint (any ``c_k > 0``) under the current certificate.
+
+        The certificate is a claim about the raw model on admissible inputs, so
+        the check is on the unfiltered dynamics even for ``SimpleLureSafe`` (its
+        filter would otherwise hide every violation by construction)."""
         with torch.no_grad():
-            _, c = self.get_regularization_input(u, x, return_c=True)
-            c_max = torch.nan_to_num(c, nan=float("-inf")).max()
-        if float(c_max) <= 0:
-            return None
-        return self.solve_max_s()
-
-    def get_regularization_loss(self, method: Optional[str] = None, return_components: bool = False):
-        """
-        Compute custom regularization loss on model parameters.
-
-        Args:
-            method: Regularization method ('interior_point' or 'dual').
-                   If None, uses self.regularization_method.
-            return_components: If True, returns a dict with loss breakdown.
-                             If False, returns total loss tensor.
-
-        Returns:
-            If return_components=False: Regularization loss tensor
-            If return_components=True: Dict with keys:
-                - 'total': Total regularization loss
-                - 'feasibility': Feasibility regularization (barrier or dual)
-                - 'parametric': Parametric regularization (L nonzero, etc.)
-        """
-        if method is None:
-            method = self.regularization_method
-
-        if method == "interior_point":
-            return self._interior_point_regularization()
-        elif method == "dual":
-            if return_components:
-                return self._dual_regularization(return_components=True)
+            if hasattr(self, "forward_unfiltered"):
+                _, (x, _), u_applied = self.forward_unfiltered(inputs, x0)
             else:
-                return self._dual_regularization()
-        else:
-            raise ValueError(f"Unknown regularization method: {method}")
+                _, (x, _), u_applied = self.forward(inputs, x0, warmup_steps=warmup_steps)
+            _, c = self.get_regularization_input(
+                u_applied, x, return_c=True, warmup_steps=warmup_steps
+            )
+            viol = (torch.nan_to_num(c, nan=float("-inf")) > 0).any(dim=1)
+        return int(viol.sum())
 
-        # add parameter regularization
+    def solve_output_coverage_certificate(
+        self,
+        y_max: Optional[float] = None,
+        inputs: Optional[torch.Tensor] = None,
+        x0: Optional[torch.Tensor] = None,
+        warmup_steps: int = 0,
+        n_grid: int = 10,
+        s_min: float = 0.1,
+        s_max: float = 20.0,
+    ) -> dict:
+        """**MinTrProb** — the binding-Corollary-1 certificate (see the wiki
+        ``binding-output-certificate``).
 
-    def _interior_point_regularization(self):
+        Produces the tightest certified output interval ``[-ȳ, ȳ]`` with the
+        PHYSICAL ``ȳ = y_max`` that (a) satisfies the Lyapunov + regionality
+        LMIs and (b) — when ``inputs`` are supplied — leaves **zero input
+        violations** on that data. The scale ``s`` is the lone nonconvex degree
+        of freedom, so we solve a convex SDP (:meth:`_coverage_sdp`) at each
+        point of a fixed grid ``s ∈ [s_min, s_max]`` (default ``[0.1, 20]``; a
+        deliberately simple preset — no MaxS bracket / bisection for now) and
+        keep the feasible ones. Among the ``s`` with zero input violations we
+        pick the tightest ``ȳ`` (the SDP objective already drives ``ȳ`` to
+        ``y_max``); if none clears the violations, we take the fewest-violations
+        ``s``. If no grid ``s`` is feasible at all, this θ cannot certify
+        ``y_max`` — reported, not hidden.
+
+        ``y_max`` is physical; ``None`` uses the model's stored physical
+        ``y_max``. The selected certificate is written back into the model.
+        Returns a summary dict with ``success``, ``reason``, ``s``, ``y_bar``
+        (physical), ``y_max`` (physical), ``s_min``, ``s_max``,
+        ``n_input_violations`` and the full ``sweep``.
         """
-        Interior point method: uses log-det barrier function.
-        Requires strictly feasible parameters (all eigenvalues > 0).
-        Gradients explode when constraints are violated.
+        if y_max is None:
+            if self.y_max is None or bool(torch.isnan(self.y_max)):
+                return {"success": False, "reason": "y_max_unset"}
+            y_max = float(self.y_max)
+        y_max = float(y_max)
+
+        # Save the current certificate so a failed search leaves the model as-is.
+        saved = {
+            "P": self.P.detach().clone(),
+            "L": self.L.detach().clone(),
+            "la": self.la.detach().clone(),
+            "s": self.s.detach().clone(),
+        }
+
+        def _restore():
+            with torch.no_grad():
+                self.P.data.copy_(saved["P"])
+                self.L.data.copy_(saved["L"])
+                self.la.data.copy_(saved["la"])
+                self.s.data.copy_(saved["s"])
+
+        # Fixed-grid sweep over the preset band [s_min, s_max]. Infeasible s
+        # (too small for coverage, or too large for regionality) are skipped.
+        s_grid = np.linspace(float(s_min), float(s_max), int(n_grid))
+        sweep = []
+        for s in s_grid:
+            sol = self._coverage_sdp(float(s), y_max)
+            if sol is None:
+                continue
+            n_viol = None
+            if inputs is not None:
+                self._apply_certificate_solution(sol)
+                n_viol = self._count_input_violations(inputs, x0, warmup_steps)
+            sweep.append({"s": sol["s"], "y_bar": sol["y_bar"], "n_violations": n_viol, "sol": sol})
+
+        if not sweep:
+            _restore()
+            return {
+                "success": False,
+                "reason": "coverage_unreachable",
+                "s_min": float(s_min),
+                "s_max": float(s_max),
+                "y_max": y_max,
+            }
+
+        # Selection. Prefer zero-violation candidates; among the eligible ones
+        # pick the tightest ȳ (then smallest s). ȳ is None for ne>1 (no scalar
+        # tightness) -> fall back to smallest s.
+        def _tightness_key(cand):
+            yb = cand["y_bar"]
+            return (yb if yb is not None else float("inf"), cand["s"])
+
+        if inputs is not None:
+            eligible = [c for c in sweep if c["n_violations"] == 0]
+            violation_free = bool(eligible)
+            if eligible:
+                best = min(eligible, key=_tightness_key)
+            else:
+                # No s clears the violations: take the fewest-violations s
+                # (then tightest).
+                best = min(sweep, key=lambda c: (c["n_violations"], _tightness_key(c)))
+        else:
+            violation_free = None
+            best = min(sweep, key=_tightness_key)
+
+        self._apply_certificate_solution(best["sol"])
+        constraints_ok = self.check_constraints()
+
+        return {
+            "success": True,
+            "reason": "ok" if (violation_free is not False) else "violations_remain",
+            "s": best["s"],
+            "y_bar": best["y_bar"],
+            "y_max": y_max,
+            "s_min": float(s_min),
+            "s_max": float(s_max),
+            "n_input_violations": best["n_violations"],
+            "violation_free": violation_free,
+            "constraints_satisfied": constraints_ok,
+            "sweep": [
+                {"s": c["s"], "y_bar": c["y_bar"], "n_violations": c["n_violations"]}
+                for c in sweep
+            ],
+        }
+
+    def initialize_s_from_conditions(
+        self,
+        train_inputs_n,
+        y_max: float,
+        warmup_steps: int = 0,
+        n_grid: int = 15,
+        s_min: float = 0.1,
+        s_max: float = 20.0,
+    ) -> dict:
+        """Initialize ``s`` (and ``P``, ``L``) from the output + input conditions.
+
+        Replaces the cumbersome max-s / heuristic ``s`` initialization with the
+        *same sweep used for the final certificate* (MinTrProb,
+        :meth:`solve_output_coverage_certificate`): over the preset ``s`` band it
+        prefers an ``s`` that satisfies the (physical) output-coverage floor
+        **and** leaves zero input violations on the training data, else the
+        ``s`` with the fewest input violations.
+
+        When the output level is not yet reachable for this freshly-initialized
+        ``theta`` (``coverage_unreachable``), it falls back to plain max-s (the
+        fewest-violations feasible certificate); the output-coverage penalty
+        then grows the image toward ``y_max`` during training.
+
+        ``y_max`` is the PHYSICAL safe output level; ``self.output_std`` must
+        already be set (see :meth:`set_output_coverage_level`).
+        ``train_inputs_n`` are the *normalized* training inputs ``(B, N, nd)``.
+        Returns the certificate summary dict (``success=False`` when the max-s
+        fallback was used).
+        """
+        self.set_output_coverage_level(y_max)  # output_std left unchanged
+        inputs = torch.as_tensor(
+            np.asarray(train_inputs_n), dtype=self.P.dtype, device=self.P.device
+        )
+        res = self.solve_output_coverage_certificate(
+            y_max=y_max, inputs=inputs, warmup_steps=warmup_steps,
+            n_grid=n_grid, s_min=s_min, s_max=s_max,
+        )
+        if res["success"]:
+            logger.info(
+                f"Init s from conditions: s={res['s']:.6f} "
+                f"(band [{res['s_min']:.6f}, {res['s_max']:.6f}]), "
+                f"y_bar={res['y_bar']} (y_max={y_max}), "
+                f"input violations={res['n_input_violations']}, "
+                f"violation_free={res['violation_free']}"
+            )
+            return res
+
+        # Output level not reachable at init -> fall back to MaxS (fewest input
+        # violations among feasible certificates). Coverage is then handled by
+        # the output-coverage penalty during training.
+        logger.warning(
+            f"Init s from conditions: output level y_max={y_max:.6f} not "
+            f"reachable (reason={res['reason']}); falling back to max-s."
+        )
+        sol = self._max_s_sdp()
+        if sol is not None:
+            self._apply_certificate_solution(sol)
+        else:
+            logger.warning("Init s fallback (max-s) also failed; s left unchanged.")
+        return res
+
+    def get_regularization_loss(self) -> torch.Tensor:
+        """
+        Feasibility regularization via the log-det interior-point barrier.
+
+        For each LMI ``F ≻ 0`` adds ``-log det F`` and for each scalar
+        inequality ``s > 0`` adds ``-log s``. Requires strictly feasible
+        parameters (all eigenvalues > 0); the barrier grows to ``+∞`` as any
+        constraint approaches its boundary.
 
         Returns:
-            Regularization loss (sum of negative log-determinants)
+            Regularization loss (sum of negative log-determinants).
         """
         feasibility_loss = torch.tensor(0.0, device=self.P.device)
         for f_i in self.get_lmis():
@@ -1770,104 +1728,53 @@ class SimpleLure(nn.Module):
 
         return feasibility_loss
 
-    def _dual_regularization(self, return_components: bool = False):
+    def get_feasibility_margins(self) -> Dict[str, float]:
         """
-        Dual method: penalizes negative eigenvalues with adaptive penalty coefficient.
-        Allows infeasible parameters during training.
+        Per-constraint feasibility margins for monitoring interior-point drift.
 
-        For each LMI F that should be positive definite (F ≻ 0):
-        - Compute eigenvalues of F
-        - Penalize negative eigenvalues: sum(max(0, -λ)^2)
-        - Scale by dual penalty coefficient
+        For each LMI ``F ≻ 0`` reports the smallest eigenvalue ``min λ(F)`` —
+        the distance to the constraint boundary (``≤ 0`` means infeasible). For
+        each scalar inequality ``s > 0`` reports its value. Also returns the
+        aggregate ``min_eig`` (smallest margin across all constraints).
 
-        Args:
-            return_components: If True, returns dict with breakdown
+        Intended use: watch whether ``min_eig`` climbs steadily over training
+        (certificate parameters drifting deeper into the feasible interior,
+        pushed by the ``-log det`` barrier) while the input/output violation
+        terms worsen — the signature of the barrier tugging against the other
+        loss terms. A stationary ``min_eig`` means the barrier is not causing
+        drift and the negative barrier value can be left as is.
 
         Returns:
-            If return_components=False: Regularization loss (sum of negative eigenvalue penalties)
-            If return_components=True: Dict with 'total', 'feasibility', 'parametric'
+            Dict mapping ``lmi_<i>_min_eig`` / ``scalar_<j>`` to their margins,
+            plus aggregate ``min_eig`` (smallest margin across all constraints).
         """
-        feasibility_loss = torch.tensor(0.0, device=self.P.device)
-
-        for f_i in self.get_lmis():
-            F = f_i()
-            # Compute eigenvalues (real part, since F should be symmetric)
-            eigenvalues = torch.linalg.eigvalsh(F)  # More efficient for symmetric matrices
-
-            # Penalize negative eigenvalues: sum of squared violations
-            # max(0, -λ)^2 = (ReLU(-λ))^2
-            negative_eigs = torch.relu(-eigenvalues)
-            violation = torch.sum(negative_eigs**2)
-
-            feasibility_loss += self.dual_penalty * violation
-
-        # Add parametric regularization to encourage non-zero L
-        parametric_loss = self._parametric_regularization()
-        total_loss = feasibility_loss + parametric_loss
-
-        if return_components:
-            return {
-                'total': total_loss,
-                'feasibility': feasibility_loss,
-                'parametric': parametric_loss
-            }
-        else:
-            return total_loss
-
-    def _parametric_regularization(self) -> torch.Tensor:
-        """
-        Parametric regularization to encourage specific parameter properties.
-
-        Currently implements:
-        - Inverse Frobenius norm penalty on L to encourage non-zero values
-          (penalty increases as ||L|| → 0, encouraging larger magnitude)
-          Formula: weight / (||L||_F + eps)
-
-        Returns:
-            Parametric regularization loss
-        """
-        param_loss = torch.tensor(0.0, device=self.P.device)
-
-        if self.l_nonzero_weight > 0 and self.learn_L:
-            # Inverse norm penalty with numerical stability
-            param_loss += self.l_nonzero_weight / (torch.norm(self.L, p="fro") + 1e-6)
-
-        # minimize Frobenius norm of P to encourage smaller values (less conservative)
-        # param_loss += self.l_nonzero_weight * torch.norm(self.P, p="fro")
-
-        return param_loss
-
-    def update_dual_penalty(self, constraints_satisfied: bool):
-        """
-        Update the dual penalty coefficient based on constraint satisfaction.
-
-        Args:
-            constraints_satisfied: True if all constraints are satisfied, False otherwise
-        """
-        if constraints_satisfied:
-            # Reduce penalty when constraints are satisfied
-            self.dual_penalty *= self.dual_penalty_shrink
-        else:
-            # Increase penalty when constraints are violated
-            self.dual_penalty *= self.dual_penalty_growth
-
-    def get_constraint_violation(self) -> float:
-        """
-        Compute the total constraint violation (sum of negative eigenvalues).
-        Useful for monitoring during training.
-
-        Returns:
-            Total violation (0 if all constraints satisfied)
-        """
-        total_violation = 0.0
+        margins: Dict[str, float] = {}
+        overall_min = float("inf")
         with torch.no_grad():
-            for f_i in self.get_lmis():
-                F = f_i()
-                eigenvalues = torch.linalg.eigvalsh(F)
-                negative_eigs = torch.relu(-eigenvalues)
-                total_violation += torch.sum(negative_eigs).item()
+            for i, f_i in enumerate(self.get_lmis()):
+                min_eig = torch.linalg.eigvalsh(f_i()).min().item()
+                margins[f"lmi_{i}_min_eig"] = min_eig
+                overall_min = min(overall_min, min_eig)
+            for j, s_i in enumerate(self.get_scalar_inequalities()):
+                val = s_i().squeeze().item()
+                margins[f"scalar_{j}"] = val
+                overall_min = min(overall_min, val)
 
-        return total_violation
+        if overall_min != float("inf"):
+            margins["min_eig"] = overall_min
+        return margins
+
+    @overload
+    def get_regularization_input(
+        self, u: torch.Tensor, x: torch.Tensor,
+        return_c: Literal[False] = ..., warmup_steps: int = ...,
+    ) -> torch.Tensor: ...
+
+    @overload
+    def get_regularization_input(
+        self, u: torch.Tensor, x: torch.Tensor,
+        return_c: Literal[True], warmup_steps: int = ...,
+    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def get_regularization_input(
         self,
@@ -1875,7 +1782,7 @@ class SimpleLure(nn.Module):
         x: torch.Tensor,
         return_c: bool = False,
         warmup_steps: int = 0,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Compute input constraint regularization loss (vectorized).
 
@@ -1937,6 +1844,54 @@ class SimpleLure(nn.Module):
         if return_c:
             return reg_loss, c
 
+        return reg_loss
+
+    def set_output_coverage_level(self, y_max, output_std=None) -> None:
+        """Set the **physical** safe output level ``y_max`` (and, optionally, the
+        physical output scale ``output_std`` used to relate the model's
+        normalized ``C/P/s`` to physical units).
+
+        ``y_max`` has a physical meaning and is stored unnormalized; the coverage
+        machinery divides by ``output_std`` internally. ``None``/``nan`` y_max
+        disables the output-coverage penalty. ``output_std=None`` leaves the
+        stored scale unchanged. Kept on the model's device/dtype."""
+        device, dtype = self.P.device, self.P.dtype
+        self.y_max = torch.tensor(
+            float(y_max) if y_max is not None else float("nan"), device=device, dtype=dtype
+        )
+        if output_std is not None:
+            self.output_std = torch.tensor(float(output_std), device=device, dtype=dtype)
+
+    def get_regularization_output(self, return_margin: bool = False):
+        """Output-coverage penalty — bind Corollary 1 (see the wiki
+        ``binding-output-certificate``).
+
+        Enforces the coverage-on-image floor ``(σ·s)² C P Cᵀ ⪰ y_max² I`` in
+        PHYSICAL output units (``σ = output_std``): the model's *own* certified
+        output set must reach the physical safe level ``y_max``. The penalty is
+        ``relu(λ_max(y_max² I − (σ·s)² C P Cᵀ))`` — zero once the physical image
+        covers the data envelope in every direction, else the largest remaining
+        per-direction deficit (for ``ne = 1`` just
+        ``relu(y_max² − (σ·s)²·CPCᵀ)``).
+
+        No-op (returns 0) when ``y_max`` is unset. This is the differentiable
+        training surrogate for the exact binding SDP in
+        :meth:`solve_output_coverage_certificate`.
+        """
+        zero = torch.zeros((), device=self.P.device, dtype=self.P.dtype)
+        if self.y_max is None or bool(torch.isnan(self.y_max)):
+            return (zero, zero) if return_margin else zero
+
+        CPCt = self.C @ self.P @ self.C.T  # (ne, ne), symmetric
+        deficit = self.y_max**2 * torch.eye(
+            self.ne, device=self.P.device, dtype=self.P.dtype
+        ) - (self.output_std * self.s)**2 * CPCt
+        # Coverage <=> deficit ⪯ 0 <=> lambda_max(deficit) <= 0.
+        lam_max = torch.linalg.eigvalsh(deficit)[-1]
+        reg_loss = torch.relu(lam_max)
+
+        if return_margin:
+            return reg_loss, lam_max
         return reg_loss
 
 

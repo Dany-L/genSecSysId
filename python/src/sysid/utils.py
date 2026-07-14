@@ -70,6 +70,19 @@ def torch_bmat(mat: List[List[torch.Tensor]]) -> torch.Tensor:
     return torch.vstack(mat_list)
 
 
+def max_abs_output(outputs: np.ndarray) -> float:
+    """Safe output level ``y_max = max_{i,k} |y_k^(i)|`` from a dataset.
+
+    NaN entries (padded variable-length trajectories) are ignored, so this is
+    robust to the ragged batches produced by the variable-length loaders.
+
+    The result is in the *same units as ``outputs``*: pass raw outputs for the
+    physical level, or ``normalizer.transform_outputs(outputs)`` for the
+    normalized level ``y_max_n`` that the model's ``C``/``P``/``s`` live in.
+    """
+    return float(np.nanmax(np.abs(outputs)))
+
+
 def plot_safe_set_trajectories(
     P: np.ndarray,
     L: np.ndarray,
