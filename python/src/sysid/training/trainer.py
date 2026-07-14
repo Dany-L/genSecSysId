@@ -11,9 +11,9 @@ import mlflow
 import numpy as np
 import torch
 import torch.nn as nn
-from scipy.io import savemat
+from scipy.io import savemat  # type: ignore[import-untyped]
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from tqdm import tqdm  # type: ignore[import-untyped]
 
 from ..evaluation.evaluator import Evaluator
 from ..models.base import BaseRNN
@@ -46,6 +46,8 @@ class Trainer:
         log_gradients: bool = True,
         warmup_steps: int = 0,
         input_regularization_weight: float = 0.01,
+        output_regularization_weight: float = 0.0,
+        output_std: float = 1.0,
         train_div_loader: Optional[DataLoader] = None,
         val_div_loader: Optional[DataLoader] = None,
     ):
@@ -102,6 +104,13 @@ class Trainer:
         self.warmup_steps = warmup_steps  # Number of steps to skip before computing loss
         self.input_regularization_weight = input_regularization_weight  # Weight for input constraint regularization
         self.initial_input_regularization_weight = input_regularization_weight  # Store initial value
+        # Output-coverage regularization (bind Corollary 1): pushes the certified
+        # output image s^2 C P C^T to reach the physical safe data level y_max.
+        self.output_regularization_weight = output_regularization_weight
+        self.initial_output_regularization_weight = output_regularization_weight
+        # Physical output scale (relates normalized C/P/s to physical y_max);
+        # used only by the _init_output_coverage_level fallback.
+        self.output_std = float(output_std)
 
         # Rollback tracking
         self.rollback_count = 0
@@ -116,17 +125,50 @@ class Trainer:
         self.best_val_loss = float("inf")
         self.best_epoch = 0  # Track which epoch had the best validation loss
         self.patience_counter = 0
-        self.train_losses = []
-        self.train_pred_losses = []
-        self.train_reg_feasibility = []
-        self.train_reg_inputs = []
-        self.val_losses = []
+        self.train_losses: list[float] = []
+        self.train_pred_losses: list[float] = []
+        self.train_reg_feasibility: list[float] = []
+        self.train_reg_inputs: list[float] = []
+        self.val_losses: list[float] = []
         # Diverging-trajectory metric histories (populated when *_div loaders are provided)
-        self.train_div_losses = []
-        self.val_div_losses = []
+        self.train_div_losses: list[float] = []
+        self.val_div_losses: list[float] = []
 
         # Scheduler (can be set later)
         self.scheduler = None
+
+        # Derive the (physical) safe output level y_max from the training targets
+        # and hand it to the model for the output-coverage penalty.
+        self._init_output_coverage_level()
+
+    def _init_output_coverage_level(self):
+        """Set the model's PHYSICAL safe output level ``y_max`` (fallback path).
+
+        No-op unless output-coverage regularization is requested and the model
+        supports it, and skipped when the model already has ``y_max`` set — in
+        the normal pipeline ``initialize_parameters`` sets both ``y_max`` and
+        ``output_std`` from the raw data + normalizer, so this only fires for
+        directly-constructed / loaded models. The loader yields *normalized*
+        targets, so ``max |e| · output_std`` is the physical ``y_max``.
+        """
+        if self.output_regularization_weight <= 0:
+            return
+        if not hasattr(self.model, "set_output_coverage_level"):
+            return
+        y_max = getattr(self.model, "y_max", None)
+        if y_max is not None and not bool(torch.isnan(y_max)):
+            return  # already set by the caller (e.g. initialize_parameters)
+
+        peak_n = 0.0
+        for batch in self.train_loader:
+            e = batch[1]
+            e = e[torch.isfinite(e)]  # ignore NaN padding
+            if e.numel() > 0:
+                peak_n = max(peak_n, float(e.abs().max()))
+        if peak_n > 0.0:
+            y_max_phys = peak_n * self.output_std
+            self.model.set_output_coverage_level(y_max_phys, self.output_std)
+            logging.info(f"Output-coverage level y_max set from training data: {y_max_phys:.6f}")
 
     def set_scheduler(self, scheduler):
         """Set learning rate scheduler."""
@@ -331,6 +373,15 @@ class Trainer:
                 f"Input regularization weight decayed: {old_input_weight:.6e} → {self.input_regularization_weight:.6e}"
             )
 
+        if self.output_regularization_weight > 0:
+            old_output_weight = self.output_regularization_weight
+            self.output_regularization_weight *= self.regularization_decay_factor
+            if self.output_regularization_weight < self.min_regularization_weight:
+                self.output_regularization_weight = self.min_regularization_weight
+            logging.info(
+                f"Output regularization weight decayed: {old_output_weight:.6e} → {self.output_regularization_weight:.6e}"
+            )
+
     def reduce_lr_on_rollback(self, factor: float = 0.5):
         """
         Reduce learning rate when rollbacks occur frequently.
@@ -361,6 +412,7 @@ class Trainer:
         total_pred_loss_div = 0.0
         num_batches = 0
 
+        assert self.train_div_loader is not None  # caller guards this
         for batch in self.train_div_loader:
             if len(batch) == 3:
                 d, e, x0 = batch
@@ -399,7 +451,7 @@ class Trainer:
 
             if isinstance(self.model, SimpleLure):
                 if not self.model.check_constraints() and self.regularization_weight > 0:
-                    b_feasible = self.model.analysis_problem()
+                    b_feasible = self.model.feasibility_problem()
                     if not b_feasible:
                         logging.warning(
                             "Diverging batch: Feasibility SDP failed, rolling back parameters"
@@ -416,7 +468,7 @@ class Trainer:
 
         return total_pred_loss_div / max(num_batches, 1)
 
-    def train_epoch(self) -> Dict[str, float]:
+    def train_epoch(self) -> Dict[str, Any]:
         """
         Train for one epoch.
 
@@ -430,13 +482,14 @@ class Trainer:
         total_reg_feasibility = 0.0
         total_reg_parametric = 0.0
         total_reg_inputs = 0.0
+        total_reg_output = 0.0
         num_batches = 0
 
         # Reset epoch rollback counter
         self.epoch_rollback_count = 0
 
         # Accumulate gradient stats over epoch
-        epoch_grad_stats = {}
+        epoch_grad_stats: dict[str, list[float]] = {}
 
         for batch_idx, batch in enumerate(self.train_loader):
             # Unpack batch (states may be None)
@@ -464,6 +517,7 @@ class Trainer:
             reg_loss_value = 0.0
             reg_feasibility_value = 0.0
             reg_input_value = 0.0
+            reg_output_value = 0.0
             if self.regularization_weight > 0:
                 # feasibility loss
                 reg_feasibility_loss = self.model.get_regularization_loss()
@@ -476,6 +530,14 @@ class Trainer:
                 reg_input_value = reg_input_loss.item()
 
                 loss = pred_loss + self.regularization_weight * reg_feasibility_loss + self.input_regularization_weight * reg_input_loss
+
+                # Output-coverage regularization (bind Corollary 1): push the
+                # certified output image to reach the physical safe level y_max.
+                # No-op when the weight is 0 or y_max is unset.
+                if self.output_regularization_weight > 0:
+                    reg_output_loss = self.model.get_regularization_output()
+                    reg_output_value = reg_output_loss.item()
+                    loss = loss + self.output_regularization_weight * reg_output_loss
             else:
                 loss = pred_loss
 
@@ -509,8 +571,9 @@ class Trainer:
             # Check if constraints are satisfied (for constrained models)
             if isinstance(self.model, SimpleLure):
                 if not self.model.check_constraints() and self.regularization_weight > 0:
-                    # Constraints violated - try to solve feasibility SDP
-                    b_feasible = self.model.analysis_problem()
+                    # Constraints violated - repair P, L, M at the current s (fixed-s
+                    # Feasibility); roll back the update if no feasible cert exists.
+                    b_feasible = self.model.feasibility_problem()
 
                     if not b_feasible:
                         # SDP failed - roll back to previous parameters
@@ -539,6 +602,7 @@ class Trainer:
             total_pred_loss += pred_loss.item()
             total_reg_feasibility += reg_feasibility_value
             total_reg_inputs += reg_input_value
+            total_reg_output += reg_output_value
             num_batches += 1
 
         # Average loss
@@ -546,6 +610,7 @@ class Trainer:
         avg_pred_loss = total_pred_loss / num_batches
         avg_reg_feasibility = total_reg_feasibility / num_batches
         avg_reg_inputs = total_reg_inputs / num_batches
+        avg_reg_output = total_reg_output / num_batches
 
         # Average gradient statistics over epoch
         avg_grad_stats = {key: np.mean(values) for key, values in epoch_grad_stats.items()}
@@ -562,6 +627,7 @@ class Trainer:
             "pred_loss_div": pred_loss_div,
             "reg_feasibility": avg_reg_feasibility,
             "reg_input": avg_reg_inputs,
+            "reg_output": avg_reg_output,
             "rollback_count": self.epoch_rollback_count,
             **avg_grad_stats,
         }
@@ -670,6 +736,7 @@ class Trainer:
                     "pred_loss_div",
                     "reg_feasibility",
                     "reg_input",
+                    "reg_output",
                     "rollback_count",
                 ]
             }
@@ -685,6 +752,7 @@ class Trainer:
             val_results = self.validate()
             val_loss = val_results["val_loss"]
             val_loss_div = val_results["val_loss_div"]
+            assert val_loss is not None  # validate() always returns a converging val_loss
             self.val_losses.append(val_loss)
 
             # Synchronize CUDA so the wall-clock time reflects completed GPU work,
@@ -696,6 +764,16 @@ class Trainer:
             if val_loss_div is not None:
                 self.val_div_losses.append(val_loss_div)
             # print(f'Epoch {epoch}: constraints satisfied={self.model.check_constraints()}')
+
+            # Feasibility margins (min eigenvalue per LMI + scalar inequalities).
+            # Diagnostic for interior-point drift: if min_eig climbs steadily while
+            # the input/output violation terms worsen, the -log det barrier is
+            # tugging the certificate params deeper into the interior.
+            feas_margins = (
+                self.model.get_feasibility_margins()
+                if hasattr(self.model, "get_feasibility_margins")
+                else {}
+            )
 
             # Get scheduler patience info if using ReduceLROnPlateau
             scheduler_patience_info = ""
@@ -716,6 +794,8 @@ class Trainer:
                 "constraints": f"{self.model.check_constraints()}",
                 "epoch_s": f"{epoch_time_sec:.2f}",
             }
+            if "min_eig" in feas_margins:
+                progress_metrics["min_eig"] = f"{feas_margins['min_eig']:.2e}"
             if train_pred_loss_div is not None:
                 progress_metrics["pred_div"] = f"{train_pred_loss_div:.4f}"
             if val_loss_div is not None:
@@ -736,7 +816,23 @@ class Trainer:
                 mlflow.log_metric("train_loss", train_loss, step=epoch)
                 mlflow.log_metric("train_pred_loss", train_pred_loss, step=epoch)
                 mlflow.log_metric("train_reg_feasibility", train_results["reg_feasibility"], step=epoch)
+                # Feasibility margins: min eig per LMI + scalar inequalities (drift monitor)
+                for margin_name, margin_value in feas_margins.items():
+                    mlflow.log_metric(f"feas_margin/{margin_name}", margin_value, step=epoch)
                 mlflow.log_metric("train_reg_input", train_results["reg_input"], step=epoch)
+                if self.output_regularization_weight > 0:
+                    mlflow.log_metric("train_reg_output", train_results["reg_output"], step=epoch)
+                    mlflow.log_metric(
+                        "output_regularization_weight",
+                        self.output_regularization_weight,
+                        step=epoch,
+                    )
+                    # Coverage margin: lambda_max(y_max^2 I - (output_std*s)^2 CPC^T).
+                    # <=0 means the certified output image covers the safe level.
+                    if hasattr(self.model, "get_regularization_output"):
+                        with torch.no_grad():
+                            _, cov_margin = self.model.get_regularization_output(return_margin=True)
+                        mlflow.log_metric("output_coverage_margin", float(cov_margin), step=epoch)
                 mlflow.log_metric("val_loss", val_loss, step=epoch)
                 if train_pred_loss_div is not None:
                     mlflow.log_metric("train_pred_loss_div", train_pred_loss_div, step=epoch)
@@ -799,23 +895,6 @@ class Trainer:
             if self.mlflow_tracking:
                 mlflow.log_metric("rollback_count", epoch_rollback_count, step=epoch)
                 mlflow.log_metric("total_rollbacks", self.rollback_count, step=epoch)
-
-            # Update dual penalty coefficient if using dual method
-            if hasattr(self.model, "update_dual_penalty") and hasattr(
-                self.model, "regularization_method"
-            ):
-                if self.model.regularization_method == "dual":
-                    constraints_satisfied = self.model.check_constraints()
-                    self.model.update_dual_penalty(constraints_satisfied)
-
-                    # Log dual penalty and constraint violation to MLflow
-                    if self.mlflow_tracking:
-                        mlflow.log_metric(
-                            "dual_penalty", self.model.dual_penalty.item(), step=epoch
-                        )
-                        if hasattr(self.model, "get_constraint_violation"):
-                            violation = self.model.get_constraint_violation()
-                            mlflow.log_metric("constraint_violation", violation, step=epoch)
 
             # Save checkpoint
             if (epoch + 1) % self.checkpoint_frequency == 0:

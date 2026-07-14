@@ -24,29 +24,56 @@ from sysid.utils import get_device, print_model_summary, set_seed
 torch.set_default_dtype(torch.float64)
 
 
-def setup_console_logging() -> logging.Logger:
+_LOG_LEVELS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
+
+def resolve_log_level(name: str) -> int:
+    """Map a level name ('DEBUG', 'INFO', ...) to its logging int, erroring on typos."""
+    key = str(name).upper()
+    if key not in _LOG_LEVELS:
+        raise ValueError(
+            f"Unknown log_level {name!r}. Use one of: {', '.join(_LOG_LEVELS)}."
+        )
+    return _LOG_LEVELS[key]
+
+
+def _quiet_noisy_loggers() -> None:
+    """Keep chatty third-party libraries at WARNING so DEBUG stays readable."""
+    for name in ("matplotlib", "PIL", "mlflow"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def setup_console_logging(level: int = logging.INFO) -> logging.Logger:
     """Setup console-only logging (before run_id is known)."""
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
         force=True,
     )
+    _quiet_noisy_loggers()
     return logging.getLogger(__name__)
 
 
-def setup_file_logging(log_dir: Path, log_prefix: str) -> logging.Logger:
+def setup_file_logging(log_dir: Path, log_prefix: str, level: int = logging.INFO) -> logging.Logger:
     """Setup logging with both file and console output (after run_id is known)."""
     log_dir.mkdir(parents=True, exist_ok=True)
     log_filename = f"{log_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     log_file_path = log_dir / log_filename
 
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=[logging.FileHandler(log_file_path), logging.StreamHandler(sys.stdout)],
         force=True,
     )
+    _quiet_noisy_loggers()
     logger = logging.getLogger(__name__)
     logger.info(f"Log file: {log_file_path}")
 
@@ -130,8 +157,11 @@ def main():
         model_dir = Path(os.path.expanduser(config.model_dir))
         log_dir = Path(os.path.expanduser(config.log_dir))
 
+    # Resolve logging verbosity: --debug overrides the config's log_level.
+    log_level = logging.DEBUG if args.debug else resolve_log_level(config.log_level)
+
     # Setup basic console-only logging until we have run_id
-    logger = setup_console_logging()
+    logger = setup_console_logging(log_level)
 
     logger.info("=" * 70)
     logger.info("Training RNN for System Identification")
@@ -311,8 +341,7 @@ def main():
             train_states,
             train_outputs,
             init_config=config.model.initialization,
-            data_dir=data_config.train_path,
-            normalizer = normalizer
+            normalizer=normalizer,
         )
     print_model_summary(model)
 
@@ -403,7 +432,7 @@ def main():
         run_log_dir.mkdir(parents=True, exist_ok=True)
 
         # Setup full logging (console + file) now that we have run_id
-        logger = setup_file_logging(run_log_dir, "training")
+        logger = setup_file_logging(run_log_dir, "training", log_level)
         logger.info(f"MLflow run ID: {run_id}")
         logger.info(f"Experiment: {config.mlflow.experiment_name}")
 
@@ -511,6 +540,16 @@ def main():
             log_gradients=getattr(config.training, "log_gradients", True),
             warmup_steps=config.training.warmup_steps,
             input_regularization_weight=getattr(config.training, "input_regularization_weight", 0.01),
+            output_regularization_weight=(
+                getattr(config.training, "output_regularization_weight", 0.0)
+                if config.training.use_custom_regularization
+                else 0.0
+            ),
+            output_std=(
+                float(np.asarray(normalizer.output_std).reshape(-1)[0])
+                if normalizer is not None and getattr(normalizer, "output_std", None) is not None
+                else 1.0
+            ),
         )
 
         if scheduler is not None:

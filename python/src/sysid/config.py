@@ -2,11 +2,31 @@
 
 import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import yaml
+
+logger = logging.getLogger(__name__)
+
+
+def _known_fields(config_cls, section: str, values: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only the keys ``config_cls`` actually accepts, warning about the rest.
+
+    Lets old configs load even when they still carry keys from removed features
+    (e.g. ``esn_n_restarts`` after the ESN init was dropped): the stale keys are
+    ignored with a warning instead of raising ``TypeError``.
+    """
+    allowed = {f.name for f in fields(config_cls)}
+    unknown = [k for k in values if k not in allowed]
+    if unknown:
+        logger.warning(
+            "Ignoring unknown config field(s) in '%s': %s "
+            "(not part of %s — likely leftovers from a removed/renamed feature).",
+            section, ", ".join(sorted(unknown)), config_cls.__name__,
+        )
+    return {k: v for k, v in values.items() if k in allowed}
 
 
 @dataclass
@@ -58,10 +78,19 @@ class DataConfig:
 class InitializationConfig:
     """Configuration for model parameter initialization."""
 
-    method: str = "esn"  # "esn", "n4sid", or "identity"
-    # ESN-specific parameters
-    esn_n_restarts: int = 5  # Number of random reservoirs to try
+    method: str = "identity"  # only "identity" is supported (esn/n4sid removed)
     # Identity initialization uses α=0.99, A=0.9I, C2=Rand(-1,1), C=[I,0], B2=D=D12=0
+
+    # Initialize s (and P, L) with the output+input condition sweep (MinTrProb)
+    # instead of plain max-s: pick an s that meets the output-coverage floor AND
+    # leaves zero input violations; else the s with the fewest violations;
+    # falling back to max-s only when the output level is not yet reachable.
+    # Set False for the legacy max-s initialization.
+    init_s_from_conditions: bool = True
+    # Number of s grid points for the initialization sweep (kept small; init runs once).
+    init_s_grid_size: int = 15
+    # Upper end of the s sweep band (simple preset; see solve_output_coverage_certificate).
+    init_s_max: float = 20.0
 
 
 @dataclass
@@ -163,6 +192,11 @@ class TrainingConfig:
     # Input constraint regularization weight
     input_regularization_weight: float = 0.01  # Weight for input constraint loss
 
+    # Output-coverage regularization weight. Penalizes s^2 C P C^T below the
+    # (normalized) safe level (bind Corollary 1): pushes the certified output
+    # image to reach the physical data level y_max. 0.0 disables it (default).
+    output_regularization_weight: float = 0.0
+
     # Gradient monitoring
     log_gradients: bool = True  # Log gradient statistics to MLflow
 
@@ -205,14 +239,14 @@ class EvaluationConfig:
     # - <metric>_final: Metric at final time step
     
     def __post_init__(self):
-        """Handle both metrics and metrics_to_log field names."""
+        """Reconcile the metrics/metrics_to_log aliases, then apply defaults."""
+        # Accept either field name as the source of truth.
         if self.metrics_to_log is not None and self.metrics is None:
             self.metrics = self.metrics_to_log
         elif self.metrics_to_log is None and self.metrics is not None:
             self.metrics_to_log = self.metrics
 
-    def __post_init__(self):
-        """Set default metrics if none provided."""
+        # Default when neither was provided.
         if self.metrics is None:
             # Default: all available metrics
             self.metrics = ["mse", "rmse", "mae", "r2", "nrmse", "max_error"]
@@ -241,6 +275,11 @@ class Config:
     # Set to None to disable seeding (allows getting different results on each run for variance estimation)
     # Set to an integer (e.g., 42) for reproducible results
     seed: Optional[int] = None
+
+    # Logging verbosity: one of DEBUG, INFO, WARNING, ERROR, CRITICAL.
+    # DEBUG surfaces per-step SDP diagnostics (e.g. MaxS / feasibility solves).
+    # The --debug CLI flag overrides this to DEBUG for a single run.
+    log_level: str = "INFO"
 
     def __post_init__(self):
         """Initialize evaluation config if not provided."""
@@ -281,7 +320,9 @@ class Config:
         # Handle model config with nested initialization config
         model_dict = config_dict.get("model", {}).copy()
         if "initialization" in model_dict and isinstance(model_dict["initialization"], dict):
-            model_dict["initialization"] = InitializationConfig(**model_dict["initialization"])
+            model_dict["initialization"] = InitializationConfig(
+                **_known_fields(InitializationConfig, "model.initialization", model_dict["initialization"])
+            )
         
         # Handle optimizer config with field name mappings
         optimizer_dict = config_dict.get("optimizer", {}).copy()
@@ -302,20 +343,21 @@ class Config:
         eval_config = None
         if "evaluation" in config_dict:
             eval_dict = config_dict["evaluation"].copy()
-            eval_config = EvaluationConfig(**eval_dict)
+            eval_config = EvaluationConfig(**_known_fields(EvaluationConfig, "evaluation", eval_dict))
 
         return cls(
-            data=DataConfig(**data_dict),
-            model=ModelConfig(**model_dict),
-            optimizer=OptimizerConfig(**optimizer_dict),
-            training=TrainingConfig(**training_dict),
-            mlflow=MLflowConfig(**config_dict.get("mlflow", {})),
+            data=DataConfig(**_known_fields(DataConfig, "data", data_dict)),
+            model=ModelConfig(**_known_fields(ModelConfig, "model", model_dict)),
+            optimizer=OptimizerConfig(**_known_fields(OptimizerConfig, "optimizer", optimizer_dict)),
+            training=TrainingConfig(**_known_fields(TrainingConfig, "training", training_dict)),
+            mlflow=MLflowConfig(**_known_fields(MLflowConfig, "mlflow", config_dict.get("mlflow", {}))),
             evaluation=eval_config,
             output_dir=config_dict.get("output_dir", "outputs"),
             model_dir=config_dict.get("model_dir", "models"),
             log_dir=config_dict.get("log_dir", "logs"),
             root_dir=config_dict.get("root_dir", None),
             seed=config_dict.get("seed", None),
+            log_level=config_dict.get("log_level", "INFO"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -332,6 +374,7 @@ class Config:
             "log_dir": self.log_dir,
             "root_dir": self.root_dir,
             "seed": self.seed,
+            "log_level": self.log_level,
         }
 
     def save_yaml(self, path: str):
@@ -443,6 +486,74 @@ def resolve_run_artifacts(
 
     run_info = None
     run_info_path = run_dir / "run_info.json"
+    if run_info_path.exists():
+        with open(run_info_path) as f:
+            run_info = json.load(f)
+
+    return config, model_path, normalizer_path, run_info
+
+
+def resolve_run_artifacts_mlflow(
+    run_id: str,
+    tracking_uri: str,
+) -> Tuple["Config", Path, Optional[Path], Optional[Dict[str, Any]]]:
+    """Resolve an MLflow run id to its artefacts on a (possibly remote) server.
+
+    The remote counterpart to :func:`resolve_run_artifacts`: rather than reading
+    a local ``data_root`` layout, it points MLflow at ``tracking_uri`` and
+    downloads the per-run artefacts train.py logs (into MLflow's local artifact
+    cache):
+        outputs/config.yaml
+        models/best_model.pt
+        models/normalizer.json
+        models/run_info.json
+
+    The config YAML is parsed with the same restricted SafeLoader subclass used
+    for local runs (only ``!!python/tuple`` is recognised, mapped to a list), so
+    a tampered config can't construct arbitrary Python objects.
+
+    Args:
+        run_id: MLflow run id.
+        tracking_uri: MLflow tracking URI, e.g. ``http://host/`` or
+            ``file:///path/to/mlruns``.
+
+    Returns:
+        The same 4-tuple as :func:`resolve_run_artifacts`:
+        ``(config, model_path, normalizer_path, run_info)``.
+    """
+    import mlflow  # imported lazily so sysid.config has no hard mlflow dep
+
+    log = logging.getLogger(__name__)
+    mlflow.set_tracking_uri(tracking_uri)
+    log.info(f"Downloading artefacts for run {run_id} from {tracking_uri}")
+    outputs_dir = Path(
+        mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path="outputs")
+    )
+    models_dir = Path(
+        mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path="models")
+    )
+
+    config_path = outputs_dir / "config.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"config.yaml not found in MLflow artifacts (outputs/) for run_id={run_id}"
+        )
+    with open(config_path) as f:
+        cfg_dict = yaml.load(f, Loader=_SafeLoaderWithTuple)
+    config = Config.from_dict(cfg_dict)
+
+    model_path = models_dir / "best_model.pt"
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"best_model.pt not found in MLflow artifacts (models/) for run_id={run_id}"
+        )
+
+    normalizer_path = models_dir / "normalizer.json"
+    if not normalizer_path.exists():
+        normalizer_path = None
+
+    run_info = None
+    run_info_path = models_dir / "run_info.json"
     if run_info_path.exists():
         with open(run_info_path) as f:
             run_info = json.load(f)

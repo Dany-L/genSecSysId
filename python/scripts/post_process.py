@@ -30,6 +30,7 @@ from sysid.evaluation import get_true_dynamics, list_true_dynamics
 from sysid.models import SimpleLure, SimpleLureSafe, load_model
 from sysid.data import DataNormalizer
 from sysid.utils import (
+    max_abs_output,
     plot_ellipse,
     plot_ellipse_and_parallelogram,
     plot_polytope,
@@ -726,8 +727,11 @@ def main():
         mlflow.log_metric("post_process/y_bar", y_bar)
 
         logger.info(f"Maximum output range (y_bar) after post-processing: {y_bar}")
-        # compute maximum output value from training dataset
-        y_max_train = np.max(np.abs(train_outputs))
+        # Physical safe output level from the training data. The model needs the
+        # output scale to relate its normalized C/P/s to this physical y_max.
+        y_max_train = max_abs_output(train_outputs)
+        output_std = float(np.asarray(normalizer.output_std).reshape(-1)[0])
+        model.set_output_coverage_level(y_max_train, output_std)
         logger.info(f"Maximum output value in training data: {y_max_train}")
         mlflow.log_metric("data/max_output_train", y_max_train)
 
@@ -755,6 +759,45 @@ def main():
         fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
         mlflow.log_figure(fig, f'post_processing/{ellipse_plot_name}')
         plt.close(fig)
+
+        # ------------------------------------------------------------------
+        # MinTrProb output certificate: sweep s over the preset band and select
+        # the tightest certified output interval [-y_bar, y_bar] (physical) with
+        # y_bar = y_max that also leaves zero input violations on the training
+        # data. Overwrites (P, L, s) with this final certificate.
+        # ------------------------------------------------------------------
+        try:
+            cert = model.solve_output_coverage_certificate(
+                y_max=y_max_train,
+                inputs=u_train_n,
+                x0=x0_train,
+                warmup_steps=warmup_steps,
+            )
+            if cert["success"]:
+                logger.info(
+                    f"Output certificate: y_bar={cert['y_bar']} "
+                    f"(y_max={cert['y_max']}), s={cert['s']:.6f} "
+                    f"in [{cert['s_min']:.6f}, {cert['s_max']:.6f}], "
+                    f"input violations={cert['n_input_violations']}, "
+                    f"violation_free={cert['violation_free']}"
+                )
+                mlflow.log_metric("certificate/y_bar", cert["y_bar"])
+                mlflow.log_metric("certificate/y_max", cert["y_max"])
+                mlflow.log_metric("certificate/s", cert["s"])
+                mlflow.log_metric("certificate/s_min", cert["s_min"])
+                mlflow.log_metric("certificate/s_max", cert["s_max"])
+                mlflow.log_metric("certificate/n_input_violations", cert["n_input_violations"])
+                mlflow.log_metric("certificate/violation_free", int(bool(cert["violation_free"])))
+                mlflow.log_metric("certificate/constraints_satisfied", int(cert["constraints_satisfied"]))
+            else:
+                logger.warning(
+                    f"Output certificate not found: reason={cert['reason']} "
+                    f"(this theta cannot certify y_max={y_max_train})"
+                )
+                mlflow.log_metric("certificate/success", 0)
+                mlflow.log_param("certificate/failure_reason", cert["reason"])
+        except Exception as e:
+            logger.warning(f"Output-coverage certificate step failed: {e}", exc_info=True)
 
         # Log parameter
         mlflow.log_param("post_processing", True)

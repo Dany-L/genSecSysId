@@ -271,42 +271,6 @@ class TestInitializationMethods:
         assert torch.allclose(model.B[0, :], torch.zeros(1))
         assert torch.allclose(model.C, torch.tensor([[1.0, 0.0]]))
 
-    def test_esn_init_with_constraints(self):
-        """Test ESN initialization respects constraints."""
-        custom_params = {
-            "structural_constraints": {
-                "C": {"fixed": True, "value": [[1.0, 0.0]]},
-                "D": {"fixed": True, "value": 0.0},
-            }
-        }
-        
-        model = SimpleLure(
-            nd=1,
-            ne=1,
-            nx=2,
-            nw=5,
-            activation="tanh",
-            delta=0.1,
-            custom_params=custom_params,
-        )
-        
-        # Create dummy training data
-        train_inputs = np.random.randn(2, 50, 1)
-        train_outputs = np.random.randn(2, 50, 1)
-        
-        # Call ESN initialization
-        try:
-            model._init_esn(train_inputs, None, train_outputs, n_restarts=1)
-        except Exception:
-            # ESN might fail due to SDP, that's okay for this test
-            pass
-        
-        # Check fixed constraints are still respected
-        assert model.C.requires_grad is False
-        assert torch.allclose(model.C, torch.tensor([[1.0, 0.0]]))
-        assert model.D.requires_grad is False
-        assert torch.allclose(model.D, torch.tensor(0.0))
-
 
 class TestConstraintValidation:
     """Test constraint validation and error handling."""

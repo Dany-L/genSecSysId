@@ -170,6 +170,13 @@ def test_filter_clamps_negative_oversized_input():
     torch.testing.assert_close(e_safe, e_ref, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="Warmup window intentionally disabled in d684ddf: the filter now "
+    "clamps from step 0 and ignores warmup_steps. Re-enable the "
+    "'if k < warmup_steps' bypass in LureSystemSafe.clamp_step to restore this "
+    "(and remove this marker) when the window comes back.",
+)
 def test_warmup_steps_disables_filter():
     """While k < warmup_steps the filter must be bypassed entirely."""
     safe_model = _make_lure(safety_filter=True)
@@ -235,11 +242,11 @@ def test_safety_filter_clamps_real_duffing_trajectory():
     safety filter actually clamps. A plot of the original vs. filtered input
     is saved alongside the test for visual inspection.
 
-    Background: after ``initialize_parameters``, the SDP in
-    ``analysis_problem_init`` maximizes ``s`` so that all training data fits
-    inside the safe set — meaning training inputs never trigger the filter.
-    We therefore scale the input to ``2×s`` to guarantee clamping at ``x0=0``
-    (where ``d_max = s``), independently of the SDP-chosen ``s`` value.
+    Background: after ``initialize_parameters``, the MinTrProb sweep sets ``s``
+    so that the training data fits inside the safe set — meaning training inputs
+    never trigger the filter. We therefore scale the input to ``2×s`` to
+    guarantee clamping at ``x0=0`` (where ``d_max = s``), independently of the
+    chosen ``s`` value.
     """
     import matplotlib
 
@@ -297,7 +304,6 @@ def test_safety_filter_clamps_real_duffing_trajectory():
         model.initialize_parameters(
             train_inputs, train_states, train_outputs,
             init_config=config.model.initialization,
-            data_dir=config.data.train_path,
             normalizer=normalizer,
         )
         model.eval()
