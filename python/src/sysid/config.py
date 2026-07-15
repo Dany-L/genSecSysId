@@ -197,6 +197,29 @@ class TrainingConfig:
     # image to reach the physical data level y_max. 0.0 disables it (default).
     output_regularization_weight: float = 0.0
 
+    # Dead-zone activity regularization. Penalizes relu(activity_target - mean||w||)
+    # on the rollout so the dead-zone nonlinearity fires, preventing the degenerate
+    # linear collapse (w == 0 -> pure LTI rollout) and pushing the model into its
+    # nonlinear regime. NOTE: this does NOT by itself make the global (H=0)
+    # certificate infeasible -- tanh/dzn are globally sector-bounded, so a model can
+    # be globally absolutely stable with an active nonlinearity; it is a behavioral
+    # heuristic that correlates with, not guarantees, a non-global model. 0.0
+    # disables it (default). Only meaningful for the 'dzn' activation. Unlike the
+    # other reg terms this one is NOT decayed (it must hold all through training),
+    # regardless of decay_regularization_weight.
+    activity_regularization_weight: float = 0.0
+    activity_target: float = 0.0  # w_star: target mean ||w|| (the hinge threshold)
+
+    # Anti-global-certificate regularization. Penalizes relu(h_target - ||H||_F)
+    # with H = L P^-1, pushing the coupling away from zero so the certificate
+    # stays LOCAL (H = 0 is the global sector condition -> a globally stable,
+    # typically near-linear model). Acts directly on the certificate params
+    # (L, P), unlike activity regularization which only touches the rollout. 0.0
+    # disables it (default). Requires learn_L. Like the activity term it is NOT
+    # decayed (it must hold all through training).
+    h_regularization_weight: float = 0.0
+    h_target: float = 0.0  # h_star: target coupling norm ||H||_F (hinge threshold)
+
     # Gradient monitoring
     log_gradients: bool = True  # Log gradient statistics to MLflow
 

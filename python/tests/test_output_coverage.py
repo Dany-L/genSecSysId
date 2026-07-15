@@ -219,18 +219,20 @@ class TestTrainerWiring:
 class TestBindingCertificate:
     """The exact binding-Corollary-1 certificate (solve_output_coverage_certificate)."""
 
-    def test_binds_ybar_to_ymax(self):
-        """When the level is reachable, the tightest certificate has ȳ = y_max
-        (Corollary 1 binds), constraints hold, and s lies in [s_min, s_max].
-        output_std defaults to 1 here, so physical == normalized."""
+    def test_tight_binds_ymax_operative_is_largest_set(self):
+        """Coverage binds on the tight branch (y_tight = y_max, Corollary 1) while
+        the operative certificate is the LARGEST invariant set (largest-s), so
+        y_bar >= y_max and the written-back model reflects the operative (largest)
+        certificate. output_std defaults to 1 here, so physical == normalized."""
         m = _make_model(s_value=0.5)
         res = m.solve_output_coverage_certificate(y_max=0.5, n_grid=15)
         assert res["success"]
         assert res["constraints_satisfied"]
-        assert res["y_bar"] == pytest.approx(0.5, rel=5e-2)
+        assert res["y_tight"] == pytest.approx(0.5, rel=5e-2)   # tight branch binds
+        assert res["y_bar"] >= res["y_max"] - 1e-6              # operative covers
         assert res["s_min"] <= res["s"] <= res["s_max"] * (1 + 1e-6)
-        # The written-back model reflects the selected certificate (physical ȳ,
-        # output_std=1 so it equals s*sqrt(CPC^T)).
+        # The written-back model reflects the selected (largest-set) certificate
+        # (physical ȳ, output_std=1 so it equals s*sqrt(CPC^T)).
         ybar_model = float(m.s * torch.sqrt(m.C @ m.P @ m.C.T)[0, 0])
         assert ybar_model == pytest.approx(res["y_bar"], rel=1e-4)
 
@@ -243,9 +245,14 @@ class TestBindingCertificate:
 
     def test_coverage_unreachable_is_reported(self):
         """A level far beyond the model's reachable image -> honest failure,
-        not a padded/vacuous 'success' (the informative-infeasibility signal)."""
+        not a padded/vacuous 'success' (the informative-infeasibility signal).
+        Pin a bounded s-band so the level stays beyond reach regardless of the
+        (tunable) default s_max — at very large s_max MOSEK will marginally
+        'solve' the coverage floor with an ill-conditioned huge P."""
         m = _make_model(s_value=0.5)
-        res = m.solve_output_coverage_certificate(y_max=1e6, n_grid=10)
+        res = m.solve_output_coverage_certificate(
+            y_max=1e6, n_grid=10, s_min=0.1, s_max=20.0
+        )
         assert not res["success"]
         assert res["reason"] == "coverage_unreachable"
 
@@ -260,21 +267,135 @@ class TestBindingCertificate:
         assert res["n_input_violations"] == 0
 
     def test_physical_y_max_with_output_std(self):
-        """y_max is physical: with output_std=2 the normalized floor is (y_max/2)^2
-        and the reported ȳ is physical (== output_std * s * sqrt(CPC^T))."""
+        """y_max is physical: with output_std=2 the normalized floor is (y_max/2)^2.
+        Coverage binds on the tight branch (y_tight == y_max) while the operative
+        y_bar is the largest invariant set; both physical (output_std*s*sqrt(CPC^T))."""
         m = _make_model(s_value=0.5)
         m.set_output_coverage_level(1.0, output_std=2.0)
         res = m.solve_output_coverage_certificate(y_max=1.0, n_grid=15)
         assert res["success"]
-        assert res["y_bar"] == pytest.approx(1.0, rel=5e-2)  # physical, binds to y_max
+        assert res["y_tight"] == pytest.approx(1.0, rel=5e-2)  # physical, tight binds
+        assert res["y_bar"] >= res["y_max"] - 1e-6             # operative covers
         ybar_phys = float(2.0 * m.s * torch.sqrt(m.C @ m.P @ m.C.T)[0, 0])
         assert ybar_phys == pytest.approx(res["y_bar"], rel=1e-4)
 
     def test_does_not_mutate_model_on_failure(self):
         m = _make_model(s_value=0.5)
         before = (m.P.detach().clone(), m.s.detach().clone(), m.L.detach().clone())
-        res = m.solve_output_coverage_certificate(y_max=1e6, n_grid=8)
+        res = m.solve_output_coverage_certificate(
+            y_max=1e6, n_grid=8, s_min=0.1, s_max=20.0  # bounded band -> unreachable
+        )
         assert not res["success"]
+        assert torch.equal(m.P, before[0])
+        assert torch.equal(m.s, before[1])
+        assert torch.equal(m.L, before[2])
+
+    def test_reports_band_and_maxs_ceiling(self):
+        """The summary carries the tight-branch band and the MaxS feasibility
+        ceiling. y_tight (sweep min ȳ) ≤ y_bar; the operative ȳ covers y_max; and
+        s_feas (MaxS) dominates any coverage-feasible s (same 5a/5b feasibility
+        plus coverage), with a non-negative ‖H‖ diagnostic."""
+        m = _make_model(s_value=0.5)
+        res = m.solve_output_coverage_certificate(
+            y_max=0.5, n_grid=15, s_min=0.1, s_max=20.0
+        )
+        assert res["success"]
+        for key in ("y_feas", "s_feas", "norm_H_feas", "y_tight", "s_tight"):
+            assert key in res and res[key] is not None
+        tol = 1e-6
+        assert res["y_tight"] <= res["y_bar"] + tol
+        assert res["y_bar"] >= res["y_max"] - tol  # operative certificate covers
+        assert res["s_feas"] >= res["s"] - tol      # MaxS s dominates operative s
+        assert res["norm_H_feas"] >= 0.0
+        sweep_ybars = [c["y_bar"] for c in res["sweep"] if c["y_bar"] is not None]
+        assert res["y_tight"] == pytest.approx(min(sweep_ybars))
+
+    def test_maxs_ceiling_independent_of_inputs(self):
+        """The MaxS ceiling (y_feas/s_feas/norm_H_feas) is a pure certificate
+        property (fixed θ, no coverage/input-violation constraint), so it does not
+        depend on whether inputs are supplied."""
+        m1 = _make_model(s_value=0.5)
+        r1 = m1.solve_output_coverage_certificate(
+            y_max=0.5, n_grid=15, s_min=0.1, s_max=20.0
+        )
+        m2 = _make_model(s_value=0.5)
+        u = 0.02 * torch.ones(4, 8, 1, dtype=torch.float64)  # tiny -> admissible
+        r2 = m2.solve_output_coverage_certificate(
+            y_max=0.5, inputs=u, n_grid=15, s_min=0.1, s_max=20.0
+        )
+        assert r2["violation_free"] is True
+        assert r1["s_feas"] == pytest.approx(r2["s_feas"], rel=1e-3)
+        assert r1["y_feas"] == pytest.approx(r2["y_feas"], rel=1e-3)
+        assert r1["norm_H_feas"] == pytest.approx(r2["norm_H_feas"], rel=1e-3, abs=1e-6)
+
+
+@requires_mosek
+class TestPostProcess:
+    """post_process: the two cleanly separated certificate SDPs.
+
+    Problem 1 (MaxS, ``max_s`` block) is the operative certificate written back
+    into the model — the largest invariant set (reports ȳ_c, ‖H‖, s); Problem 2
+    (coverage sweep, ``coverage`` block) reports the tightest coverage ȳ_f only.
+    """
+
+    def test_structure_and_applies_max_s(self):
+        s_direct = _make_model(s_value=0.5)._max_s_sdp()["s"]
+        m = _make_model(s_value=0.5)
+        res = m.post_process(y_max=0.5, n_grid=12)
+        assert res["success"]
+        assert res["constraints_satisfied"]
+        # The operative (applied) certificate is the MaxS one.
+        assert res["s_opt"] == pytest.approx(s_direct, rel=1e-4)
+        assert res["max_s"]["s"] == pytest.approx(s_direct, rel=1e-4)
+        assert float(m.s) == pytest.approx(res["max_s"]["s"], rel=1e-4)
+        # Both problems are reported.
+        assert res["max_s"]["y_bar"] is not None       # ȳ_c
+        assert res["max_s"]["norm_H"] >= 0.0
+        assert res["coverage"]["reason"] == "ok"
+        assert res["coverage"]["y_bar"] is not None    # ȳ_f
+        # ȳ_c = output_std * s * sqrt(CPCᵀ) matches the written-back model.
+        ybar_model = float(m.output_std * m.s * torch.sqrt(m.C @ m.P @ m.C.T)[0, 0])
+        assert ybar_model == pytest.approx(res["max_s"]["y_bar"], rel=1e-4)
+
+    def test_coverage_tightest_matches_sweep(self):
+        m = _make_model(s_value=0.5)
+        res = m.post_process(y_max=0.5, n_grid=12, s_min=0.1, s_max=20.0)
+        ybars = [c["y_bar"] for c in res["coverage"]["sweep"] if c["y_bar"] is not None]
+        assert res["coverage"]["y_bar"] == pytest.approx(min(ybars))
+
+    def test_coverage_skipped_when_y_max_unset(self):
+        m = _make_model(s_value=0.5)  # y_max buffer left unset (nan)
+        res = m.post_process(n_grid=8)
+        assert res["success"]
+        assert res["coverage"]["reason"] == "y_max_unset"
+        assert res["coverage"]["y_bar"] is None
+        assert res["max_s"]["coverage_ok"] is None
+
+    def test_coverage_ok_when_image_covers_level(self):
+        """The MaxS image easily covers a tiny demanded level -> coverage_ok."""
+        m = _make_model(s_value=0.5)
+        res = m.post_process(y_max=1e-3, n_grid=8)
+        assert res["max_s"]["coverage_ok"] is True
+
+    def test_coverage_unreachable_reported_but_maxs_succeeds(self):
+        """A level beyond reach on the band: MaxS (operative) still succeeds; the
+        coverage sweep honestly reports it cannot certify y_max."""
+        m = _make_model(s_value=0.5)
+        res = m.post_process(y_max=1e6, n_grid=8, s_min=0.1, s_max=20.0)
+        assert res["success"]
+        assert res["coverage"]["reason"] == "coverage_unreachable"
+        assert res["coverage"]["y_bar"] is None
+
+    def test_coverage_sweep_is_pure(self):
+        """_coverage_sweep must not mutate the model (post_process applies MaxS,
+        not the sweep result)."""
+        m = _make_model(s_value=0.5)
+        before = (m.P.detach().clone(), m.s.detach().clone(), m.L.detach().clone())
+        out = m._coverage_sweep(0.5, n_grid=8, s_min=0.1, s_max=20.0)
+        assert out is not None and out["y_f"] is not None
+        assert out["y_f"] == pytest.approx(
+            min(c["y_bar"] for c in out["sweep"] if c["y_bar"] is not None)
+        )
         assert torch.equal(m.P, before[0])
         assert torch.equal(m.s, before[1])
         assert torch.equal(m.L, before[2])

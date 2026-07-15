@@ -131,11 +131,11 @@ def plot_safe_set_trajectories(
     for c_i, x_i in zip(c, x_traj):
         if np.any(c_i > 0):
             ax.plot(x_i[warmup_steps, 0], x_i[warmup_steps, 1], "rx")
-            ax.plot(x_i[warmup_steps:M, 0], x_i[warmup_steps:M, 1], "--")
+            ax.plot(x_i[warmup_steps:, 0], x_i[warmup_steps:, 1], "--")
             count_unstable += 1
         else:
             ax.plot(x_i[warmup_steps, 0], x_i[warmup_steps, 1], "go")
-            ax.plot(x_i[warmup_steps:M, 0], x_i[warmup_steps:M, 1])
+            ax.plot(x_i[warmup_steps:, 0], x_i[warmup_steps:, 1])
             count_stable += 1
 
     X = np.linalg.inv(P)

@@ -47,6 +47,10 @@ class Trainer:
         warmup_steps: int = 0,
         input_regularization_weight: float = 0.01,
         output_regularization_weight: float = 0.0,
+        activity_regularization_weight: float = 0.0,
+        activity_target: float = 0.0,
+        h_regularization_weight: float = 0.0,
+        h_target: float = 0.0,
         output_std: float = 1.0,
         train_div_loader: Optional[DataLoader] = None,
         val_div_loader: Optional[DataLoader] = None,
@@ -108,6 +112,19 @@ class Trainer:
         # output image s^2 C P C^T to reach the physical safe data level y_max.
         self.output_regularization_weight = output_regularization_weight
         self.initial_output_regularization_weight = output_regularization_weight
+        # Dead-zone activity regularization: pushes mean ||w|| up to activity_target
+        # so the nonlinearity fires, preventing the degenerate linear collapse
+        # (w == 0 -> pure LTI rollout). NOTE: it does not by itself force a
+        # non-global model (see get_regularization_activity). NOT decayed on purpose
+        # (must hold all through training), so no initial_* / decay entry.
+        self.activity_regularization_weight = float(activity_regularization_weight)
+        self.activity_target = float(activity_target)
+        # Anti-global-certificate regularization: pushes ||H||_F (H = L P^-1) up
+        # to h_target so the certificate stays LOCAL (H = 0 is the global sector
+        # condition). Acts on the certificate params directly, unlike the activity
+        # term. NOT decayed on purpose (must hold all through training).
+        self.h_regularization_weight = float(h_regularization_weight)
+        self.h_target = float(h_target)
         # Physical output scale (relates normalized C/P/s to physical y_max);
         # used only by the _init_output_coverage_level fallback.
         self.output_std = float(output_std)
@@ -483,6 +500,8 @@ class Trainer:
         total_reg_parametric = 0.0
         total_reg_inputs = 0.0
         total_reg_output = 0.0
+        total_reg_activity = 0.0
+        total_reg_H = 0.0
         num_batches = 0
 
         # Reset epoch rollback counter
@@ -518,6 +537,8 @@ class Trainer:
             reg_feasibility_value = 0.0
             reg_input_value = 0.0
             reg_output_value = 0.0
+            reg_activity_value = 0.0
+            reg_H_value = 0.0
             if self.regularization_weight > 0:
                 # feasibility loss
                 reg_feasibility_loss = self.model.get_regularization_loss()
@@ -538,6 +559,31 @@ class Trainer:
                     reg_output_loss = self.model.get_regularization_output()
                     reg_output_value = reg_output_loss.item()
                     loss = loss + self.output_regularization_weight * reg_output_loss
+
+                # Dead-zone activity regularization: push mean ||w|| up to
+                # activity_target so the nonlinearity fires, preventing the
+                # degenerate linear collapse (w == 0 -> pure LTI rollout). Uses the
+                # rollout w from the forward pass above. No-op when weight/target
+                # is 0 or the model doesn't implement it.
+                if self.activity_regularization_weight > 0 and hasattr(
+                    self.model, "get_regularization_activity"
+                ):
+                    reg_activity_loss = self.model.get_regularization_activity(
+                        w, self.activity_target, warmup_steps=self.warmup_steps
+                    )
+                    reg_activity_value = reg_activity_loss.item()
+                    loss = loss + self.activity_regularization_weight * reg_activity_loss
+
+                # Anti-global-certificate regularization: push ||H||_F (H = L P^-1)
+                # up to h_target so the certificate stays local (H = 0 is the
+                # global sector condition). Acts on the certificate params (L, P).
+                # No-op when weight/target is 0 or the model doesn't implement it.
+                if self.h_regularization_weight > 0 and hasattr(
+                    self.model, "get_regularization_H"
+                ):
+                    reg_H_loss = self.model.get_regularization_H(self.h_target)
+                    reg_H_value = reg_H_loss.item()
+                    loss = loss + self.h_regularization_weight * reg_H_loss
             else:
                 loss = pred_loss
 
@@ -603,6 +649,8 @@ class Trainer:
             total_reg_feasibility += reg_feasibility_value
             total_reg_inputs += reg_input_value
             total_reg_output += reg_output_value
+            total_reg_activity += reg_activity_value
+            total_reg_H += reg_H_value
             num_batches += 1
 
         # Average loss
@@ -611,6 +659,8 @@ class Trainer:
         avg_reg_feasibility = total_reg_feasibility / num_batches
         avg_reg_inputs = total_reg_inputs / num_batches
         avg_reg_output = total_reg_output / num_batches
+        avg_reg_activity = total_reg_activity / num_batches
+        avg_reg_H = total_reg_H / num_batches
 
         # Average gradient statistics over epoch
         avg_grad_stats = {key: np.mean(values) for key, values in epoch_grad_stats.items()}
@@ -628,6 +678,8 @@ class Trainer:
             "reg_feasibility": avg_reg_feasibility,
             "reg_input": avg_reg_inputs,
             "reg_output": avg_reg_output,
+            "reg_activity": avg_reg_activity,
+            "reg_H": avg_reg_H,
             "rollback_count": self.epoch_rollback_count,
             **avg_grad_stats,
         }
@@ -737,6 +789,8 @@ class Trainer:
                     "reg_feasibility",
                     "reg_input",
                     "reg_output",
+                    "reg_activity",
+                    "reg_H",
                     "rollback_count",
                 ]
             }
@@ -827,12 +881,25 @@ class Trainer:
                         self.output_regularization_weight,
                         step=epoch,
                     )
+                if self.activity_regularization_weight > 0:
+                    mlflow.log_metric("train_reg_activity", train_results["reg_activity"], step=epoch)
                     # Coverage margin: lambda_max(y_max^2 I - (output_std*s)^2 CPC^T).
                     # <=0 means the certified output image covers the safe level.
                     if hasattr(self.model, "get_regularization_output"):
                         with torch.no_grad():
                             _, cov_margin = self.model.get_regularization_output(return_margin=True)
                         mlflow.log_metric("output_coverage_margin", float(cov_margin), step=epoch)
+                if self.h_regularization_weight > 0:
+                    mlflow.log_metric("train_reg_H", train_results["reg_H"], step=epoch)
+                    # Current coupling norm ||H||_F (H = L P^-1): watch it climb
+                    # toward h_target as the anti-global term takes effect.
+                    if hasattr(self.model, "get_regularization_H"):
+                        with torch.no_grad():
+                            _, norm_H = self.model.get_regularization_H(
+                                self.h_target if self.h_target > 0 else 1.0,
+                                return_norm=True,
+                            )
+                        mlflow.log_metric("norm_H", float(norm_H), step=epoch)
                 mlflow.log_metric("val_loss", val_loss, step=epoch)
                 if train_pred_loss_div is not None:
                     mlflow.log_metric("train_pred_loss_div", train_pred_loss_div, step=epoch)

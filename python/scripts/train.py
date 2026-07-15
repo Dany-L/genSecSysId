@@ -460,6 +460,10 @@ def main():
                 "max_epochs": config.training.max_epochs,
                 "warmup_steps": config.training.warmup_steps,
                 "input_regularization_weight": config.training.input_regularization_weight,
+                "activity_regularization_weight": getattr(config.training, "activity_regularization_weight", 0.0),
+                "activity_target": getattr(config.training, "activity_target", 0.0),
+                "h_regularization_weight": getattr(config.training, "h_regularization_weight", 0.0),
+                "h_target": getattr(config.training, "h_target", 0.0),
                 "custom_parameters": str(getattr(config.model, "custom_params", None)),
             }
         )
@@ -545,6 +549,18 @@ def main():
                 if config.training.use_custom_regularization
                 else 0.0
             ),
+            activity_regularization_weight=(
+                getattr(config.training, "activity_regularization_weight", 0.0)
+                if config.training.use_custom_regularization
+                else 0.0
+            ),
+            activity_target=getattr(config.training, "activity_target", 0.0),
+            h_regularization_weight=(
+                getattr(config.training, "h_regularization_weight", 0.0)
+                if config.training.use_custom_regularization
+                else 0.0
+            ),
+            h_target=getattr(config.training, "h_target", 0.0),
             output_std=(
                 float(np.asarray(normalizer.output_std).reshape(-1)[0])
                 if normalizer is not None and getattr(normalizer, "output_std", None) is not None
