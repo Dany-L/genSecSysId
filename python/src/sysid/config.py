@@ -92,6 +92,16 @@ class InitializationConfig:
     # Upper end of the s sweep band (simple preset; see solve_output_coverage_certificate).
     init_s_max: float = 20.0
 
+    # Calibrate the C2 std at init so the max-volume invariant set *just* covers
+    # the coverage set. Searches a scalar factor on the initialized C2 for
+    # 0 <= rho - 1 < calibrate_c2_eps, where rho = vol(MaxVol)/vol(tightest
+    # coverage): a globally stable init has rho = ∞ (unbounded set), so C2 is
+    # grown until the model turns regional and the set shrinks onto the coverage
+    # requirement. Disable to keep the config C2 std unchanged.
+    calibrate_c2_for_coverage: bool = True
+    calibrate_c2_eps: float = 0.05
+    calibrate_c2_max_iter: int = 30
+
 
 @dataclass
 class ModelConfig:

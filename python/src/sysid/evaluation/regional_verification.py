@@ -176,6 +176,7 @@ def regional_verification(
     factors,
     n_traj,
     horizon,
+    initial_state_scale=2.0,
 ):
     """Verify the model's regional-stability character.
 
@@ -191,8 +192,12 @@ def regional_verification(
         excitation with peak ``factor · s`` (``factor < 1`` is a sanity
         baseline, ``factor ≥ 1`` violates the input bound).
       * **Initial-state violation** — ``x0`` outside the ellipse (radius
-        ``2 · s/α`` along the ellipse axes), modest LP-filtered excitation
-        within the input bound.
+        ``initial_state_scale · s/α`` along the ellipse axes), modest
+        LP-filtered excitation within the input bound.
+
+    ``initial_state_scale`` sets how far outside the safe ellipse the
+    initial-state-violation samples are placed (``> 1`` violates the bound;
+    the analogue of ``factors`` for the input regime).
     """
     nx = model.nx
     nd = getattr(model, "nd", 1)
@@ -267,7 +272,9 @@ def regional_verification(
 
 
 
-    st_x0 = _sample_on_ellipsoid(rng, X, radius=2 * s / max(alpha, 1e-12), n=n_traj)
+    st_x0 = _sample_on_ellipsoid(
+        rng, X, radius=initial_state_scale * s / max(alpha, 1e-12), n=n_traj
+    )
     st_u = np.stack(
         [_make_lp_noise(rng, horizon, amp_max=0.01 * s, Ts=Ts) for _ in range(n_traj)]
     )
@@ -388,6 +395,7 @@ def regional_verification(
 
     # N = 800
     # Combine all input-violation trajectories into one figure.
+    lim_xs = 1.5 * np.max(np.abs(st_xs[:,0,:]),axis=0)
     xs_all = np.concatenate([r[2][:,:,:] for r in in_results], axis=0)
     c_all = np.concatenate([r[3][:,:] for r in in_results], axis=0)
     fig_in, ax_in, n_stab_in, n_unst_in = plot_safe_set_trajectories(
@@ -410,8 +418,8 @@ def regional_verification(
         ax_in.legend(loc="upper right", fontsize=8)
     factor_summary = ",".join(f"{f:g}" for f in factors)
     ax_in.set_title(f"Regional verification – input violation (factors {factor_summary})")
-    # ax_in.set_xlim(-2.5, 2.5)
-    # ax_in.set_ylim(-2.5, 2.5)
+    ax_in.set_xlim(-lim_xs[0], lim_xs[0])
+    ax_in.set_ylim(-lim_xs[1], lim_xs[1])
     in_plot = run_output_dir / "rv_input.png"
     fig_in.savefig(in_plot, dpi=150, bbox_inches="tight")
     mlflow.log_figure(fig_in, f"regional_verification/{in_plot.name}")
@@ -434,9 +442,11 @@ def regional_verification(
             )
             labelled = True
         ax_st.legend(loc="upper right", fontsize=8)
-    ax_st.set_title("Regional verification – initial-state violation")
-    # ax_st.set_xlim(-3.5, 3.5)
-    # ax_st.set_ylim(-3.5, 3.5)
+    ax_st.set_title(
+        f"Regional verification – initial-state violation (scale {initial_state_scale:g})"
+    )
+    ax_st.set_xlim(-lim_xs[0], lim_xs[0])
+    ax_st.set_ylim(-lim_xs[1], lim_xs[1])
     st_plot = run_output_dir / "rv_state.png"
     fig_st.savefig(st_plot, dpi=150, bbox_inches="tight")
     mlflow.log_figure(fig_st, f"regional_verification/{st_plot.name}")

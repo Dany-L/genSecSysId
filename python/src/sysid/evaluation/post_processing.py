@@ -25,6 +25,36 @@ from .regional_verification import simulate_model
 logger = logging.getLogger(__name__)
 
 
+def _scatter_trajectories(x_traj, c, *, warmup_steps=0, horizon=100, figsize=(8, 8)):
+    """Plain 2D state-space scatter of trajectories coloured by input-constraint
+    violation — the fallback when there is no ellipse/polytope safe set to draw.
+
+    Used when the coupling ``L`` is not learnable (``learn_L=False`` => ``L = 0``,
+    the model is globally stable): the regional ellipse/polytope is undefined, so
+    the safe-set overlay is skipped, but the trajectories are still drawn (green
+    solid = feasible, red dashed = a step breaches the input constraint ``c > 0``)
+    so a diagnostic figure is still produced. The colouring and the returned
+    ``(fig, count_stable, count_unstable)`` mirror
+    :func:`~sysid.utils.plot_safe_set_trajectories`.
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    count_stable = count_unstable = 0
+    M = warmup_steps + horizon
+    for x_hat, c_i in zip(x_traj, c):
+        if np.any(c_i > 0):
+            ax.plot(x_hat[warmup_steps, 0], x_hat[warmup_steps, 1], "rx")
+            ax.plot(x_hat[warmup_steps:M, 0], x_hat[warmup_steps:M, 1], "--")
+            count_unstable += 1
+        else:
+            ax.plot(x_hat[warmup_steps, 0], x_hat[warmup_steps, 1], "go")
+            ax.plot(x_hat[warmup_steps:M, 0], x_hat[warmup_steps:M, 1])
+            count_stable += 1
+    ax.grid(True, alpha=0.3)
+    ax.set_xlabel(r"$x_1$", fontsize=12)
+    ax.set_ylabel(r"$x_2$", fontsize=12)
+    return fig, count_stable, count_unstable
+
+
 def check_input_condition(
     model,
     inputs_n,
@@ -39,11 +69,14 @@ def check_input_condition(
     """Roll the model out on ``inputs_n`` and count input-constraint violations.
 
     A trajectory counts as 'unstable' iff its constraint margin
-    ``c_k = ‖u_k‖² − s² + α² xₖᵀ P⁻¹ xₖ`` ever exceeds 0. When ``nx == 2`` a
-    safe-set trajectory plot ``ellipse_polytope_<tag>.png`` is saved to
-    ``run_output_dir`` and logged to MLflow. For ``SimpleLureSafe``,
-    :func:`simulate_model` bypasses the safety filter so the margin reflects the
-    raw (unprotected) behaviour.
+    ``c_k = ‖u_k‖² − s² + α² xₖᵀ P⁻¹ xₖ`` ever exceeds 0. The count is always
+    logged, independent of ``learn_L``. When ``nx == 2`` a trajectory plot
+    ``ellipse_polytope_<tag>.png`` is saved to ``run_output_dir`` and logged to
+    MLflow: the ellipse/polytope safe set is overlaid when ``L`` is learnable,
+    otherwise (``learn_L=False`` => ``L = 0``, globally stable) there is no
+    regional safe set to draw and a plain trajectory scatter is emitted instead.
+    For ``SimpleLureSafe``, :func:`simulate_model` bypasses the safety filter so
+    the margin reflects the raw (unprotected) behaviour.
 
     Args:
         model: the (post-processed) SimpleLure model.
@@ -70,15 +103,23 @@ def check_input_condition(
     logger.info(f"{title}: total={b}, stable={n_stable}, unstable={n_unstable}")
 
     if model.nx == 2:
-        fig, _, _, _ = plot_safe_set_trajectories(
-            P=model.P.cpu().detach().numpy(),
-            L=model.L.cpu().detach().numpy(),
-            s=model.s.cpu().detach().numpy(),
-            x_traj=x_hat.cpu().detach().numpy(),
-            c=c_np,
-            warmup_steps=warmup_steps,
-            horizon=horizon,
-        )
+        if model.learn_L:
+            fig, _, _, _ = plot_safe_set_trajectories(
+                P=model.P.cpu().detach().numpy(),
+                L=model.L.cpu().detach().numpy(),
+                s=model.s.cpu().detach().numpy(),
+                x_traj=x_hat.cpu().detach().numpy(),
+                c=c_np,
+                warmup_steps=0,
+                horizon=horizon,
+            )
+        else:
+            # L is not learnable (L = 0 => globally stable): there is no regional
+            # ellipse/polytope safe set to draw. Fall back to a plain trajectory
+            # scatter so the feasibility check above is still logged/plotted.
+            fig, _, _ = _scatter_trajectories(
+                x_hat.cpu().detach().numpy(), c_np, warmup_steps=0, horizon=horizon,
+            )
         plot_name = f"ellipse_polytope_{tag}.png"
         fig.savefig(run_output_dir / plot_name, dpi=150, bbox_inches="tight")
         mlflow.log_figure(fig, f"post_processing/{plot_name}")
@@ -129,21 +170,11 @@ def plot_post_process_trajectories(
             figsize=figsize,
         )
     else:
-        fig, ax = plt.subplots(figsize=figsize)
-        count_stable, count_unstable = 0, 0
-        M = warmup_steps + horizon
-        for x_hat, c in zip(xs_np, cs):
-            if np.any(c > 0):
-                ax.plot(x_hat[warmup_steps, 0], x_hat[warmup_steps, 1], "rx")
-                ax.plot(x_hat[warmup_steps:M, 0], x_hat[warmup_steps:M, 1], "--")
-                count_unstable += 1
-            else:
-                ax.plot(x_hat[warmup_steps, 0], x_hat[warmup_steps, 1], "go")
-                ax.plot(x_hat[warmup_steps:M, 0], x_hat[warmup_steps:M, 1])
-                count_stable += 1
-        ax.grid(True, alpha=0.3)
-        ax.set_xlabel(r"$x_1$", fontsize=12)
-        ax.set_ylabel(r"$x_2$", fontsize=12)
+        # No learned coupling / custom regularization: no ellipse-polytope safe
+        # set, so fall back to the plain trajectory scatter.
+        fig, count_stable, count_unstable = _scatter_trajectories(
+            xs_np, cs, warmup_steps=warmup_steps, horizon=horizon, figsize=figsize,
+        )
 
     logger.info(f"total: {b}, stable: {count_stable}, unstable: {count_unstable}")
 

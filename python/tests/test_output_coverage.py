@@ -15,9 +15,14 @@ import cvxpy as cp
 from torch.utils.data import DataLoader, TensorDataset
 
 from sysid.models.constrained_rnn import SimpleLure
+from sysid.optimization import LureCertificateSynthesizer
 from sysid.training import get_loss_function, get_optimizer
 from sysid.training.trainer import Trainer
 from sysid.utils import max_abs_output
+
+
+def _synth(model) -> LureCertificateSynthesizer:
+    return LureCertificateSynthesizer.from_model(model)
 
 
 def _mosek_available() -> bool:
@@ -42,6 +47,25 @@ def _make_model(s_value: float = 0.05) -> SimpleLure:
     known-feasible starting point.
     """
     m = SimpleLure(nd=1, ne=1, nx=2, nw=1, activation="dzn", custom_params={"learn_L": True})
+    with torch.no_grad():
+        m.A.data = torch.tensor([[0.5, 0.0], [0.0, 0.5]], dtype=m.A.dtype)
+        m.B.data = torch.tensor([[0.1], [0.1]], dtype=m.B.dtype)
+        m.B2.data = torch.zeros_like(m.B2)
+        m.C.data = torch.tensor([[1.0, 0.0]], dtype=m.C.dtype)
+        m.C2.data = torch.tensor([[0.1, 0.1]], dtype=m.C2.dtype)
+        m.D21.data = torch.tensor([[0.1]], dtype=m.D21.dtype)
+        m.tau.data = torch.tensor(float(np.log(0.9 / 0.1)))  # alpha = 0.9
+        m.s.data = torch.tensor(float(s_value))
+        m.P.data = torch.eye(2, dtype=m.P.dtype)
+    return m
+
+
+def _make_global_model(s_value: float = 1.0) -> SimpleLure:
+    """A globally stable model (learn_L=False => L=0, fixed s/alpha).
+
+    The coverage SDP must stay well-posed here: no locality LMIs and s is not a
+    variable (mirrors tests/test_max_s.py::_make_global_model)."""
+    m = SimpleLure(nd=1, ne=1, nx=2, nw=1, activation="dzn", custom_params={"learn_L": False})
     with torch.no_grad():
         m.A.data = torch.tensor([[0.5, 0.0], [0.0, 0.5]], dtype=m.A.dtype)
         m.B.data = torch.tensor([[0.1], [0.1]], dtype=m.B.dtype)
@@ -333,29 +357,33 @@ class TestBindingCertificate:
 class TestPostProcess:
     """post_process: the two cleanly separated certificate SDPs.
 
-    Problem 1 (MaxS, ``max_s`` block) is the operative certificate written back
-    into the model — the largest invariant set (reports ȳ_c, ‖H‖, s); Problem 2
-    (coverage sweep, ``coverage`` block) reports the tightest coverage ȳ_f only.
+    Problem 1 (MaxVol, ``max_vol`` block) is the operative certificate written
+    back into the model — the largest-*volume* invariant set (reports volume,
+    ȳ_c, ‖H‖, s and the MaxS ceiling s_feas); Problem 2 (coverage sweep,
+    ``coverage`` block) reports the tightest coverage ȳ_f only.
     """
 
-    def test_structure_and_applies_max_s(self):
-        s_direct = _make_model(s_value=0.5)._max_s_sdp()["s"]
+    def test_structure_and_applies_max_vol(self):
+        s_ceiling = _synth(_make_model(s_value=0.5)).max_s().s
         m = _make_model(s_value=0.5)
         res = m.post_process(y_max=0.5, n_grid=12)
         assert res["success"]
         assert res["constraints_satisfied"]
-        # The operative (applied) certificate is the MaxS one.
-        assert res["s_opt"] == pytest.approx(s_direct, rel=1e-4)
-        assert res["max_s"]["s"] == pytest.approx(s_direct, rel=1e-4)
-        assert float(m.s) == pytest.approx(res["max_s"]["s"], rel=1e-4)
+        # The operative (applied) certificate is the MaxVol one; its s lives in
+        # (0, s_feas] and s_feas is the MaxS feasibility ceiling.
+        assert res["max_vol"]["s_feas"] == pytest.approx(s_ceiling, rel=1e-4)
+        assert 0.0 < res["s_opt"] <= s_ceiling * (1.0 + 1e-6)
+        assert res["s_opt"] == pytest.approx(res["max_vol"]["s"], rel=1e-12)
+        assert float(m.s) == pytest.approx(res["max_vol"]["s"], rel=1e-4)
         # Both problems are reported.
-        assert res["max_s"]["y_bar"] is not None       # ȳ_c
-        assert res["max_s"]["norm_H"] >= 0.0
+        assert res["max_vol"]["volume"] > 0.0
+        assert res["max_vol"]["y_bar"] is not None       # ȳ_c
+        assert res["max_vol"]["norm_H"] >= 0.0
         assert res["coverage"]["reason"] == "ok"
         assert res["coverage"]["y_bar"] is not None    # ȳ_f
         # ȳ_c = output_std * s * sqrt(CPCᵀ) matches the written-back model.
         ybar_model = float(m.output_std * m.s * torch.sqrt(m.C @ m.P @ m.C.T)[0, 0])
-        assert ybar_model == pytest.approx(res["max_s"]["y_bar"], rel=1e-4)
+        assert ybar_model == pytest.approx(res["max_vol"]["y_bar"], rel=1e-4)
 
     def test_coverage_tightest_matches_sweep(self):
         m = _make_model(s_value=0.5)
@@ -369,16 +397,16 @@ class TestPostProcess:
         assert res["success"]
         assert res["coverage"]["reason"] == "y_max_unset"
         assert res["coverage"]["y_bar"] is None
-        assert res["max_s"]["coverage_ok"] is None
+        assert res["max_vol"]["coverage_ok"] is None
 
     def test_coverage_ok_when_image_covers_level(self):
-        """The MaxS image easily covers a tiny demanded level -> coverage_ok."""
+        """The MaxVol image easily covers a tiny demanded level -> coverage_ok."""
         m = _make_model(s_value=0.5)
         res = m.post_process(y_max=1e-3, n_grid=8)
-        assert res["max_s"]["coverage_ok"] is True
+        assert res["max_vol"]["coverage_ok"] is True
 
-    def test_coverage_unreachable_reported_but_maxs_succeeds(self):
-        """A level beyond reach on the band: MaxS (operative) still succeeds; the
+    def test_coverage_unreachable_reported_but_maxvol_succeeds(self):
+        """A level beyond reach on the band: MaxVol (operative) still succeeds; the
         coverage sweep honestly reports it cannot certify y_max."""
         m = _make_model(s_value=0.5)
         res = m.post_process(y_max=1e6, n_grid=8, s_min=0.1, s_max=20.0)
@@ -387,18 +415,39 @@ class TestPostProcess:
         assert res["coverage"]["y_bar"] is None
 
     def test_coverage_sweep_is_pure(self):
-        """_coverage_sweep must not mutate the model (post_process applies MaxS,
-        not the sweep result)."""
+        """coverage_sweep runs on a synthesizer snapshot and must not mutate the
+        model (post_process applies MaxVol, not the sweep result)."""
         m = _make_model(s_value=0.5)
         before = (m.P.detach().clone(), m.s.detach().clone(), m.L.detach().clone())
-        out = m._coverage_sweep(0.5, n_grid=8, s_min=0.1, s_max=20.0)
-        assert out is not None and out["y_f"] is not None
-        assert out["y_f"] == pytest.approx(
-            min(c["y_bar"] for c in out["sweep"] if c["y_bar"] is not None)
+        out = _synth(m).coverage_sweep(0.5, n_grid=8, s_min=0.1, s_max=20.0)
+        assert out is not None and out.y_f is not None
+        assert out.y_f == pytest.approx(
+            min(c.y_bar for c in out.sweep if c.y_bar is not None)
         )
         assert torch.equal(m.P, before[0])
         assert torch.equal(m.s, before[1])
         assert torch.equal(m.L, before[2])
+
+
+@requires_mosek
+class TestGlobalModelCoverage:
+    """learn_L=False (L=0, globally stable): the coverage SDP must run without
+    building the degenerate locality LMIs and must return the fixed L=0."""
+
+    def test_coverage_sdp_runs_for_global_model(self):
+        m = _make_global_model(s_value=1.0)
+        sol = _synth(m).coverage_at_s(s=1.0, y_max=0.5)
+        assert sol is not None
+        assert np.allclose(sol.L, 0.0)  # fixed coupling returned unchanged
+        assert sol.y_bar is not None and sol.y_bar > 0.0
+
+    def test_post_process_with_coverage_for_global_model(self):
+        m = _make_global_model(s_value=1.0)
+        res = m.post_process(y_max=0.5, n_grid=8, s_min=0.1, s_max=5.0)
+        assert res["success"]
+        assert res["constraints_satisfied"]
+        assert res["s_opt"] == pytest.approx(1.0, rel=1e-9)  # s stays fixed
+        assert res["max_vol"]["norm_H"] == pytest.approx(0.0, abs=1e-9)  # H = L P^-1 = 0
 
 
 def test_init_config_flag_defaults_on():
@@ -406,6 +455,16 @@ def test_init_config_flag_defaults_on():
     from sysid.config import InitializationConfig
     assert InitializationConfig().init_s_from_conditions is True
     assert InitializationConfig(init_s_from_conditions=False).init_s_from_conditions is False
+
+
+def test_c2_calibration_config_defaults():
+    """C2-std calibration is on by default (eps=0.05); can be disabled."""
+    from sysid.config import InitializationConfig
+    cfg = InitializationConfig()
+    assert cfg.calibrate_c2_for_coverage is True
+    assert cfg.calibrate_c2_eps == 0.05
+    assert cfg.calibrate_c2_max_iter == 30
+    assert InitializationConfig(calibrate_c2_for_coverage=False).calibrate_c2_for_coverage is False
 
 
 @requires_mosek

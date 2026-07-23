@@ -335,8 +335,12 @@ def main():
     logger.info("Creating model...")
     print("Creating model...")
     model = create_model(config, delta, max_norm_x0)
+    init_report = None
     if isinstance(model, SimpleLure):
-        model.initialize_parameters(
+        # initialize_parameters returns an InitializationReport; it runs before the
+        # mlflow run starts, so we hold it and log initialization/* metrics inside
+        # the run block below.
+        init_report = model.initialize_parameters(
             train_inputs,
             train_states,
             train_outputs,
@@ -422,6 +426,13 @@ def main():
             logger.info(f"Wrote run_id to {run_id_out_path}")
         mlflow.log_param("total_parameters", total_params)
         mlflow.log_param("trainable_parameters", trainable_params)
+
+        # Certificate established at initialization (MaxVol + optional C2
+        # calibration). initialize_parameters runs before the run starts, so the
+        # report is logged here under the initialization/ metric namespace.
+        if init_report is not None:
+            for name, value in init_report.to_metrics().items():
+                mlflow.log_metric(f"initialization/{name}", value)
 
         # Update directories to include run_id for better organization
         run_model_dir = Path(model_dir) / run_id

@@ -18,7 +18,7 @@ from tqdm import tqdm  # type: ignore[import-untyped]
 from ..evaluation.evaluator import Evaluator
 from ..models.base import BaseRNN
 from ..models.constrained_rnn import SimpleLure
-from ..utils import plot_predictions, plot_safe_set_trajectories
+from ..utils import plot_predictions, plot_safe_set_trajectories, get_volume_of_ellipsoid
 
 
 class Trainer:
@@ -447,6 +447,15 @@ class Trainer:
             # warmup_steps would expire, and they share x0 with the model
             # so there is no transient to discard.
             pred_loss_div = self.loss_fn(e_hat, e)
+
+            if self.regularization_weight > 0:
+                # feasibility loss
+                reg_feasibility_loss = self.model.get_regularization_loss()
+                # reg_feasibility_loss = torch.tensor(0.0)
+                reg_feasibility_value = reg_feasibility_loss.item()
+
+                loss = pred_loss_div + self.regularization_weight * reg_feasibility_loss
+
             loss = pred_loss_div
             loss.backward()
 
@@ -927,6 +936,11 @@ class Trainer:
                     alpha = 1/(1+ np.exp(-self.model.tau.cpu().detach().numpy()))
                     mlflow.log_metric("s", self.model.s.item(), step=epoch)
                     mlflow.log_metric("alpha", alpha, step=epoch)
+                    s = float(self.model.s.cpu().detach().numpy())
+                    P = self.model.P.cpu().detach().numpy()
+                    vol_X = get_volume_of_ellipsoid(P, s)
+                    mlflow.log_metric("vol_X", vol_X, step=epoch)
+                    logging.debug(f"Epoch {epoch}: s={s:.6f}, ||P|| = {np.linalg.norm(P):.6f}, vol(Xc)={vol_X:.6e}, alpha={alpha:.6f}")
 
             # Plot trajectories and ellipse periodically (at checkpoint frequency)
             if (epoch + 1) % self.checkpoint_frequency == 0:

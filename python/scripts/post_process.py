@@ -108,6 +108,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--rv-initial-state-scale",
+        type=float,
+        default=2.0,
+        help=(
+            "Radius scale for the initial-state-violation regime: x0 is sampled "
+            "on the ellipse scaled by this factor (radius = scale * s / alpha). "
+            "<1 stays inside the safe ellipse; >=1 violates the initial-state bound."
+        ),
+    )
+    parser.add_argument(
         "--rv-num-trajectories",
         type=int,
         default=4,
@@ -277,7 +287,7 @@ def main():
         # --- Baseline: input condition under the ORIGINAL (trained) certificate
         n_stable_orig, n_unstable_orig = check_input_condition(
             model, u_train_n, x0_train, warmup_steps, run_output_dir,
-            tag="orig", title="Original training trajectories",
+            tag="orig", title="Original training trajectories",horizon=10
         )
         mlflow.log_metric("post_process/orig/stable_train_trajectories", n_stable_orig)
         mlflow.log_metric("post_process/orig/unstable_train_trajectories", n_unstable_orig)
@@ -289,9 +299,10 @@ def main():
         # Post-processing: solve the two (now cleanly separated) certificate
         # SDPs and set the model to the LARGEST invariant set. See
         # SimpleLure.post_process for the full description:
-        #   Problem 1 (MaxS, _max_s_sdp): max feasible s -> the operative
-        #       certificate written back into the model. Reports ȳ_c, ‖H‖, s
-        #       and whether the coverage floor (σ·s)²·CPCᵀ ≥ y_max² holds.
+        #   Problem 1 (MaxVol, _max_vol_sdp): max ellipsoid volume sⁿˣ·√(det P)
+        #       over the s-sweep -> the operative certificate written back into
+        #       the model. Reports the volume, ȳ_c, ‖H‖, s (and the MaxS ceiling
+        #       s_feas) and whether the coverage floor (σ·s)²·CPCᵀ ≥ y_max² holds.
         #   Problem 2 (coverage sweep, _coverage_sdp over a grid of s): the
         #       tightest coverage ȳ_f (reported only, not applied).
         # ------------------------------------------------------------------
@@ -301,21 +312,24 @@ def main():
             logger.error(f"Post-processing failed: {result.get('status', 'unknown')}")
             sys.exit(1)
 
-        max_s = result["max_s"]
+        max_vol = result["max_vol"]
         cov = result["coverage"]
 
-        # Problem 1 — max-feasible-s certificate (operative; largest invariant set).
+        # Problem 1 — max-volume certificate (operative; largest invariant set).
         logger.info(
-            f"[Problem 1: MaxS] y_bar (ȳ_c)={max_s['y_bar']}, s={max_s['s']:.4f}, "
-            f"norm_H={max_s['norm_H']:.4f}, coverage_ok={max_s['coverage_ok']}"
+            f"[Problem 1: MaxVol] volume={max_vol['volume']:.3e}, y_bar (ȳ_c)={max_vol['y_bar']}, "
+            f"s={max_vol['s']:.4f} (ceiling s_feas={max_vol['s_feas']:.4f}), "
+            f"norm_H={max_vol['norm_H']:.4f}, coverage_ok={max_vol['coverage_ok']}"
         )
-        mlflow.log_metric("post_process/max_s/s", max_s["s"])
-        mlflow.log_metric("post_process/max_s/norm_H", max_s["norm_H"])
-        mlflow.log_metric("post_process/max_s/max_eig_F", max_s["max_eig_F"])
-        if max_s["y_bar"] is not None:
-            mlflow.log_metric("post_process/max_s/y_bar", max_s["y_bar"])  # ȳ_c
-        if max_s["coverage_ok"] is not None:
-            mlflow.log_metric("post_process/max_s/coverage_ok", int(max_s["coverage_ok"]))
+        mlflow.log_metric("post_process/max_vol/volume", max_vol["volume"])
+        mlflow.log_metric("post_process/max_vol/s", max_vol["s"])
+        mlflow.log_metric("post_process/max_vol/s_feas", max_vol["s_feas"])
+        mlflow.log_metric("post_process/max_vol/norm_H", max_vol["norm_H"])
+        mlflow.log_metric("post_process/max_vol/max_eig_F", max_vol["max_eig_F"])
+        if max_vol["y_bar"] is not None:
+            mlflow.log_metric("post_process/max_vol/y_bar", max_vol["y_bar"])  # ȳ_c
+        if max_vol["coverage_ok"] is not None:
+            mlflow.log_metric("post_process/max_vol/coverage_ok", int(max_vol["coverage_ok"]))
 
         # Problem 2 — tightest coverage over the s-grid (report only).
         logger.info(
@@ -333,13 +347,13 @@ def main():
         )
         mlflow.log_metric("post_process/y_max", result["y_max"])
 
-        # --- Test on the training data under the APPLIED (MaxS) certificate ----
+        # --- Test on the training data under the APPLIED (MaxVol) certificate --
         n_stable_opt, n_unstable_opt = check_input_condition(
             model, u_train_n, x0_train, warmup_steps, run_output_dir,
-            tag="opt", title="Post-processed (MaxS) training trajectories",
+            tag="opt", title="Post-processed (MaxVol) training trajectories",horizon=10
         )
-        mlflow.log_metric("post_process/opt_stable_train_trajectories", n_stable_opt)
-        mlflow.log_metric("post_process/opt_unstable_train_trajectories", n_unstable_opt)
+        mlflow.log_metric("post_process/opt/stable_train_trajectories", n_stable_opt)
+        mlflow.log_metric("post_process/opt/unstable_train_trajectories", n_unstable_opt)
 
         # Log parameters
         mlflow.log_param("post_processing", True)
@@ -355,9 +369,10 @@ def main():
                else np.zeros((model.nz, model.nx))),
             s=model.s.cpu().detach().numpy(),
             alpha=alpha,
-            y_c=np.nan if max_s["y_bar"] is None else max_s["y_bar"],
+            y_c=np.nan if max_vol["y_bar"] is None else max_vol["y_bar"],
             y_f=np.nan if cov["y_bar"] is None else cov["y_bar"],
-            norm_H=max_s["norm_H"],
+            volume=max_vol["volume"],
+            norm_H=max_vol["norm_H"],
             y_max=y_max_train,
             A=model.A.cpu().detach().numpy(),
             B=model.B.cpu().detach().numpy(),
@@ -427,6 +442,7 @@ def main():
                 factors=list(args.rv_violation_factors),
                 n_traj=args.rv_num_trajectories,
                 horizon=args.rv_horizon,
+                initial_state_scale=args.rv_initial_state_scale,
             )
         except Exception as e:
             logger.warning(f"Regional verification failed: {e}", exc_info=True)
