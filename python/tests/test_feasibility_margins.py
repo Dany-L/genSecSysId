@@ -12,6 +12,19 @@ import torch
 
 from sysid.models.constrained_rnn import SimpleLure
 
+# The ``s > 0`` scalar inequality is currently commented out in
+# ``SimpleLure.get_scalar_inequalities`` (see constrained_rnn.py): its ``-log s``
+# barrier drove s -> 0 on its own (nothing in the prediction loss pulls back).
+# The agreed replacement is a hard coverage-floor LMI whose barrier counter-
+# pushes s up, but that is not implemented yet. Until then no scalar inequality
+# is registered, so ``get_feasibility_margins`` emits no ``scalar_0`` key and the
+# tests that assert on it fail. These are expected-fail markers, not bugs —
+# revisit (and rewrite against the coverage-floor LMI margin) once it lands.
+_SCALAR_INEQ_DISABLED = (
+    "s>0 scalar inequality disabled pending hard coverage-floor LMI; "
+    "no scalar_0 margin is produced (see get_scalar_inequalities)"
+)
+
 
 def _make_feasible_model(s_value: float = 0.05) -> SimpleLure:
     """A small, stable Lure system that satisfies its constraints."""
@@ -28,6 +41,7 @@ def _make_feasible_model(s_value: float = 0.05) -> SimpleLure:
 
 
 class TestFeasibilityMargins:
+    @pytest.mark.xfail(reason=_SCALAR_INEQ_DISABLED, strict=True)
     def test_returns_expected_keys(self):
         """Dict exposes the aggregate plus one entry per constraint."""
         m = _make_feasible_model()
@@ -61,6 +75,7 @@ class TestFeasibilityMargins:
         assert m.check_constraints() is True
         assert m.get_feasibility_margins()["min_eig"] > 0
 
+    @pytest.mark.xfail(reason=_SCALAR_INEQ_DISABLED, strict=True)
     def test_infeasible_scalar_gives_negative_margin(self):
         """Violating s > 0 flips min_eig negative, consistent with the check."""
         m = _make_feasible_model()
@@ -72,6 +87,7 @@ class TestFeasibilityMargins:
         assert margins["min_eig"] < 0
         assert m.check_constraints() is False
 
+    @pytest.mark.xfail(reason=_SCALAR_INEQ_DISABLED, strict=True)
     def test_min_eig_tracks_binding_constraint(self):
         """min_eig follows whichever constraint is closest to its boundary.
 

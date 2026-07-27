@@ -26,16 +26,16 @@ import matplotlib.pyplot as plt
 
 from sysid.config import resolve_run_artifacts, setup_mlflow_tracking
 from sysid.data.direct_loader import load_csv_folder
-from sysid.evaluation import get_true_dynamics, list_true_dynamics
-from sysid.models import SimpleLure, SimpleLureSafe, load_model
-from sysid.data import DataNormalizer
-from sysid.utils import (
-    max_abs_output,
-    plot_ellipse,
-    plot_ellipse_and_parallelogram,
-    plot_polytope,
-    plot_safe_set_trajectories,
+from sysid.evaluation import (
+    check_input_condition,
+    list_true_dynamics,
+    plot_post_process_trajectories,
+    regional_verification,
+    simulate_model,
 )
+from sysid.models import SimpleLure, load_model
+from sysid.data import DataNormalizer
+from sysid.utils import max_abs_output
 
 torch.set_default_dtype(torch.float64)
 
@@ -46,420 +46,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATA_ROOT = "~/genSecSysId-Data"
-
-
-
-def _simulate(model, u, x0, warmup_steps):
-    """Run model dynamics for diagnostic plots.
-
-    For SimpleLureSafe we explicitly bypass the safety filter so that the
-    constraint margin c reflects raw behavior (the filter would otherwise
-    prevent any violation by construction, making the plots uninformative).
-    """
-    if isinstance(model, SimpleLureSafe):
-        return model.forward_unfiltered(u, x0)
-    return model(u, x0, warmup_steps=warmup_steps)
-
-
-def _make_lp_noise(rng, T, amp_max, f_cut=2.0, order=4, Ts=0.05):
-    """Butterworth-LP-filtered white noise, peak-normalised to ``amp_max``.
-
-    Mirrors the input excitation used during data generation in
-    ``scripts/duffing/duffing_benchmark.ipynb`` so regional verification stays
-    consistent with how training trajectories were created.
-    """
-    from scipy.signal import butter, filtfilt
-
-    b, a = butter(order, f_cut / (0.5 / Ts), btype="low")
-    pad = 4 * order
-    noise = rng.standard_normal(T + pad)
-    u = filtfilt(b, a, noise)[pad:]
-    peak = float(np.max(np.abs(u)))
-    if peak <= 0.0:
-        return u
-    return (u / peak) * amp_max
-
-
-def _sample_on_ellipsoid(rng, X, radius, n):
-    """Sample ``n`` points ``x`` uniformly on ``{x : x^T X x = radius^2}``."""
-    nx = X.shape[0]
-    L = np.linalg.cholesky(X)  # X = L @ L.T (lower)
-    z = rng.standard_normal((n, nx))
-    z /= np.linalg.norm(z, axis=1, keepdims=True)
-    z *= radius
-    # solve L.T @ x = z.T  =>  x = solve(L.T, z.T).T
-    return np.linalg.solve(L.T, z.T).T
-
-
-def _fidelity_check(
-    model, normalizer, spec, run_output_dir, run_id, *,
-    P, L, X, s, alpha, Ts, n_traj, horizon, rng,
-):
-    """Sanity-check overlap between model and true dynamics on SAFE inputs.
-
-    Generates trajectories with small initial state (well inside the safe
-    ellipse) and modest LP-filtered input (well inside the input bound), then
-    overlays model and true-dynamics state trajectories so the user can verify
-    the identification is faithful before reading the divergence experiments.
-    """
-    rad_x0 = 0.8 * s / max(alpha, 1e-12)
-    amp = 0.1 * s
-    x0 = _sample_on_ellipsoid(rng, X, radius=rad_x0, n=n_traj)
-    u_n = np.stack(
-        [_make_lp_noise(rng, horizon, amp_max=amp, Ts=Ts) for _ in range(n_traj)]
-    )
-
-    u_t = torch.tensor(u_n[..., None], dtype=torch.float64)
-    x0_t = torch.tensor(x0, dtype=torch.float64)
-    with torch.no_grad():
-        _, (xs_model_t, _), _ = _simulate(model, u_t, x0_t, warmup_steps=0)
-    xs_model = xs_model_t.cpu().detach().numpy()
-
-    u_phys = normalizer.inverse_transform_inputs(u_n[..., None]).squeeze(-1)
-    xs_true = []
-    for x0_p, u_p in zip(x0, u_phys):
-        X_true, _, _ = spec.simulate(x0_p, u_p)
-        xs_true.append(X_true)
-
-    rmses = []
-    for x_m, x_t in zip(xs_model, xs_true):
-        T = min(len(x_m), len(x_t))
-        rmses.append(float(np.sqrt(np.mean((x_m[:T] - x_t[:T]) ** 2))))
-    rmse_mean = float(np.mean(rmses))
-    mlflow.log_metric("regional_verification/fidelity/state_rmse", rmse_mean)
-    logger.info(
-        f"  [fidelity] mean state RMSE (model vs true, safe regime): {rmse_mean:.4f}"
-    )
-
-    if model.nx != 2:
-        return rmse_mean
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-    ax_phase = axes[0]
-    H = L @ X
-    plot_ellipse_and_parallelogram(
-        X, H, s, None, ax=ax_phase, show=False, fill_polytope=True,
-    )
-    n_label = min(3, n_traj)
-    for i, (x_m, x_t) in enumerate(zip(xs_model, xs_true)):
-        color = f"C{i}"
-        T = min(len(x_m), len(x_t))
-        ax_phase.plot(
-            x_m[:T, 0], x_m[:T, 1],
-            color=color, lw=1.5,
-            label=(f"model #{i}" if i < n_label else None),
-        )
-        ax_phase.plot(
-            x_t[:T, 0], x_t[:T, 1],
-            color=color, lw=1.0, ls="--",
-            label=(f"true #{i}" if i < n_label else None),
-        )
-        ax_phase.plot(x_m[0, 0], x_m[0, 1], "o", color=color, ms=5)
-    ax_phase.set_xlabel(r"$x_1$")
-    ax_phase.set_ylabel(r"$x_2$")
-    ax_phase.set_title(
-        f"Fidelity check – safe regime\n"
-        f"|x0|_X={rad_x0:.3g}, peak‖u_n‖={amp:.3g}, mean RMSE={rmse_mean:.4f}"
-    )
-    ax_phase.legend(loc="best", fontsize=8)
-    ax_phase.grid(alpha=0.3)
-
-    ax_ts = axes[1]
-    for i, (x_m, x_t) in enumerate(zip(xs_model, xs_true)):
-        color = f"C{i}"
-        T = min(len(x_m), len(x_t))
-        t = np.arange(T) * Ts
-        ax_ts.plot(
-            t, x_m[:T, 0], color=color, lw=1.5,
-            label=(f"model #{i}" if i < n_label else None),
-        )
-        ax_ts.plot(
-            t, x_t[:T, 0], color=color, lw=1.0, ls="--",
-            label=(f"true #{i}" if i < n_label else None),
-        )
-    ax_ts.set_xlabel("time [s]")
-    ax_ts.set_ylabel(r"$x_1$")
-    ax_ts.set_title("Position vs time (solid: model, dashed: true)")
-    ax_ts.legend(loc="best", fontsize=8)
-    ax_ts.grid(alpha=0.3)
-
-    plot_path = run_output_dir / f"rv_fidelity_{run_id[:8]}.png"
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    mlflow.log_figure(fig, f"regional_verification/{plot_path.name}")
-    plt.close(fig)
-    logger.info(f"  [fidelity] plot saved to {plot_path}")
-    return rmse_mean
-
-
-def regional_verification(
-    model,
-    normalizer,
-    run_output_dir,
-    run_id,
-    true_dynamics_name,
-    config,
-    factors,
-    n_traj,
-    horizon,
-):
-    """Verify the model's regional-stability character.
-
-    Drives the (post-processed) model with input/initial-state combinations
-    that violate the learned regional constraint
-    ``α² xᵀ X x + ‖u‖² ≤ s²`` (with ``X = P⁻¹``, ``α = σ(τ)``) and reports
-    whether the model diverges. When ``true_dynamics_name`` is provided, the
-    same trajectories are simulated through the registered ground-truth model
-    and divergence agreement is logged as well.
-
-    Two regimes are run:
-      * **Input violation** — ``x0`` inside the ellipse, LP-filtered noise
-        excitation with peak ``factor · s`` (``factor < 1`` is a sanity
-        baseline, ``factor ≥ 1`` violates the input bound).
-      * **Initial-state violation** — ``x0`` outside the ellipse (radius
-        ``2 · s/α`` along the ellipse axes), modest LP-filtered excitation
-        within the input bound.
-    """
-    nx = model.nx
-    nd = getattr(model, "nd", 1)
-    if nd != 1:
-        logger.warning(
-            f"Regional verification currently builds scalar LP-noise excitation; "
-            f"model has nd={nd} input channels. Skipping."
-        )
-        return
-
-    if model.learn_L:
-        s = float(model.s.detach().cpu().numpy())
-    else:
-        s = 5.0
-    alpha = float(torch.sigmoid(model.tau.detach()).cpu().numpy())
-    P = model.P.detach().cpu().numpy()
-    L = model.L.detach().cpu().numpy()
-    X = np.linalg.inv(P)
-
-    Ts = getattr(config.data, "sampling_time", 0.05)
-    seed = getattr(config, "seed", 0) or 0
-    rng = np.random.default_rng(seed + 17)
-
-    # Validate true-dynamics compatibility, if requested.
-    spec = None
-    if true_dynamics_name is not None:
-        spec = get_true_dynamics(true_dynamics_name)
-        if spec.state_dim != nx:
-            logger.warning(
-                f"True-dynamics '{true_dynamics_name}' has state_dim={spec.state_dim} "
-                f"but model.nx={nx}. Skipping ground-truth comparison."
-            )
-            spec = None
-
-    # ------------------------------------------------------------------
-    # Fidelity sanity-check (only when true dynamics are available):
-    # confirm that on safe (non-violating) trajectories the identified
-    # model overlaps the true system. If the dashed (true) and solid
-    # (model) curves disagree here, the divergence comparisons below
-    # cannot be interpreted as evidence of (mis)matched regional
-    # stability — fix the identification first.
-    # ------------------------------------------------------------------
-    if spec is not None:
-        try:
-            _fidelity_check(
-                model, normalizer, spec, run_output_dir, run_id,
-                P=P, L=L, X=X, s=s, alpha=alpha, Ts=Ts,
-                n_traj=min(5, n_traj), horizon=horizon, rng=rng,
-            )
-        except Exception as e:
-            logger.warning(f"Fidelity check failed: {e}", exc_info=True)
-
-    # ------------------------------------------------------------------
-    # Build trajectories (normalized input space; states are physical)
-    # ------------------------------------------------------------------
-    in_amps = [float(f) * s for f in factors]                  # per-factor peak ‖u_n‖
-    in_x0 = _sample_on_ellipsoid(rng, X, radius=0.2 * s / max(alpha, 1e-12), n=n_traj)
-    in_u_per_factor = [
-        np.stack([_make_lp_noise(rng, horizon, amp_max=amp, Ts=Ts) for _ in range(n_traj)])
-        for amp in in_amps
-    ]  # list of (n_traj, horizon)
-
-    st_x0 = _sample_on_ellipsoid(rng, X, radius=2 * s / max(alpha, 1e-12), n=n_traj)
-    st_u = np.stack(
-        [_make_lp_noise(rng, horizon, amp_max=0.01 * s, Ts=Ts) for _ in range(n_traj)]
-    )
-
-    DIVERGE_THRESHOLD = 10
-
-    def _run(model, u_n, x0):
-        """Simulate model on (u_n, x0) and return (xs, c, diverged_flag) per traj."""
-        u_t = torch.tensor(u_n, dtype=torch.float64)
-        if u_t.dim() == 2:
-            u_t = u_t.unsqueeze(-1)  # (B, T, 1)
-        x0_t = torch.tensor(x0, dtype=torch.float64)
-        with torch.no_grad():
-            _, (xs, _), u_used = _simulate(model, u_t, x0_t, warmup_steps=0)
-            _, c = model.get_regularization_input(u_used, xs, return_c=True)
-        xs_np = xs.cpu().detach().numpy()
-        c_np = c.cpu().detach().numpy()
-        # Divergence: any |state| > threshold OR non-finite anywhere.
-        max_abs = np.nanmax(np.abs(np.where(np.isfinite(xs_np), xs_np, np.nan)),
-                            axis=(1, 2))
-        any_nan = ~np.isfinite(xs_np).all(axis=(1, 2))
-        diverged = (max_abs > DIVERGE_THRESHOLD) | any_nan
-        return xs_np, c_np, diverged
-
-    # Concatenate input-violation trajectories across factors for a single
-    # combined plot, while keeping per-factor metrics.
-    in_results = []
-    for amp, u_n in zip(in_amps, in_u_per_factor):
-        xs_np, c_np, diverged = _run(model, u_n, in_x0)
-        in_results.append((amp, u_n, xs_np, c_np, diverged))
-    st_xs, st_c, st_diverged = _run(model, st_u, st_x0)
-
-    # ------------------------------------------------------------------
-    # Optional: simulate the same (x0, u) through the true dynamics
-    # ------------------------------------------------------------------
-    in_true = None  # list of (true_xs (n_traj, T+1, nx), true_diverged (n_traj,))
-    st_true = None
-    if spec is not None:
-        in_true = []
-        for amp, u_n, *_ in in_results:
-            u_phys = normalizer.inverse_transform_inputs(u_n[..., None]).squeeze(-1)
-            xs_list, div_list = [], []
-            for x0_p, u_p in zip(in_x0, u_phys):
-                X_true, _, div = spec.simulate(x0_p, u_p, diverge_thresh=DIVERGE_THRESHOLD)
-                xs_list.append(X_true)
-                div_list.append(div)
-            in_true.append((np.array(div_list), xs_list))
-
-        u_phys_st = normalizer.inverse_transform_inputs(st_u[..., None]).squeeze(-1)
-        xs_list, div_list = [], []
-        for x0_p, u_p in zip(st_x0, u_phys_st):
-            X_true, _, div = spec.simulate(x0_p, u_p, diverge_thresh=DIVERGE_THRESHOLD)
-            xs_list.append(X_true)
-            div_list.append(div)
-        st_true = (np.array(div_list), xs_list)
-
-    # ------------------------------------------------------------------
-    # Metrics
-    # ------------------------------------------------------------------
-    for idx, ((amp, _, _, _, diverged), factor) in enumerate(zip(in_results, factors)):
-        tag = f"f{factor:.2f}".replace(".", "p")
-        mlflow.log_metric(
-            f"regional_verification/input/{tag}/model_diverged_frac",
-            float(diverged.mean()),
-        )
-        if in_true is not None:
-            true_div = in_true[idx][0]
-            mlflow.log_metric(
-                f"regional_verification/input/{tag}/true_diverged_frac",
-                float(true_div.mean()),
-            )
-            mlflow.log_metric(
-                f"regional_verification/input/{tag}/agreement",
-                float((diverged == true_div).mean()),
-            )
-        logger.info(
-            f"  [input violation, factor={factor:.2f}] model_diverged="
-            f"{int(diverged.sum())}/{n_traj}"
-            + (
-                f", true_diverged={int(in_true[idx][0].sum())}/{n_traj}"
-                if in_true is not None
-                else ""
-            )
-        )
-
-    mlflow.log_metric(
-        "regional_verification/state/model_diverged_frac",
-        float(st_diverged.mean()),
-    )
-    if st_true is not None:
-        true_div_st, _ = st_true
-        mlflow.log_metric(
-            "regional_verification/state/true_diverged_frac",
-            float(true_div_st.mean()),
-        )
-        mlflow.log_metric(
-            "regional_verification/state/agreement",
-            float((st_diverged == true_div_st).mean()),
-        )
-    logger.info(
-        f"  [state violation] model_diverged={int(st_diverged.sum())}/{n_traj}"
-        + (
-            f", true_diverged={int(st_true[0].sum())}/{n_traj}"
-            if st_true is not None
-            else ""
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # Plots (only meaningful for nx == 2)
-    # ------------------------------------------------------------------
-    if nx != 2:
-        logger.info(
-            f"Skipping regional-verification plots (nx={nx}, plots are 2D only)."
-        )
-        return
-
-    N = 400
-    # Combine all input-violation trajectories into one figure.
-    xs_all = np.concatenate([r[2][:,:N,:] for r in in_results], axis=0)
-    c_all = np.concatenate([r[3][:,:N] for r in in_results], axis=0)
-    fig_in, ax_in, n_stab_in, n_unst_in = plot_safe_set_trajectories(
-        P=P, L=L, s=s,
-        x_traj=xs_all,
-        c=c_all,
-        warmup_steps=0,
-        horizon=horizon,
-    )
-    if in_true is not None:
-        labelled = False
-        for (true_div, xs_list) in in_true:
-            for X_true in xs_list:
-                ax_in.plot(
-                    X_true[:N, 0], X_true[:N, 1],
-                    color="k", lw=1.0, alpha=0.5,
-                    label=("true dynamics" if not labelled else None),
-                )
-                labelled = True
-        ax_in.legend(loc="upper right", fontsize=8)
-    factor_summary = ",".join(f"{f:g}" for f in factors)
-    ax_in.set_title(f"Regional verification – input violation (factors {factor_summary})")
-    ax_in.set_xlim(-2.5, 2.5)
-    ax_in.set_ylim(-2.5, 2.5)
-    in_plot = run_output_dir / f"rv_input_{run_id[:8]}.png"
-    fig_in.savefig(in_plot, dpi=150, bbox_inches="tight")
-    mlflow.log_figure(fig_in, f"regional_verification/{in_plot.name}")
-    plt.close(fig_in)
-
-    fig_st, ax_st, n_stab_st, n_unst_st = plot_safe_set_trajectories(
-        P=P, L=L, s=s,
-        x_traj=st_xs[:,:N,:],
-        c=st_c,
-        warmup_steps=0,
-        horizon=horizon,
-    )
-    if st_true is not None:
-        labelled = False
-        for X_true in st_true[1]:
-            ax_st.plot(
-                X_true[:N, 0], X_true[:N, 1],
-                color="k", lw=1.0, alpha=0.5,
-                label=("true dynamics" if not labelled else None),
-            )
-            labelled = True
-        ax_st.legend(loc="upper right", fontsize=8)
-    ax_st.set_title("Regional verification – initial-state violation")
-    ax_st.set_xlim(-3.5, 3.5)
-    ax_st.set_ylim(-3.5, 3.5)
-    st_plot = run_output_dir / f"rv_state_{run_id[:8]}.png"
-    fig_st.savefig(st_plot, dpi=150, bbox_inches="tight")
-    mlflow.log_figure(fig_st, f"regional_verification/{st_plot.name}")
-    plt.close(fig_st)
-
-    logger.info(
-        f"Regional verification: input plot {in_plot.name} "
-        f"({n_stab_in} stable, {n_unst_in} violating); "
-        f"state plot {st_plot.name} ({n_stab_st} stable, {n_unst_st} violating)."
-    )
 
 
 def parse_args():
@@ -519,6 +105,16 @@ def parse_args():
         help=(
             "Peak-||u_n|| / s factors used for the input-violation regime. "
             "<1 stays inside the input bound (sanity baseline); >=1 violates."
+        ),
+    )
+    parser.add_argument(
+        "--rv-initial-state-scale",
+        type=float,
+        default=2.0,
+        help=(
+            "Radius scale for the initial-state-violation regime: x0 is sampled "
+            "on the ellipse scaled by this factor (radius = scale * s / alpha). "
+            "<1 stays inside the safe ellipse; >=1 violates the initial-state bound."
         ),
     )
     parser.add_argument(
@@ -669,253 +265,134 @@ def main():
         
         u_train_n = torch.tensor(normalizer.transform_inputs(train_inputs))
         b, N, _ = u_train_n.shape
-        x0_train = torch.zeros((b, model.nx))  # Start from origin
+        x0_train = torch.zeros((b, model.nx))  # start from origin
+        warmup_steps = getattr(config.training, "warmup_steps", 0)
 
-        # check input condition on training trajectories before post-processing
-        warmup_steps = config.training.warmup_steps if hasattr(config.training, "warmup_steps") else 0
-        with torch.no_grad():
-            _, (x_hat_train, _), u_safe = _simulate(model, u_train_n, x0_train, warmup_steps)
-            _, c_train = model.get_regularization_input(u_safe, x_hat_train, return_c=True, warmup_steps=warmup_steps)
-
-        c_train_np = c_train.cpu().detach().numpy()
-        x_hat_train_np = x_hat_train.cpu().detach().numpy()
-
-        fig, ax, count_stable_orig, count_unstable_orig = plot_safe_set_trajectories(
-            P=model.P.cpu().detach().numpy(),
-            L=model.L.cpu().detach().numpy(),
-            s=model.s.cpu().detach().numpy(),
-            x_traj=x_hat_train_np,
-            c=c_train_np,
-            warmup_steps=warmup_steps,
-            horizon=200,
-        )
-        ellipse_plot_name= Path(f"ellipse_polytope_post_train_orig_{args.run_id[:8]}.png")
-        ellipse_plot_path = Path(run_output_dir / ellipse_plot_name)
-        fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
-        mlflow.log_figure(fig, f'post_processing/{ellipse_plot_name}')
-        plt.close(fig)
-
-        logger.info(f"Original training trajectories: total={b}, stable={count_stable_orig}, unstable={count_unstable_orig}")
-        mlflow.log_metric("post_process/orig_stable_train_trajectories", count_stable_orig)
-        mlflow.log_metric("post_process/orig_unstable_train_trajectories", count_unstable_orig)
-
-        result = model.post_process()
-        
-        if not result["success"]:
-            logger.error(
-                f"Post-processing failed: {result.get('error', result.get('status', 'unknown'))}"
-            )
-            sys.exit(1)
-
-        # Extract results
-        summary = result["summary"]
-
-        # Log metrics to MLflow with post_process prefix
-        mlflow.log_metric(
-            "post_process/constraints_satisfied", int(result["constraints_satisfied"])
-        )
-        mlflow.log_metric("post_process/s_original", summary["original"]["s"])
-        mlflow.log_metric("post_process/s_optimized", summary["optimized"]["s"])
-        mlflow.log_metric("post_process/norm_P_original", summary["original"]["norm_P"])
-        mlflow.log_metric("post_process/norm_L_original", summary["original"]["norm_L"])
-        mlflow.log_metric("post_process/norm_H_original", summary["original"]["norm_H"])
-        mlflow.log_metric("post_process/max_eig_F", summary["optimized"]["max_eig_F"])
-        mlflow.log_metric("post_process/norm_P_optimized", summary["optimized"]["norm_P"])
-        mlflow.log_metric("post_process/norm_L_optimized", summary["optimized"]["norm_L"])
-        mlflow.log_metric("post_process/norm_H_optimized", summary["optimized"]["norm_H"])
-        y_bar = summary["optimized"]["y_bar_n"] * normalizer.output_std
-        mlflow.log_metric("post_process/y_bar", y_bar)
-
-        logger.info(f"Maximum output range (y_bar) after post-processing: {y_bar}")
-        # Physical safe output level from the training data. The model needs the
-        # output scale to relate its normalized C/P/s to this physical y_max.
+        # --- Physical safe output level from the training data ----------------
+        # y_max is physical (has meaning); output_std relates the model's
+        # normalized C/P/s to physical units for the coverage machinery.
         y_max_train = max_abs_output(train_outputs)
         output_std = float(np.asarray(normalizer.output_std).reshape(-1)[0])
         model.set_output_coverage_level(y_max_train, output_std)
-        logger.info(f"Maximum output value in training data: {y_max_train}")
+        logger.info(f"Maximum |output| in training data (physical y_max): {y_max_train:.4f}")
+        L_orig = model.L.cpu().detach().numpy()
+        P_orig = model.P.cpu().detach().numpy()
+        H_orig = L_orig @ np.linalg.inv(P_orig)
+        C_orig = model.C.cpu().detach().numpy()
+        s_orig = float(model.s.cpu().detach().numpy())
+        y_bar_orig = float(output_std * s_orig * np.sqrt((C_orig @ P_orig @ C_orig.T).item()))
+        logger.info(f"original s: {s_orig:.4f}, original ||H||: {float(np.linalg.norm(H_orig)):.4f} original y_bar: {y_bar_orig:.4f}")
         mlflow.log_metric("data/max_output_train", y_max_train)
 
-        # check how many training trajectories satisfy the input condition after post-processing
-        with torch.no_grad():
-            _, (x_hat_train, _), u_safe = _simulate(model, u_train_n, x0_train, warmup_steps)
-            _, c_train = model.get_regularization_input(u_safe, x_hat_train, return_c=True, warmup_steps=warmup_steps)
-
-        fig, ax, count_stable_post, count_unstable_post = plot_safe_set_trajectories(
-            P=model.P.cpu().detach().numpy(),
-            L=model.L.cpu().detach().numpy(),
-            s=model.s.cpu().detach().numpy(),
-            x_traj=x_hat_train.cpu().detach().numpy(),
-            c=c_train.cpu().detach().numpy(),
-            warmup_steps=warmup_steps,
-            horizon=200,
+        # --- Baseline: input condition under the ORIGINAL (trained) certificate
+        n_stable_orig, n_unstable_orig = check_input_condition(
+            model, u_train_n, x0_train, warmup_steps, run_output_dir,
+            tag="orig", title="Original training trajectories",horizon=10
         )
-        logger.info(f"Post-processed training trajectories: total={b}, stable={count_stable_post}, unstable={count_unstable_post}")
-        mlflow.log_metric("post_process/opt_stable_train_trajectories", count_stable_post)
-        mlflow.log_metric("post_process/opt_unstable_train_trajectories", count_unstable_post)
-
-    
-        ellipse_plot_name = Path(f"ellipse_polytope_post_train_opt_{args.run_id[:8]}.png")
-        ellipse_plot_path = Path(run_output_dir / ellipse_plot_name)
-        fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
-        mlflow.log_figure(fig, f'post_processing/{ellipse_plot_name}')
-        plt.close(fig)
+        mlflow.log_metric("post_process/orig/stable_train_trajectories", n_stable_orig)
+        mlflow.log_metric("post_process/orig/unstable_train_trajectories", n_unstable_orig)
+        mlflow.log_metric("post_process/orig/s", float(model.s.cpu().detach().numpy()))
+        mlflow.log_metric("post_process/orig/norm_H", float(np.linalg.norm(H_orig)))
+        mlflow.log_metric("post_process/orig/y_bar", y_bar_orig)
 
         # ------------------------------------------------------------------
-        # MinTrProb output certificate: sweep s over the preset band and select
-        # the tightest certified output interval [-y_bar, y_bar] (physical) with
-        # y_bar = y_max that also leaves zero input violations on the training
-        # data. Overwrites (P, L, s) with this final certificate.
+        # Post-processing: solve the two (now cleanly separated) certificate
+        # SDPs and set the model to the LARGEST regional invariant set. See
+        # SimpleLure.post_process for the full description:
+        #   Problem 1 (MaxS, max_s): max feasible s -> the operative certificate
+        #       written back into the model (well conditioned, moderate s).
+        #       Reports the ellipsoid volume, ȳ_c, ‖H‖, s and whether the coverage
+        #       floor (σ·s)²·CPCᵀ ≥ y_max² holds.
+        #   Problem 2 (coverage sweep over a grid of s): the tightest coverage ȳ_f
+        #       (reported only, not applied), plus ρ = vol(MaxS)/vol(cov).
         # ------------------------------------------------------------------
-        try:
-            cert = model.solve_output_coverage_certificate(
-                y_max=y_max_train,
-                inputs=u_train_n,
-                x0=x0_train,
-                warmup_steps=warmup_steps,
-            )
-            if cert["success"]:
-                logger.info(
-                    f"Output certificate: y_bar={cert['y_bar']} "
-                    f"(y_max={cert['y_max']}), s={cert['s']:.6f} "
-                    f"in [{cert['s_min']:.6f}, {cert['s_max']:.6f}], "
-                    f"input violations={cert['n_input_violations']}, "
-                    f"violation_free={cert['violation_free']}"
-                )
-                mlflow.log_metric("certificate/y_bar", cert["y_bar"])
-                mlflow.log_metric("certificate/y_max", cert["y_max"])
-                mlflow.log_metric("certificate/s", cert["s"])
-                mlflow.log_metric("certificate/s_min", cert["s_min"])
-                mlflow.log_metric("certificate/s_max", cert["s_max"])
-                mlflow.log_metric("certificate/n_input_violations", cert["n_input_violations"])
-                mlflow.log_metric("certificate/violation_free", int(bool(cert["violation_free"])))
-                mlflow.log_metric("certificate/constraints_satisfied", int(cert["constraints_satisfied"]))
-            else:
-                logger.warning(
-                    f"Output certificate not found: reason={cert['reason']} "
-                    f"(this theta cannot certify y_max={y_max_train})"
-                )
-                mlflow.log_metric("certificate/success", 0)
-                mlflow.log_param("certificate/failure_reason", cert["reason"])
-        except Exception as e:
-            logger.warning(f"Output-coverage certificate step failed: {e}", exc_info=True)
+        logger.info("Calling model.post_process()...")
+        result = model.post_process(y_max=y_max_train, n_grid=20)
+        if not result["success"]:
+            logger.error(f"Post-processing failed: {result.get('status', 'unknown')}")
+            sys.exit(1)
 
-        # Log parameter
+        max_s = result["max_s"]
+        cov = result["coverage"]
+
+        # Problem 1 — max-feasible-s certificate (operative; largest regional set).
+        logger.info(
+            f"[Problem 1: MaxS] volume={max_s['volume']:.3e}, y_bar (ȳ_c)={max_s['y_bar']}, "
+            f"s={max_s['s']:.4f}, norm_H={max_s['norm_H']:.4f}, "
+            f"coverage_ok={max_s['coverage_ok']}, rho={max_s['rho']}"
+        )
+        mlflow.log_metric("post_process/max_s/volume", max_s["volume"])
+        mlflow.log_metric("post_process/max_s/s", max_s["s"])
+        mlflow.log_metric("post_process/max_s/norm_H", max_s["norm_H"])
+        mlflow.log_metric("post_process/max_s/max_eig_F", max_s["max_eig_F"])
+        if max_s["y_bar"] is not None:
+            mlflow.log_metric("post_process/max_s/y_bar", max_s["y_bar"])  # ȳ_c
+        if max_s["coverage_ok"] is not None:
+            mlflow.log_metric("post_process/max_s/coverage_ok", int(max_s["coverage_ok"]))
+        if max_s["rho"] is not None:
+            mlflow.log_metric("post_process/max_s/rho", max_s["rho"])
+
+        # Problem 2 — tightest coverage over the s-grid (report only).
+        logger.info(
+            f"[Problem 2: coverage] y_bar (ȳ_f)={cov['y_bar']}, s={cov['s']}, "
+            f"reason={cov['reason']} "
+            f"(band [{cov['s_min']:.1f}, {cov['s_max']:.1f}], n_grid={cov['n_grid']})"
+        )
+        if cov["y_bar"] is not None:
+            mlflow.log_metric("post_process/coverage/y_bar", cov["y_bar"])  # ȳ_f
+            mlflow.log_metric("post_process/coverage/s", cov["s"])
+        mlflow.log_param("post_process/coverage_reason", cov["reason"])
+
+        mlflow.log_metric(
+            "post_process/constraints_satisfied", int(result["constraints_satisfied"])
+        )
+        mlflow.log_metric("post_process/y_max", result["y_max"])
+
+        # --- Test on the training data under the APPLIED (MaxS) certificate ----
+        n_stable_opt, n_unstable_opt = check_input_condition(
+            model, u_train_n, x0_train, warmup_steps, run_output_dir,
+            tag="opt", title="Post-processed (MaxS) training trajectories",horizon=10
+        )
+        mlflow.log_metric("post_process/opt/stable_train_trajectories", n_stable_opt)
+        mlflow.log_metric("post_process/opt/unstable_train_trajectories", n_unstable_opt)
+
+        # Log parameters
         mlflow.log_param("post_processing", True)
         mlflow.log_param("post_process_eps", args.eps)
 
-        # Save results to file
-        alpha = 1/(1 + np.exp(-model.tau.cpu().detach().numpy()))  # Sigmoid of tau
-
-        results_path = run_output_dir / f"post_processing_{args.run_id[:8]}.npz"
+        # --- Save the post-processed certificate + fixed dynamics -------------
+        alpha = 1.0 / (1.0 + np.exp(-model.tau.cpu().detach().numpy()))  # sigmoid(tau)
+        results_path = run_output_dir / "post_processing.npz"
         np.savez(
             results_path,
-            P_original=model.P.cpu().detach().numpy(),
-            P_opt=result["P_opt"],
-            L_original=model.L.cpu().detach().numpy() if model.learn_L else None,
-            L_opt=result["L_opt"],
-            s_original=summary["original"]["s"],
-            s_opt=result["s_opt"],
-            max_eig_F=result["max_eig_F"],
-            y_bar=y_bar,
+            P=model.P.cpu().detach().numpy(),
+            L=(model.L.cpu().detach().numpy() if model.learn_L
+               else np.zeros((model.nz, model.nx))),
+            s=model.s.cpu().detach().numpy(),
             alpha=alpha,
+            y_c=np.nan if max_s["y_bar"] is None else max_s["y_bar"],
+            y_f=np.nan if cov["y_bar"] is None else cov["y_bar"],
+            volume=max_s["volume"],
+            norm_H=max_s["norm_H"],
+            y_max=y_max_train,
             A=model.A.cpu().detach().numpy(),
             B=model.B.cpu().detach().numpy(),
             B2=model.B2.cpu().detach().numpy(),
+            C=model.C.cpu().detach().numpy(),
             C2=model.C2.cpu().detach().numpy(),
             D21=model.D21.cpu().detach().numpy(),
         )
         logger.info(f"Saved results to {results_path}")
-
-        # Log results file to MLflow
         mlflow.log_artifact(str(results_path), artifact_path="post_processing")
 
-        # Save and log updated model with different name
-        # model_path = run_output_dir / f"post_processing_model_{args.run_id[:8]}.pt"
-        # torch.save(model.state_dict(), model_path)
-        # mlflow.pytorch.log_model(model, name="model_post_processing")
-
-        # Generate ellipse/polytope plot if model is 2D
-        if model.nx == 2:
-            logger.info("Generating ellipse and polytope visualization...")
-
-            # generate trajectories
-            with torch.no_grad():
-                b, N, _ = test_inputs.shape
-                x0= torch.zeros((b, model.nx))  # Start from origin for visualization
-                u_n = torch.tensor(normalizer.transform_inputs(test_inputs))
-                e_hat_n, (xs, ws), _ = _simulate(model, u_n, x0, warmup_steps)
-                e_hat = normalizer.inverse_transform_outputs(e_hat_n.cpu().detach().numpy())
-                xs = xs[:,:N] # strip last state
-
-            try:
-
-                import tikzplotlib
-
-                # check if (u^k)^T u^k <= s^2 - alpha^2 (x^k)^T X x^k holds for all test trajectories
-                # c = (u^k)^T u^k - s^2 + alpha^2 (x^k)^T X x^k
-                _, cs = model.get_regularization_input(u_n, xs, return_c=True)
-                cs = cs.cpu().detach().numpy()
-
-                ellipse_plot_name = Path(f"ellipse_polytope_post_{args.run_id[:8]}.png")
-                ellipse_plot_path = Path(run_output_dir / ellipse_plot_name)
-
-                if model.learn_L and config.training.use_custom_regularization:
-                    fig, ax, count_stable, count_unstable = plot_safe_set_trajectories(
-                        P=model.P.cpu().detach().numpy(),
-                        L=model.L.cpu().detach().numpy(),
-                        s=model.s.cpu().detach().numpy(),
-                        x_traj=xs.cpu().detach().numpy(),
-                        c=cs,
-                        warmup_steps=warmup_steps,
-                        horizon=100,
-                        figsize=(8, 8),
-                    )
-                    logger.info(f'total:{b}, stable: {count_stable}, count unstable: {count_unstable}')
-
-                    # Save to output directory
-                    fig.savefig(ellipse_plot_path, dpi=150, bbox_inches="tight")
-
-                    try:
-                        tikzplotlib.save(str(ellipse_plot_path.with_suffix(".tex")))
-                        mlflow.log_artifact(
-                            str(ellipse_plot_path.with_suffix(".tex")),
-                            artifact_path="post_processing",
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to save TikZ plot: {e}")
-                    logger.info(f"Ellipse/polytope plot saved to {ellipse_plot_path}")
-
-                    # Log to MLflow
-                    mlflow.log_figure(fig, f'post_processing/{str(ellipse_plot_name.with_suffix(".png"))}')
-                    plt.close(fig)
-                    logger.info("Ellipse/polytope plot logged to MLflow")
-                else:
-                    fig, ax = plt.subplots(figsize=(8, 8))
-                    count_stable, count_unstable = 0, 0
-                    xs_np = xs.cpu().detach().numpy()
-                    for x_hat, c in zip(xs_np, cs):
-                        M = warmup_steps + 100
-                        if np.any(c > 0):
-                            ax.plot(x_hat[warmup_steps, 0], x_hat[warmup_steps, 1], "rx")
-                            ax.plot(x_hat[warmup_steps:M, 0], x_hat[warmup_steps:M, 1], '--')
-                            count_unstable += 1
-                        else:
-                            ax.plot(x_hat[warmup_steps, 0], x_hat[warmup_steps, 1], "go")
-                            ax.plot(x_hat[warmup_steps:M, 0], x_hat[warmup_steps:M, 1])
-                            count_stable += 1
-                    logger.info(f'total:{b}, stable: {count_stable}, count unstable: {count_unstable}')
-                    ax.grid(True, alpha=0.3)
-                    ax.set_xlabel(r"$x_1$", fontsize=12)
-                    ax.set_ylabel(r"$x_2$", fontsize=12)
-                    mlflow.log_figure(fig, f'post_processing/{ellipse_plot_name}')
-                    tikzplotlib.save(str(ellipse_plot_path.with_suffix(".tex")))
-                    mlflow.log_artifact(
-                        str(ellipse_plot_name.with_suffix(".tex")), artifact_path="post_processing"
-                    )
-                    plt.close(fig)
-
-            except Exception as e:
-                logger.warning(f"Failed to generate ellipse/polytope plot: {e}")
+        # --- Simulate test trajectories (needed for the plots below) ----------
+        with torch.no_grad():
+            b, N, _ = test_inputs.shape
+            x0 = torch.zeros((b, model.nx))  # start from origin
+            u_n = torch.tensor(normalizer.transform_inputs(test_inputs))
+            e_hat_n, (xs, _), _ = simulate_model(model, u_n, x0, warmup_steps)
+            e_hat = normalizer.inverse_transform_outputs(e_hat_n.cpu().detach().numpy())
+            xs = xs[:, :N]  # strip last state
 
         # plot some prediction for handpicked trajectories
         logger.info(f"Generating prediction plot for trajectory...")
@@ -925,7 +402,7 @@ def main():
 
             from sysid.utils import plot_predictions
 
-            pred_plot_name = Path(f"prediction_trajectory_post_{args.run_id[:8]}.png")
+            pred_plot_name = Path("prediction_trajectory_post.png")
             pred_plot_path = Path(run_output_dir / pred_plot_name)
 
             fig, axes = plot_predictions(
@@ -961,12 +438,12 @@ def main():
                 model=model,
                 normalizer=normalizer,
                 run_output_dir=run_output_dir,
-                run_id=args.run_id,
                 true_dynamics_name=args.true_dynamics,
                 config=config,
                 factors=list(args.rv_violation_factors),
                 n_traj=args.rv_num_trajectories,
                 horizon=args.rv_horizon,
+                initial_state_scale=args.rv_initial_state_scale,
             )
         except Exception as e:
             logger.warning(f"Regional verification failed: {e}", exc_info=True)

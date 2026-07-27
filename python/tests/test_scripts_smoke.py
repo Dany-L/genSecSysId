@@ -18,8 +18,14 @@ import pandas as pd
 import pytest
 import yaml
 
+from tests.solver_utils import requires_mosek
+
 REPO_PY = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_PY / "scripts"
+
+# Every test here runs train.py, whose crnn init solves the MaxS certificate
+# SDP via MOSEK; skip the whole module when MOSEK is unavailable (e.g. CI).
+pytestmark = requires_mosek
 
 
 def _make_traj(rng, n_steps):

@@ -335,8 +335,12 @@ def main():
     logger.info("Creating model...")
     print("Creating model...")
     model = create_model(config, delta, max_norm_x0)
+    init_report = None
     if isinstance(model, SimpleLure):
-        model.initialize_parameters(
+        # initialize_parameters returns an InitializationReport; it runs before the
+        # mlflow run starts, so we hold it and log initialization/* metrics inside
+        # the run block below.
+        init_report = model.initialize_parameters(
             train_inputs,
             train_states,
             train_outputs,
@@ -423,6 +427,13 @@ def main():
         mlflow.log_param("total_parameters", total_params)
         mlflow.log_param("trainable_parameters", trainable_params)
 
+        # Certificate established at initialization (MaxVol + optional C2
+        # calibration). initialize_parameters runs before the run starts, so the
+        # report is logged here under the initialization/ metric namespace.
+        if init_report is not None:
+            for name, value in init_report.to_metrics().items():
+                mlflow.log_metric(f"initialization/{name}", value)
+
         # Update directories to include run_id for better organization
         run_model_dir = Path(model_dir) / run_id
         run_output_dir = Path(output_dir) / run_id
@@ -460,6 +471,12 @@ def main():
                 "max_epochs": config.training.max_epochs,
                 "warmup_steps": config.training.warmup_steps,
                 "input_regularization_weight": config.training.input_regularization_weight,
+                "output_regularization_weight": getattr(config.training, "output_regularization_weight", 0.0),
+                "tightness_regularization_weight": getattr(config.training, "tightness_regularization_weight", 0.0),
+                "activity_regularization_weight": getattr(config.training, "activity_regularization_weight", 0.0),
+                "activity_target": getattr(config.training, "activity_target", 0.0),
+                "h_regularization_weight": getattr(config.training, "h_regularization_weight", 0.0),
+                "h_target": getattr(config.training, "h_target", 0.0),
                 "custom_parameters": str(getattr(config.model, "custom_params", None)),
             }
         )
@@ -545,6 +562,23 @@ def main():
                 if config.training.use_custom_regularization
                 else 0.0
             ),
+            tightness_regularization_weight=(
+                getattr(config.training, "tightness_regularization_weight", 0.0)
+                if config.training.use_custom_regularization
+                else 0.0
+            ),
+            activity_regularization_weight=(
+                getattr(config.training, "activity_regularization_weight", 0.0)
+                if config.training.use_custom_regularization
+                else 0.0
+            ),
+            activity_target=getattr(config.training, "activity_target", 0.0),
+            h_regularization_weight=(
+                getattr(config.training, "h_regularization_weight", 0.0)
+                if config.training.use_custom_regularization
+                else 0.0
+            ),
+            h_target=getattr(config.training, "h_target", 0.0),
             output_std=(
                 float(np.asarray(normalizer.output_std).reshape(-1)[0])
                 if normalizer is not None and getattr(normalizer, "output_std", None) is not None

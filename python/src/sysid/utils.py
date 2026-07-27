@@ -1,6 +1,7 @@
 """Utility functions."""
 
 import logging
+import math
 import random
 from typing import List, Optional, Tuple
 
@@ -131,11 +132,11 @@ def plot_safe_set_trajectories(
     for c_i, x_i in zip(c, x_traj):
         if np.any(c_i > 0):
             ax.plot(x_i[warmup_steps, 0], x_i[warmup_steps, 1], "rx")
-            ax.plot(x_i[warmup_steps:M, 0], x_i[warmup_steps:M, 1], "--")
+            ax.plot(x_i[warmup_steps:M, 0],x_i[warmup_steps:M, 1], "--")
             count_unstable += 1
         else:
             ax.plot(x_i[warmup_steps, 0], x_i[warmup_steps, 1], "go")
-            ax.plot(x_i[warmup_steps:M, 0], x_i[warmup_steps:M, 1])
+            ax.plot(x_i[warmup_steps:, 0], x_i[warmup_steps:, 1])
             count_stable += 1
 
     X = np.linalg.inv(P)
@@ -207,6 +208,19 @@ def plot_ellipse_and_parallelogram(
 
     return fig, ax
 
+def get_volume_of_ellipsoid(P: np.ndarray, s: float) -> float:
+    """Compute the volume of the ellipsoid defined by (1/s^2) x^T P^-1 x <= 1.
+
+    Args:
+        P: Lyapunov matrix (nx, nx)
+        s: Sector bound
+
+    Returns:
+        Volume of the ellipsoid
+    """
+    nx = P.shape[0]
+    volume = (s**nx) * np.sqrt(np.linalg.det(P)) * (np.pi ** (nx / 2)) / math.gamma(nx / 2 + 1)
+    return volume
 
 def plot_polytope(
     ax, H: np.array, fill: bool = True, linetype: str = "r--", name: str = r"$\|Hx\|_\infty \leq 1$"
