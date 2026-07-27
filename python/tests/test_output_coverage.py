@@ -146,6 +146,44 @@ class TestOutputCoverageRegularization:
         assert float(m.get_regularization_output()) > 0.0
 
 
+class TestOutputTightnessRegularization:
+    """get_regularization_tightness: the over-coverage (ceiling) complement that
+    pulls the certified half-width down onto y_max, acting on s only."""
+
+    def test_zero_when_unset(self):
+        """No coverage level -> no-op penalty (0)."""
+        assert float(_make_model().get_regularization_tightness()) == 0.0
+
+    def test_zero_when_not_overcovered(self):
+        """ybar < y_max (under/at coverage) -> tightness is silent (it only
+        penalizes EXCESS, so it can never push below y_max on its own)."""
+        m = _make_model(s_value=0.05)  # C=[1,0], P=I -> ybar = s = 0.05 << 1
+        m.set_output_coverage_level(1.0, output_std=1.0)
+        assert float(m.get_regularization_tightness()) == pytest.approx(0.0, abs=1e-12)
+
+    def test_positive_when_overcovered(self):
+        """s=5, C=[1,0], P=I, output_std=1 -> ybar^2 = 25 >> y_max^2 = 1 -> excess>0."""
+        m = _make_model(s_value=5.0)
+        m.set_output_coverage_level(1.0, output_std=1.0)
+        loss, margin = m.get_regularization_tightness(return_margin=True)
+        assert float(loss) > 0.0
+        assert float(margin) == pytest.approx(25.0 - 1.0, rel=1e-6)  # (s^2 CPC^T) - y_max^2
+
+    def test_gradient_shrinks_s_only(self):
+        """The penalty gradient must push s DOWN (dL/ds > 0) and, because CPC^T is
+        detached, must leave C and P untouched (no gradient path)."""
+        m = _make_model(s_value=5.0)
+        m.set_output_coverage_level(1.0, output_std=1.0)
+        loss = m.get_regularization_tightness()
+        loss.backward()
+        # dL/ds = 2*output_std^2*s*CPC^T = 2*1*5*1 = 10 > 0 -> minimization lowers s.
+        assert m.s.grad is not None
+        assert float(m.s.grad) == pytest.approx(10.0, rel=1e-6)
+        # Detach routed the gradient away from the output map and the certificate P.
+        assert m.C.grad is None
+        assert m.P.grad is None
+
+
 def _make_loader(u_amp: float, y_level: float, N: int = 5, B: int = 4) -> DataLoader:
     """Constant-amplitude inputs with constant (normalized) target level."""
     d = u_amp * torch.ones(B, N, 1)
@@ -211,6 +249,22 @@ class TestTrainerWiring:
         out = t.train_epoch()
         assert "reg_output" in out
         assert out["reg_output"] > 0.0
+
+    def test_tightness_weight_sets_y_max_and_reports_positive_reg(self, tmp_path):
+        """Tightness weight alone (no coverage weight) still auto-sets y_max, and
+        with an over-covering model train_epoch reports positive reg_tightness.
+        lr=0 keeps it MOSEK-free (no move -> no rollback/SDP)."""
+        m = _make_model(s_value=5.0)  # ybar = 5 >> demanded 0.9 -> over-covered
+        t = _make_trainer(
+            tmp_path, m, _make_loader(0.1, 0.9), lr=0.0,
+            regularization_weight=1e-8,
+            output_regularization_weight=0.0,
+            tightness_regularization_weight=1.0,
+        )
+        assert not bool(torch.isnan(m.y_max))  # auto-set by the tightness weight
+        out = t.train_epoch()
+        assert "reg_tightness" in out
+        assert out["reg_tightness"] > 0.0
 
     def test_train_epoch_output_reg_zero_when_weight_zero(self, tmp_path):
         m = _make_model(s_value=0.2)
@@ -357,33 +411,32 @@ class TestBindingCertificate:
 class TestPostProcess:
     """post_process: the two cleanly separated certificate SDPs.
 
-    Problem 1 (MaxVol, ``max_vol`` block) is the operative certificate written
-    back into the model — the largest-*volume* invariant set (reports volume,
-    ȳ_c, ‖H‖, s and the MaxS ceiling s_feas); Problem 2 (coverage sweep,
-    ``coverage`` block) reports the tightest coverage ȳ_f only.
+    Problem 1 (MaxS, ``max_s`` block) is the operative certificate written back
+    into the model — the largest *regional* invariant set (reports volume, ȳ_c,
+    ‖H‖, s and the tightness ratio ρ); Problem 2 (coverage sweep, ``coverage``
+    block) reports the tightest coverage ȳ_f only.
     """
 
-    def test_structure_and_applies_max_vol(self):
-        s_ceiling = _synth(_make_model(s_value=0.5)).max_s().s
+    def test_structure_and_applies_max_s(self):
+        s_direct = _synth(_make_model(s_value=0.5)).max_s().s
         m = _make_model(s_value=0.5)
         res = m.post_process(y_max=0.5, n_grid=12)
         assert res["success"]
         assert res["constraints_satisfied"]
-        # The operative (applied) certificate is the MaxVol one; its s lives in
-        # (0, s_feas] and s_feas is the MaxS feasibility ceiling.
-        assert res["max_vol"]["s_feas"] == pytest.approx(s_ceiling, rel=1e-4)
-        assert 0.0 < res["s_opt"] <= s_ceiling * (1.0 + 1e-6)
-        assert res["s_opt"] == pytest.approx(res["max_vol"]["s"], rel=1e-12)
-        assert float(m.s) == pytest.approx(res["max_vol"]["s"], rel=1e-4)
+        # The operative (applied) certificate is the MaxS one; s == the direct MaxS.
+        assert res["max_s"]["s"] == pytest.approx(s_direct, rel=1e-4)
+        assert res["s_opt"] == pytest.approx(res["max_s"]["s"], rel=1e-12)
+        assert float(m.s) == pytest.approx(res["max_s"]["s"], rel=1e-4)
         # Both problems are reported.
-        assert res["max_vol"]["volume"] > 0.0
-        assert res["max_vol"]["y_bar"] is not None       # ȳ_c
-        assert res["max_vol"]["norm_H"] >= 0.0
+        assert res["max_s"]["volume"] > 0.0
+        assert res["max_s"]["y_bar"] is not None       # ȳ_c
+        assert res["max_s"]["norm_H"] >= 0.0
         assert res["coverage"]["reason"] == "ok"
         assert res["coverage"]["y_bar"] is not None    # ȳ_f
+        assert res["max_s"]["rho"] is not None and res["max_s"]["rho"] > 0.0
         # ȳ_c = output_std * s * sqrt(CPCᵀ) matches the written-back model.
         ybar_model = float(m.output_std * m.s * torch.sqrt(m.C @ m.P @ m.C.T)[0, 0])
-        assert ybar_model == pytest.approx(res["max_vol"]["y_bar"], rel=1e-4)
+        assert ybar_model == pytest.approx(res["max_s"]["y_bar"], rel=1e-4)
 
     def test_coverage_tightest_matches_sweep(self):
         m = _make_model(s_value=0.5)
@@ -397,16 +450,16 @@ class TestPostProcess:
         assert res["success"]
         assert res["coverage"]["reason"] == "y_max_unset"
         assert res["coverage"]["y_bar"] is None
-        assert res["max_vol"]["coverage_ok"] is None
+        assert res["max_s"]["coverage_ok"] is None
 
     def test_coverage_ok_when_image_covers_level(self):
-        """The MaxVol image easily covers a tiny demanded level -> coverage_ok."""
+        """The MaxS image easily covers a tiny demanded level -> coverage_ok."""
         m = _make_model(s_value=0.5)
         res = m.post_process(y_max=1e-3, n_grid=8)
-        assert res["max_vol"]["coverage_ok"] is True
+        assert res["max_s"]["coverage_ok"] is True
 
     def test_coverage_unreachable_reported_but_maxvol_succeeds(self):
-        """A level beyond reach on the band: MaxVol (operative) still succeeds; the
+        """A level beyond reach on the band: MaxS (operative) still succeeds; the
         coverage sweep honestly reports it cannot certify y_max."""
         m = _make_model(s_value=0.5)
         res = m.post_process(y_max=1e6, n_grid=8, s_min=0.1, s_max=20.0)
@@ -416,7 +469,7 @@ class TestPostProcess:
 
     def test_coverage_sweep_is_pure(self):
         """coverage_sweep runs on a synthesizer snapshot and must not mutate the
-        model (post_process applies MaxVol, not the sweep result)."""
+        model (post_process applies MaxS, not the sweep result)."""
         m = _make_model(s_value=0.5)
         before = (m.P.detach().clone(), m.s.detach().clone(), m.L.detach().clone())
         out = _synth(m).coverage_sweep(0.5, n_grid=8, s_min=0.1, s_max=20.0)
@@ -447,7 +500,7 @@ class TestGlobalModelCoverage:
         assert res["success"]
         assert res["constraints_satisfied"]
         assert res["s_opt"] == pytest.approx(1.0, rel=1e-9)  # s stays fixed
-        assert res["max_vol"]["norm_H"] == pytest.approx(0.0, abs=1e-9)  # H = L P^-1 = 0
+        assert res["max_s"]["norm_H"] == pytest.approx(0.0, abs=1e-9)  # H = L P^-1 = 0
 
 
 def test_init_config_flag_defaults_on():

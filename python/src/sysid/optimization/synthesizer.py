@@ -119,10 +119,19 @@ class LureCertificateSynthesizer:
         )
 
     # -------------------------------------------------------------------- MaxS
-    def max_s(self) -> Optional[MaxSSolution]:
+    def max_s(self, gamma: float = 0.0) -> Optional[MaxSSolution]:
         """MaxS — maximize ``s`` (minimize ``S_hat = 1/s²``) subject to stability +
         locality LMIs. With fixed ``L = 0`` (not ``learn_L``) ``s`` is frozen and
-        the locality LMIs are dropped. Returns ``None`` if the solver fails."""
+        the locality LMIs are dropped.
+
+        ``gamma > 0`` adds a ``-γ·log det P`` pull to the objective, keeping ``P``
+        (and its inverse ``P⁻¹`` in ``H = LP⁻¹`` / ``V = xᵀP⁻¹x``) off zero and
+        pulling ``s`` down off the locality ``1/s² = ε`` ceiling — i.e. it slides
+        the operative certificate off the large-``s``/small-``P`` extreme toward a
+        balanced, better-conditioned point on the ``s↔P`` gauge. ``γ = 0`` (default)
+        is pure MaxS, so the feasibility-ceiling semantics are preserved.
+
+        Returns ``None`` if the solver fails."""
         eps = self.eps
         P = cp.Variable((self.nx, self.nx), symmetric=True)
         m = cp.Variable((self.nz, 1))
@@ -146,7 +155,9 @@ class LureCertificateSynthesizer:
                 Gs.append(locality_lmi)
                 constraints.append(locality_lmi >> eps * np.eye(self.nx + 1))
 
-        objective = cp.Minimize(S_hat) if self.learn_L else cp.Minimize(0)
+        base_obj = S_hat if self.learn_L else 0
+        obj_expr = base_obj - gamma * cp.log_det(P) if gamma > 0 else base_obj
+        objective = cp.Minimize(obj_expr)
         problem = cp.Problem(objective, constraints)
         try:
             problem.solve(solver=cp.MOSEK, verbose=False)
@@ -172,7 +183,9 @@ class LureCertificateSynthesizer:
             L_val = L
 
         min_eig_diff = float(np.min(np.real(np.linalg.eigvals(self.P_current - P.value))))
-        logger.info(
+        # DEBUG: max_s is called many times inside the C2 calibration bisection;
+        # the calibration itself emits the INFO-level progress.
+        logger.debug(
             f"max-s SDP solved: s = {s_star:.2f}, "
             f"min eig(P_current - P_opt) = {min_eig_diff:.2e}"
         )
@@ -263,7 +276,7 @@ class LureCertificateSynthesizer:
             best.s_feas = s_feas
             best.unbounded_volume = False
             best.sweep = sweep
-            logger.info(
+            logger.debug(
                 f"max-vol SDP solved: volume = {best.volume:.3e} at s = {best.s:.4f} "
                 f"(feasibility ceiling s_max = {s_feas:.4f})"
             )
@@ -400,29 +413,31 @@ class LureCertificateSynthesizer:
         )
 
     # ------------------------------------------------------- C2 calibration
-    def coverage_ratio_at_c2(
-        self, f: float, y_max: float, mv_n_grid: int = 12, cov_n_grid: int = 12
-    ) -> CoverageRatio:
-        """Evaluate ``rho = vol(MaxVol)/vol(tightest coverage)`` with ``C2`` scaled
-        by ``f`` (pure — via :meth:`with_c2`). See :class:`CoverageRatio` for how
-        the degenerate ends (``+∞`` globally stable, ``0`` uncertifiable) are
-        encoded so a sign test on ``rho - 1`` brackets the sweet spot."""
+    def coverage_ratio_at_c2(self, f: float, y_max: float) -> CoverageRatio:
+        """Evaluate ``rho = (ȳ_MaxS / y_max)ⁿˣ`` with ``C2`` scaled by ``f`` (pure —
+        via :meth:`with_c2`), where ``ȳ_MaxS = σ·s·√(λ_min(C P Cᵀ))`` is the MaxS
+        certificate's own certified output half-width (worst output direction).
+
+        This is exactly ``vol(𝒳_MaxS)/vol(𝒳c)``, with ``𝒳c`` the *minimal covering
+        set of the MaxS shape* — the MaxS ellipsoid scaled down (``s' = s·y_max/ȳ``)
+        until it just reaches ``y_max`` — since same-shape scaling gives
+        ``vol ∝ sⁿˣ``. It needs only :meth:`max_s` (no coverage sweep), is smooth
+        and monotone decreasing in ``f``, and ``rho ≥ 1 ⇔ the operative MaxS set
+        covers y_max`` (``rho < 1`` ⇔ even the max-s set cannot reach it). So a sign
+        test on ``rho - 1`` brackets the tightest covering ``C2``."""
         synth = self.with_c2(self.C2 * float(f))
-        mv = synth.max_vol(n_grid=mv_n_grid)
-        if mv is None:
+        cert = synth.max_s()
+        if cert is None:
             return CoverageRatio(f=f, rho=0.0, feasible=False)
-        if mv.unbounded_volume:
-            return CoverageRatio(f=f, rho=float("inf"), feasible=True, max_vol=mv)
-        s_feas = float(mv.s_feas)
-        cov = synth.coverage_sweep(
-            y_max, n_grid=cov_n_grid, s_min=s_feas / cov_n_grid, s_max=s_feas
-        )
-        if cov is None or cov.sol is None:
-            return CoverageRatio(f=f, rho=0.0, feasible=True, max_vol=mv)
-        cov_vol = float(get_volume_of_ellipsoid(cov.sol.P, cov.sol.s))
-        rho = float(mv.volume / cov_vol) if cov_vol > 0 else float("inf")
+        cert_vol = float(get_volume_of_ellipsoid(cert.P, cert.s))
+        CPCt = synth.C @ cert.P @ synth.C.T
+        lam_min = max(float(np.min(np.linalg.eigvalsh(CPCt))), 0.0)
+        y_bar = float(synth.output_std * cert.s * np.sqrt(lam_min))  # worst direction
+        rho = float((y_bar / y_max) ** synth.nx) if y_max > 0 else float("inf")
+        cov_vol = float(cert_vol / rho) if rho > 0 else None
         return CoverageRatio(
-            f=f, rho=rho, feasible=True, max_vol=mv, cov_sol=cov.sol, cov_volume=cov_vol
+            f=f, rho=rho, feasible=True, cert=cert, cert_volume=cert_vol,
+            cov_sol=None, cov_volume=cov_vol,
         )
 
     def calibrate_c2(
@@ -432,25 +447,25 @@ class LureCertificateSynthesizer:
         max_iter: int = 30,
         f_min: float = 1e-3,
         f_max: float = 1e3,
-        mv_n_grid: int = 12,
-        cov_n_grid: int = 12,
     ) -> Optional[CalibrationResult]:
         """Find a scalar factor on ``C2`` with ``0 ≤ rho - 1 < eps`` by geometric
-        bisection of the root of ``rho - 1`` (``rho`` is monotone decreasing in
-        the factor). Returns the largest factor that still covers (``rho ≥ 1``),
-        converged so ``rho - 1 < eps`` when reachable. Pure — the caller applies
-        the winning ``C2`` factor and certificate. ``None`` if even the base C2
-        admits no certificate."""
+        bisection of the root of ``rho - 1``, where ``rho = (ȳ_MaxS/y_max)ⁿˣ``
+        (:meth:`coverage_ratio_at_c2`) is smooth and monotone decreasing in the
+        factor. Returns the largest factor that still covers (``rho ≥ 1``),
+        converged so ``rho - 1 < eps`` when reachable — the tightest coupling for
+        which the operative MaxS set still covers ``y_max``. Pure — the caller
+        applies the winning ``C2`` factor and certificate. ``None`` if even the
+        base C2 admits no certificate."""
         memo = {}
 
         def state(f: float) -> CoverageRatio:
             key = float(f)
             if key not in memo:
-                memo[key] = self.coverage_ratio_at_c2(key, y_max, mv_n_grid, cov_n_grid)
+                memo[key] = self.coverage_ratio_at_c2(key, y_max)
             return memo[key]
 
         base = state(1.0)
-        if base.max_vol is None and not base.feasible:
+        if base.cert is None and not base.feasible:
             logger.warning("C2 calibration: base C2 admits no certificate; skipping.")
             return None
 
@@ -487,7 +502,8 @@ class LureCertificateSynthesizer:
             f=best.f,
             rho=best.rho,
             in_band=best_in_band,
-            max_vol=best.max_vol,
+            cert=best.cert,
+            cert_volume=best.cert_volume,
             cov_sol=best.cov_sol,
             cov_volume=best.cov_volume,
             iterations=iterations,

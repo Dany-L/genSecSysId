@@ -1,6 +1,4 @@
 import logging
-import os
-from pathlib import Path
 from typing import Dict, Literal, Optional, Tuple, Union, overload
 
 import cvxpy as cp
@@ -8,26 +6,23 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from sysid.optimization import (
-    CertificateSolution,
-    InitializationReport,
-    LureCertificateSynthesizer,
-)
+from sysid.optimization import CertificateSolution, LureCertificateSynthesizer
 from sysid.utils import (
-    max_abs_output,
+    get_volume_of_ellipsoid,
     plot_ellipse_and_parallelogram,
     torch_bmat,
 )
 
 from .base import DznActivation, LureSystem, LureSystemClass, LureSystemSafe
-from ..data import DataNormalizer
+from ._lure_initialization import LureInitializationMixin
+from ._lure_regularization import LureRegularizationMixin
 
 logger = logging.getLogger(__name__)
 
 EPS = 1e-6
 
 
-class SimpleLure(nn.Module):
+class SimpleLure(LureInitializationMixin, LureRegularizationMixin, nn.Module):
     """Simple Lure system model."""
 
     def __init__(
@@ -556,301 +551,6 @@ class SimpleLure(nn.Module):
         
         logger.info("=" * 80)
 
-    def initialize_parameters(
-        self,
-        train_inputs,
-        train_states,
-        train_outputs,
-        init_config=None,
-        normalizer: Optional[DataNormalizer] = None,
-    ):
-        """Initialize model parameters with the **identity** strategy.
-
-        Sets a stable diagonal A, identity-like C, and configurable random
-        B2/C2/D21 (see :meth:`_init_identity`), then establishes the certificate
-        (P, L, s) via MinTrProb (step 2 of the algorithm). ESN / N4SID inits were
-        removed — ``identity`` is the only supported method.
-
-        Args:
-            train_inputs: Training input data (B, N, nd).
-            train_states: Training state data (unused by the identity init; kept
-                for API symmetry with the loaders).
-            train_outputs: Training output data (B, N, ne) — used for y_max.
-            init_config: InitializationConfig; ``method`` must be ``'identity'``.
-            normalizer: Data normalizer used to scale C/B and derive y_max.
-
-        Returns:
-            :class:`~sysid.optimization.solutions.InitializationReport` — the
-            established certificate diagnostics (and C2 calibration, when it ran);
-            ``to_metrics()`` yields the ``initialization/`` mlflow metrics.
-        """
-        init_method = (
-            getattr(init_config, "method", "identity").lower()
-            if init_config is not None else "identity"
-        )
-        if init_method != "identity":
-            raise ValueError(
-                f"Unknown initialization method: {init_method!r}. Only 'identity' "
-                "is supported (esn/n4sid were removed)."
-            )
-
-        logger.info("=" * 80)
-        logger.info("INITIALIZATION: Using 'identity' method")
-        logger.info("=" * 80)
-
-        # Normalize inputs for the MinTrProb init below (initialize_s_from_conditions
-        # expects normalized inputs).
-        if normalizer is not None:
-            train_inputs = normalizer.transform_inputs(train_inputs)
-
-        self._init_identity(normalizer)
-
-        # Common post-initialization
-        constraints_ok = self.check_constraints()
-        logger.info(f"Initialization complete. Constraints satisfied: {constraints_ok}")
-        logger.info("=" * 80)
-
-        # Step 2 of the clean algorithm: establish the certificate (P, L, s) via
-        # MinTrProb from the output + input conditions. This also guarantees
-        # feasibility, so no separate analysis_problem_init bootstrap is needed
-        # on this path. y_max is PHYSICAL (max |raw training output|); output_std
-        # relates the model's normalized C/P/s to physical units.
-        sigma = normalizer.output_std if normalizer is not None else 1.0
-        sigma_scalar = float(np.asarray(sigma).reshape(-1)[0])
-        y_max = max_abs_output(train_outputs) if normalizer is not None else None
-        C = self.C.detach().cpu().numpy()
-
-        # Calibrate the C2 std so the max-volume invariant set *just* covers the
-        # coverage set: find a C2 factor with 0 <= rho - 1 < eps, where
-        # rho = vol(MaxVol) / vol(tightest coverage). A globally-stable init has an
-        # unbounded set (rho = ∞); growing C2 turns the model regional and shrinks
-        # the set onto the y_max requirement. Requires output_std + a physical
-        # y_max and the regional regime (ne == 1, learn_L).
-        self.set_output_coverage_level(y_max, sigma_scalar)
-        calibrate = (
-            bool(getattr(init_config, "calibrate_c2_for_coverage", True))
-            if init_config is not None else True
-        )
-        cal = None
-        if calibrate and self.learn_L and self.ne == 1 and y_max is not None:
-            eps = float(getattr(init_config, "calibrate_c2_eps", 0.05)) if init_config is not None else 0.05
-            max_iter = int(getattr(init_config, "calibrate_c2_max_iter", 30)) if init_config is not None else 30
-            cal = self._synth().calibrate_c2(y_max, eps=eps, max_iter=max_iter)
-            if cal is not None:
-                # calibrate_c2 is pure; apply the winning factor to the model's C2
-                # so the returned certificate matches the model that will train.
-                self.C2.data = self.C2.data * float(cal.f)
-                logger.info(
-                    f"C2 calibration: f={cal.f:.4g}, rho={cal.rho:.4f} "
-                    f"(target 1 <= rho < 1+{eps}), in_band={cal.in_band}, "
-                    f"iters={cal.iterations}, cov_volume={cal.cov_volume}"
-                )
-
-        max_vol_sol = cal.max_vol if cal is not None else self._synth().max_vol()
-        if max_vol_sol is None:
-            # The max-vol SDP is infeasible/failed for the initialized dynamics:
-            # there is no (P, L, s) certifying regional (or, for learn_L=False,
-            # global) stability, so training cannot start from a feasible point.
-            raise RuntimeError(
-                "Initialization failed: the max-volume certificate SDP (MaxVol) "
-                "found no feasible parameter set for the initialized dynamics. "
-                "Check the identity initialization / structural constraints "
-                "(e.g. A must be stable, alpha < 1)."
-            )
-
-        P_c, L_c, s_c = max_vol_sol.P, max_vol_sol.L, max_vol_sol.s
-        norm_H_c = float(np.linalg.norm(L_c @ np.linalg.inv(P_c), ord=2))
-        if self.ne == 1:
-            CPCt_c = max(float((C @ P_c @ C.T).item()), 0.0)
-            y_c = float(sigma_scalar * s_c * np.sqrt(CPCt_c))
-            coverage_ok = (
-                bool((sigma_scalar * s_c) ** 2 * CPCt_c >= y_max ** 2)
-                if y_max is not None else None
-            )
-        else:
-            y_c = None
-            coverage_ok = None
-
-        self._apply_certificate_solution(max_vol_sol)
-        constraints_ok = self.check_constraints()
-
-        report = InitializationReport(
-            volume=float(max_vol_sol.volume),
-            s=float(s_c),
-            s_feas=max_vol_sol.s_feas,
-            norm_H=norm_H_c,
-            max_eig_F=float(max_vol_sol.max_eig_F),
-            unbounded_volume=bool(max_vol_sol.unbounded_volume),
-            constraints_satisfied=bool(constraints_ok),
-            y_bar=y_c,
-            y_max=float(y_max) if y_max is not None else None,
-            coverage_ok=coverage_ok,
-            calibrated=cal is not None,
-            c2_factor=float(cal.f) if cal is not None else None,
-            rho=float(cal.rho) if cal is not None else None,
-            rho_in_band=bool(cal.in_band) if cal is not None else None,
-            calibration_iterations=int(cal.iterations) if cal is not None else None,
-            cov_volume=cal.cov_volume if cal is not None else None,
-        )
-        logger.info(
-            "INITIALIZATION certificate (MaxVol): "
-            f"volume={report.volume:.3e}, s={report.s:.4f}, ||H||_2={report.norm_H:.4f}, "
-            f"unbounded_volume={report.unbounded_volume}, y_c={y_c}, y_max={y_max}, "
-            f"coverage_ok={coverage_ok}, rho={report.rho}, "
-            f"rho_in_band={report.rho_in_band}, constraints_satisfied={constraints_ok}"
-        )
-        self._last_init_report = report
-        return report
-
-    def _resolve_init_spec(
-        self,
-        name: str,
-        shape: tuple,
-        default_std: float,
-    ) -> torch.Tensor:
-        """
-        Build initialization tensor for parameter `name` from identity_init config.
-
-        Config (under custom_params['identity_init'][name]):
-            {std: float}        -> Gaussian: std * randn(shape)
-            {value: [[...]]}    -> Inline fixed start value
-            {load_from: "*.npy"}-> Load from file (supports ~ expansion)
-            missing             -> Gaussian with default_std
-        """
-        spec = self._identity_init_cfg.get(name, {}) or {}
-        target = getattr(self, name)
-        device, dtype = target.device, target.dtype
-
-        if "load_from" in spec:
-            path = Path(os.path.expanduser(str(spec["load_from"])))
-            if not path.exists():
-                raise FileNotFoundError(f"Init file for '{name}' not found: {path}")
-            arr = np.load(path)
-            tensor = torch.tensor(arr, device=device, dtype=dtype)
-            if tuple(tensor.shape) != tuple(shape):
-                raise ValueError(
-                    f"Loaded '{name}' from {path} has shape {tuple(tensor.shape)}, "
-                    f"expected {tuple(shape)}"
-                )
-            logger.info(f"  {name}: loaded from {path}")
-            return tensor
-
-        if "value" in spec:
-            tensor = torch.tensor(spec["value"], device=device, dtype=dtype)
-            if tuple(tensor.shape) != tuple(shape):
-                raise ValueError(
-                    f"Fixed init for '{name}' has shape {tuple(tensor.shape)}, "
-                    f"expected {tuple(shape)}"
-                )
-            logger.info(f"  {name}: fixed value from config")
-            return tensor
-
-        std = float(spec.get("std", default_std))
-        logger.info(f"  {name}: random N(0, {std}^2)")
-        return std * torch.randn(*shape, device=device, dtype=dtype)
-
-    def _set_param_data(self, name: str, init_data: torch.Tensor):
-        """Assign init_data to parameter `name`, respecting partial constraints."""
-        if name in self.structural_constraints:
-            self._apply_partial_initialization(name, init_data)
-        else:
-            getattr(self, name).data = init_data
-
-    def _init_identity(self, normalizer: Optional[DataNormalizer] = None):
-        """
-        Identity initialization: stable Euler-discretized A, identity-like C,
-        configurable random B2/C2/D21.
-
-        Configurable via ``custom_params['identity_init']``. Each entry accepts:
-            {std: float}             -> Gaussian random (B2, C2, D21)
-            {scale: float}           -> Uniform random magnitude (A's last row only)
-            {value: [[...]]}         -> Inline fixed start value
-            {load_from: "*.npy"}     -> Load fixed start value from file
-
-        Defaults reproduce the previous behavior (A_scale=1, B2_std=ts,
-        C2_std=1, D21_std=1). Respects ``structural_constraints``: only
-        learnable parts are touched.
-        """
-        logger.info("Identity initialization")
-        cfg = self._identity_init_cfg
-
-        # --- A: I + ts * A_ct, with last row of A_ct = -scale * U(0,1) ---
-        if not self._should_skip_initialization('A'):
-            A_spec = cfg.get('A', {}) or {}
-            if 'value' in A_spec or 'load_from' in A_spec:
-                A_init = self._resolve_init_spec('A', (self.nx, self.nx), default_std=0.0)
-            else:
-                A_scale = float(A_spec.get('scale', 1.0))
-                device, dtype = self.A.device, self.A.dtype
-                A_ct = torch.tensor([[0.0, 1.0], [0.0, 0.0]], device=device, dtype=dtype)
-                A_ct[1, :] = -A_scale * torch.rand((1, self.nx), device=device, dtype=dtype)
-                A_init = torch.eye(self.nx, device=device, dtype=dtype) + A_ct * self.ts  # Euler discretization
-                logger.info(f"  A: scale={A_scale}, |eig|={torch.linalg.eigvals(A_init).abs().tolist()}")
-            self._set_param_data('A', A_init)
-
-        # --- B: deterministic input_scale * ts * [0; 1] (override via value/load_from) ---
-        if not self._should_skip_initialization('B'):
-            B_spec = cfg.get('B', {}) or {}
-            if 'value' in B_spec or 'load_from' in B_spec:
-                B_init = self._resolve_init_spec('B', (self.nx, self.nd), default_std=0.0)
-            else:
-                input_scale = 1.0
-                if normalizer is not None:
-                    input_std = getattr(normalizer, 'input_std', None)
-                    if input_std is not None:
-                        input_scale = input_std.squeeze()
-                B_init = input_scale * self.ts * torch.tensor(
-                    [[0.0], [1.0]], device=self.B.device, dtype=self.B.dtype
-                )
-                # B_init = 0.01*self.ts * torch.tensor(
-                #     [[0.0], [1.0]], device=self.B.device, dtype=self.B.dtype
-                # )
-            self._set_param_data('B', B_init)
-
-        # --- B2, C2, D21: random (configurable std) ---
-        if not self._should_skip_initialization('B2'):
-            B2_init = self._resolve_init_spec('B2', (self.nx, self.nw), default_std=float(self.ts))
-            self._set_param_data('B2', B2_init)
-
-        if not self._should_skip_initialization('C2'):
-            C2_init = self._resolve_init_spec('C2', (self.nz, self.nx), default_std=1.0)
-            self._set_param_data('C2', C2_init)
-
-        # --- C: identity-like / output_std (override via value/load_from) ---
-        if not self._should_skip_initialization('C'):
-            C_spec = cfg.get('C', {}) or {}
-            if 'value' in C_spec or 'load_from' in C_spec:
-                C_init = self._resolve_init_spec('C', (self.ne, self.nx), default_std=0.0)
-            else:
-                if normalizer is None or getattr(normalizer, 'output_std', None) is None:
-                    raise ValueError(
-                        "Identity initialization of 'C' requires a normalizer with "
-                        "'output_std', or an explicit 'identity_init.C.value' / "
-                        "'identity_init.C.load_from' override in custom_params."
-                    )
-                assert normalizer is not None and normalizer.output_std is not None
-                C_init = (1.0 / normalizer.output_std.squeeze()) * torch.tensor(
-                    [[1.0, 0.0]], device=self.C.device, dtype=self.C.dtype
-                )
-                # C_init = 0.01 * torch.tensor(
-                #     [[1.0, 0.0]], device=self.C.device, dtype=self.C.dtype
-                # )
-            self._set_param_data('C', C_init)
-
-        # --- D, D12: zero direct feedthrough ---
-        if not self._should_skip_initialization('D'):
-            self.D.data = torch.zeros_like(self.D)
-        if not self._should_skip_initialization('D12'):
-            self.D12.data = torch.zeros_like(self.D12)
-
-        if not self._should_skip_initialization('D21'):
-            D21_init = self._resolve_init_spec('D21', (self.nz, self.nd), default_std=1.0)
-            self._set_param_data('D21', D21_init)
-
-        logger.info(f"  ||A||={np.linalg.norm(self.A.detach().cpu().numpy()):.4f}")
-        logger.info(f"  ||C||={np.linalg.norm(self.C.detach().cpu().numpy()):.4f}")
-        logger.info(f"  ||C2||={np.linalg.norm(self.C2.detach().cpu().numpy()):.4f}")
-
     def _synth(self) -> LureCertificateSynthesizer:
         """Build a certificate synthesizer from the current (fixed) dynamics.
 
@@ -1216,18 +916,16 @@ class SimpleLure(nn.Module):
         held fixed; only the certificate (P, L, Λ, s) is (re)computed. Two clearly
         separated optimization problems are solved over that fixed θ:
 
-        **Problem 1 — max-volume certificate** (MaxVol, :meth:`~sysid.optimization.LureCertificateSynthesizer.max_vol`).
-        Maximizes the *volume* of the certified invariant ellipsoid,
-        ``sⁿˣ·√(det P)`` (not just the scale ``s``, which is all MaxS maximized),
-        subject to the stability + locality LMIs only. The joint objective is
-        bilinear (``s`` and ``P`` couple through ``P ⪰ s²·lⁱ(lⁱ)ᵀ``) but convex at
-        fixed ``s``, so it is swept over ``s ∈ (0, s_max]`` (``s_max`` = the MaxS
-        feasibility ceiling). It does **not** constrain output coverage — the
-        coverage floor ``(σ·s)²·C P Cᵀ ⪰ y_max²·I`` is instead *checked afterwards*
-        (``coverage_ok``). This gives the largest-volume certifiable invariant set.
-        Reported quantities: the ellipsoid ``volume``, the coupling norm
-        ``‖H‖ = ‖L P⁻¹‖``, the scale ``s`` and the certified output half-width
-        ``ȳ_c = σ·s·√(C P Cᵀ)`` (physical; ``ne == 1`` only, else ``None``).
+        **Problem 1 — max-feasible-s certificate** (MaxS, :meth:`~sysid.optimization.LureCertificateSynthesizer.max_s`).
+        Maximizes the scale ``s`` (minimizes ``1/s²``) subject to the stability +
+        locality LMIs only — the largest *regional* certifiable invariant set. It
+        is well conditioned (a moderate ``s``, not the tiny-``s``/huge-``P`` corner
+        the volume objective falls into) and is the operative certificate written
+        back into the model. It does **not** constrain output coverage — the
+        coverage floor ``(σ·s)²·C P Cᵀ ⪰ y_max²·I`` is *checked afterwards*
+        (``coverage_ok``). Reported: the ellipsoid ``volume`` (``sⁿˣ·√(det P)``),
+        the coupling norm ``‖H‖ = ‖L P⁻¹‖``, the scale ``s`` and the certified
+        output half-width ``ȳ_c = σ·s·√(C P Cᵀ)`` (physical; ``ne == 1`` only).
 
         **Problem 2 — tightest coverage** (MinTrProb, :meth:`~sysid.optimization.LureCertificateSynthesizer.coverage_at_s` swept
         over a finite s-grid). The joint problem is bilinear (convex once ``s`` is
@@ -1235,20 +933,20 @@ class SimpleLure(nn.Module):
         smallest feasible certified half-width ``ȳ_f`` — the tightest coverage of
         the demanded ``y_max``. Skipped when ``y_max`` is unset.
 
-        Because the goal here is a *large* invariant set, the MaxVol solution (ȳ_c)
-        is the one written back into the model. ``y_max`` is physical; ``None``
-        falls back to the model's stored physical level (which may be unset, in
-        which case Problem 2 and the coverage check are skipped).
+        The MaxS solution (ȳ_c) is the one written back into the model; ``ρ`` (the
+        volume ratio ``vol(𝒳_MaxS)/vol(𝒳_cov)``) is reported as a tightness
+        diagnostic. ``y_max`` is physical; ``None`` falls back to the model's
+        stored physical level (which may be unset, in which case Problem 2 and the
+        coverage check are skipped).
 
         Returns a summary dict::
 
             {
               "success": bool,
-              "s_opt": float,                 # operative (MaxVol) s == max_vol["s"]
+              "s_opt": float,                 # operative (MaxS) s == max_s["s"]
               "constraints_satisfied": bool,
               "y_max": Optional[float],       # physical demanded level (or None)
-              "max_vol": {s, volume, s_feas, norm_H, y_bar(=ȳ_c), max_eig_F,
-                          coverage_ok},
+              "max_s": {s, volume, norm_H, y_bar(=ȳ_c), max_eig_F, coverage_ok, rho},
               "coverage":{y_bar(=ȳ_f), s, reason, s_min, s_max, n_grid, sweep},
             }
         """
@@ -1265,21 +963,21 @@ class SimpleLure(nn.Module):
 
         logger.info("=" * 80)
         logger.info(
-            "POST-PROCESSING: (1) max-volume certificate + (2) tightest-coverage sweep"
+            "POST-PROCESSING: (1) max-feasible-s certificate + (2) tightest-coverage sweep"
         )
         logger.info("=" * 80)
 
         # ------------------------------------------------------------------
-        # Problem 1 — MaxVol: the largest-volume certifiable invariant set
-        # (operative). Sweeps s ∈ (0, s_max] and keeps the largest sⁿˣ·√(det P).
+        # Problem 1 — MaxS: the largest regional certifiable invariant set
+        # (operative, well conditioned — moderate s, not the tiny-s/huge-P corner).
         # ------------------------------------------------------------------
         synth = self._synth()
-        max_vol_sol = synth.max_vol(n_grid=n_grid)
-        if max_vol_sol is None:
-            return {"success": False, "status": "max_vol_sdp_failed"}
+        max_s_sol = synth.max_s()
+        if max_s_sol is None:
+            return {"success": False, "status": "max_s_sdp_failed"}
 
-        P_c, L_c, s_c = max_vol_sol.P, max_vol_sol.L, max_vol_sol.s
-        vol_c, s_feas_c = max_vol_sol.volume, max_vol_sol.s_feas
+        P_c, L_c, s_c = max_s_sol.P, max_s_sol.L, max_s_sol.s
+        vol_c = float(get_volume_of_ellipsoid(P_c, s_c))
         norm_H_c = float(np.linalg.norm(L_c @ np.linalg.inv(P_c), ord=2))
         if self.ne == 1:
             CPCt_c = max(float((C @ P_c @ C.T).item()), 0.0)
@@ -1292,12 +990,12 @@ class SimpleLure(nn.Module):
             y_c = None
             coverage_ok = None
 
-        logger.info("[Problem 1: MaxVol — largest-volume invariant set]")
+        logger.info("[Problem 1: MaxS — largest regional invariant set]")
         logger.info(f"  volume   = {vol_c:.3e}")
-        logger.info(f"  s        = {_fmt(s_c)}   (feasibility ceiling s_max = {_fmt(s_feas_c)})")
+        logger.info(f"  s        = {_fmt(s_c)}")
         logger.info(f"  ‖H‖      = {_fmt(norm_H_c)}   (H = L P⁻¹)")
         logger.info(f"  ȳ_c      = {_fmt(y_c)}   (σ·s·√(C P Cᵀ))")
-        logger.info(f"  max λ(F) = {max_vol_sol.max_eig_F:.3e}")
+        logger.info(f"  max λ(F) = {max_s_sol.max_eig_F:.3e}")
         if coverage_ok is not None:
             logger.info(
                 f"  coverage ((σ·s)²·CPCᵀ ≥ y_max²={y_max ** 2:.4g}): "
@@ -1308,6 +1006,7 @@ class SimpleLure(nn.Module):
         # Problem 2 — tightest coverage over the s-grid (reported, not applied).
         # ------------------------------------------------------------------
         y_f = s_f = None
+        rho = None
         coverage_reason = "y_max_unset"
         coverage_sweep: list = []
         if y_max is not None:
@@ -1322,21 +1021,26 @@ class SimpleLure(nn.Module):
                 y_f, s_f = cov.y_f, cov.s_f
                 coverage_sweep = [{"s": p.s, "y_bar": p.y_bar} for p in cov.sweep]
                 coverage_reason = "ok"
+                # Tightness ratio of the OPERATIVE (MaxS) certificate: how much its
+                # own certified image over-covers y_max, as a volume ratio
+                # rho = (ȳ_c/y_max)^nx = vol(𝒳_MaxS)/vol(minimal covering set).
+                if y_c is not None and y_max > 0:
+                    rho = float((y_c / y_max) ** self.nx)
                 logger.info("[Problem 2: coverage — tightest ȳ over the s-grid]")
                 logger.info(
                     f"  ȳ_f = {_fmt(y_f)}  at s = {_fmt(s_f)}   "
-                    f"(target y_max = {_fmt(y_max)})"
+                    f"(target y_max = {_fmt(y_max)}); ρ = (ȳ_c/y_max)^nx = {_fmt(rho)}"
                 )
         else:
             logger.info("[Problem 2: coverage] skipped (y_max unset)")
 
         # ------------------------------------------------------------------
-        # Set the model to the LARGEST-VOLUME invariant set (MaxVol / ȳ_c).
+        # Set the model to the largest regional invariant set (MaxS / ȳ_c).
         # ------------------------------------------------------------------
-        self._apply_certificate_solution(max_vol_sol)
+        self._apply_certificate_solution(max_s_sol)
         constraints_ok = self.check_constraints()
         logger.info(
-            f"Applied MaxVol certificate to the model. Constraints satisfied: {constraints_ok}"
+            f"Applied MaxS certificate to the model. Constraints satisfied: {constraints_ok}"
         )
         logger.info("=" * 80)
 
@@ -1345,14 +1049,14 @@ class SimpleLure(nn.Module):
             "s_opt": s_c,
             "constraints_satisfied": constraints_ok,
             "y_max": y_max,
-            "max_vol": {
+            "max_s": {
                 "s": s_c,
                 "volume": vol_c,
-                "s_feas": s_feas_c,
                 "norm_H": norm_H_c,
                 "y_bar": y_c,
-                "max_eig_F": float(max_vol_sol.max_eig_F),
+                "max_eig_F": float(max_s_sol.max_eig_F),
                 "coverage_ok": coverage_ok,
+                "rho": rho,
             },
             "coverage": {
                 "y_bar": y_f,
@@ -1565,361 +1269,6 @@ class SimpleLure(nn.Module):
                 for c in sweep
             ],
         }
-
-    def initialize_s_from_conditions(
-        self,
-        train_inputs_n,
-        y_max: float,
-        warmup_steps: int = 0,
-        n_grid: int = 15,
-        s_min: float = 0.1,
-        s_max: float = 20.0,
-    ) -> dict:
-        """Initialize ``s`` (and ``P``, ``L``) from the output + input conditions.
-
-        Replaces the cumbersome max-s / heuristic ``s`` initialization with the
-        *same sweep used for the final certificate* (MinTrProb,
-        :meth:`solve_output_coverage_certificate`): over the preset ``s`` band it
-        prefers an ``s`` that satisfies the (physical) output-coverage floor
-        **and** leaves zero input violations on the training data, else the
-        ``s`` with the fewest input violations.
-
-        When the output level is not yet reachable for this freshly-initialized
-        ``theta`` (``coverage_unreachable``), it falls back to plain max-s (the
-        fewest-violations feasible certificate); the output-coverage penalty
-        then grows the image toward ``y_max`` during training.
-
-        ``y_max`` is the PHYSICAL safe output level; ``self.output_std`` must
-        already be set (see :meth:`set_output_coverage_level`).
-        ``train_inputs_n`` are the *normalized* training inputs ``(B, N, nd)``.
-        Returns the certificate summary dict (``success=False`` when the max-s
-        fallback was used).
-        """
-        self.set_output_coverage_level(y_max)  # output_std left unchanged
-        inputs = torch.as_tensor(
-            np.asarray(train_inputs_n), dtype=self.P.dtype, device=self.P.device
-        )
-        res = self.solve_output_coverage_certificate(
-            y_max=y_max, inputs=inputs, warmup_steps=warmup_steps,
-            n_grid=n_grid, s_min=s_min, s_max=s_max,
-        )
-        if res["success"]:
-            logger.info(
-                f"Init s from conditions: s={res['s']:.2f} "
-                f"(band [{res['s_min']:.2f}, {res['s_max']:.2f}]), "
-                f"y_bar={res['y_bar']:.2f} (y_max={y_max:.2f}), "
-                f"output band y_tight={res['y_tight']:.2f} <= y_bar; "
-                f"MaxS ceiling y_feas={res['y_feas']:.2f} "
-                f"(s_feas={res['s_feas']:.2f}, ||H||={res['norm_H_feas']:.2f}), "
-                f"input violations={res['n_input_violations']}, "
-                f"violation_free={res['violation_free']}"
-            )
-            return res
-
-        # Output level not reachable at init -> fall back to MaxVol (the largest
-        # invariant set among feasible certificates). Coverage is then handled by
-        # the output-coverage penalty during training.
-        logger.warning(
-            f"Init s from conditions: output level y_max={y_max:.2f} not "
-            f"reachable (reason={res['reason']}); falling back to max-vol."
-        )
-        sol = self._synth().max_vol()
-        if sol is not None:
-            self._apply_certificate_solution(sol)
-        else:
-            logger.warning("Init s fallback (max-vol) also failed; s left unchanged.")
-        return res
-
-    def get_regularization_loss(self) -> torch.Tensor:
-        """
-        Feasibility regularization via the log-det interior-point barrier.
-
-        For each LMI ``F ≻ 0`` adds ``-log det F`` and for each scalar
-        inequality ``s > 0`` adds ``-log s``. Requires strictly feasible
-        parameters (all eigenvalues > 0); the barrier grows to ``+∞`` as any
-        constraint approaches its boundary.
-
-        Returns:
-            Regularization loss (sum of negative log-determinants).
-        """
-        feasibility_loss = torch.tensor(0.0, device=self.P.device)
-        for f_i in self.get_lmis():
-            # feasibility_loss += torch.relu(-torch.logdet(f_i()))
-            feasibility_loss += -torch.logdet(f_i())
-        for s_i in self.get_scalar_inequalities():
-            # feasibility_loss += torch.relu(-torch.log(s_i()).squeeze())
-            feasibility_loss += -torch.log(s_i()).squeeze()
-
-        return feasibility_loss
-
-    def get_feasibility_margins(self) -> Dict[str, float]:
-        """
-        Per-constraint feasibility margins for monitoring interior-point drift.
-
-        For each LMI ``F ≻ 0`` reports the smallest eigenvalue ``min λ(F)`` —
-        the distance to the constraint boundary (``≤ 0`` means infeasible). For
-        each scalar inequality ``s > 0`` reports its value. Also returns the
-        aggregate ``min_eig`` (smallest margin across all constraints).
-
-        Intended use: watch whether ``min_eig`` climbs steadily over training
-        (certificate parameters drifting deeper into the feasible interior,
-        pushed by the ``-log det`` barrier) while the input/output violation
-        terms worsen — the signature of the barrier tugging against the other
-        loss terms. A stationary ``min_eig`` means the barrier is not causing
-        drift and the negative barrier value can be left as is.
-
-        Returns:
-            Dict mapping ``lmi_<i>_min_eig`` / ``scalar_<j>`` to their margins,
-            plus aggregate ``min_eig`` (smallest margin across all constraints).
-        """
-        margins: Dict[str, float] = {}
-        overall_min = float("inf")
-        with torch.no_grad():
-            for i, f_i in enumerate(self.get_lmis()):
-                min_eig = torch.linalg.eigvalsh(f_i()).min().item()
-                margins[f"lmi_{i}_min_eig"] = min_eig
-                overall_min = min(overall_min, min_eig)
-            for j, s_i in enumerate(self.get_scalar_inequalities()):
-                val = s_i().squeeze().item()
-                margins[f"scalar_{j}"] = val
-                overall_min = min(overall_min, val)
-
-        if overall_min != float("inf"):
-            margins["min_eig"] = overall_min
-        return margins
-
-    @overload
-    def get_regularization_input(
-        self, u: torch.Tensor, x: torch.Tensor,
-        return_c: Literal[False] = ..., warmup_steps: int = ...,
-    ) -> torch.Tensor: ...
-
-    @overload
-    def get_regularization_input(
-        self, u: torch.Tensor, x: torch.Tensor,
-        return_c: Literal[True], warmup_steps: int = ...,
-    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
-
-    def get_regularization_input(
-        self,
-        u: torch.Tensor,
-        x: torch.Tensor,
-        return_c: bool = False,
-        warmup_steps: int = 0,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Compute input constraint regularization loss (vectorized).
-
-        Enforces input constraints: ||u_k||^2 <= s^2 - α^2 * (x_k^T * P^(-1) * x_k)
-        Where:
-        - u_k: input at timestep k, shape (batch, seq_len, n_inputs)
-        - x_k: state at timestep k, shape (batch, seq_len, n_states)
-        - s: input constraint bound
-        - α: sigmoid-gated constraint parameter
-        - P: parameter matrix
-
-        This vectorized implementation replaces nested loops for efficiency.
-
-        Args:
-            inputs: Input trajectories, shape (batch_size, seq_len, n_inputs)
-            states: State trajectories, shape (batch_size, seq_len, n_states, 1) or (batch_size, seq_len, n_states)
-
-        Returns:
-            Scalar tensor representing mean squared constraint violation
-        """
-
-        _, N, _ = u.shape  # batch size, sequence length, input dimension
-        # Handle state tensor shape - squeeze trailing dimension if present
-        # (batch, seq_len, state_dim, 1) -> (batch, seq_len, state_dim)
-        if x.dim() == 4:
-            x = x.squeeze(-1)
-        
-
-        # Get parameters
-        alpha = 1.0 / (1.0 + torch.exp(-self.tau))  # sigmoid
-        s = self.s
-        X = torch.linalg.inv(self.P)  # P^(-1)
-
-        # Compute vectorized quantities
-        # ||u_k||^2 for all timesteps: (batch, seq_len, n_inputs) -> (batch, seq_len)
-        u_norm_sq = (u[:,warmup_steps:N] ** 2).sum(dim=-1)
-
-        # x_k^T * P^(-1) * x_k for all timesteps using einsum
-        # states: (batch, seq_len, n_states)
-        # X: (n_states, n_states)
-        # Result: (batch, seq_len)
-        x_quad_form = torch.einsum("bti,ij,btj->bt", x[:,warmup_steps:N,:], X, x[:,warmup_steps:N,:])
-
-        # Compute constraint: c_k = ||u_k||^2 - s^2 + α^2 * (x_k^T * P^(-1) * x_k)
-        # Shape: (batch, seq_len)
-        eps = 0  # small epsilon for numerical stability
-        c = u_norm_sq - s**2 + alpha**2 * x_quad_form + eps
-
-        # Coverage is a worst-case property: the safe set must contain each
-        # trajectory's peak excursion, so penalize the largest per-trajectory
-        # violation (peak over time) averaged over the batch, rather than the
-        # mean over all steps which dilutes the few steps that actually breach s.
-        # relu is still needed (after amax): a satisfied trajectory has a
-        # negative peak c, and without relu minimizing it would reward pushing c
-        # ever more negative (inflating s) even when the constraint already holds.
-        # relu is monotone, so relu(max_k c_k) == max_k relu(c_k).
-        reg_loss = torch.relu(c.amax(dim=1)).mean()
-
-        if return_c:
-            return reg_loss, c
-
-        return reg_loss
-
-    def set_output_coverage_level(self, y_max, output_std=None) -> None:
-        """Set the **physical** safe output level ``y_max`` (and, optionally, the
-        physical output scale ``output_std`` used to relate the model's
-        normalized ``C/P/s`` to physical units).
-
-        ``y_max`` has a physical meaning and is stored unnormalized; the coverage
-        machinery divides by ``output_std`` internally. ``None``/``nan`` y_max
-        disables the output-coverage penalty. ``output_std=None`` leaves the
-        stored scale unchanged. Kept on the model's device/dtype."""
-        device, dtype = self.P.device, self.P.dtype
-        self.y_max = torch.tensor(
-            float(y_max) if y_max is not None else float("nan"), device=device, dtype=dtype
-        )
-        if output_std is not None:
-            self.output_std = torch.tensor(float(output_std), device=device, dtype=dtype)
-
-    def get_regularization_output(self, return_margin: bool = False):
-        """Output-coverage penalty — bind Corollary 1 (see the wiki
-        ``binding-output-certificate``).
-
-        Enforces the coverage-on-image floor ``(σ·s)² C P Cᵀ ⪰ y_max² I`` in
-        PHYSICAL output units (``σ = output_std``): the model's *own* certified
-        output set must reach the physical safe level ``y_max``. The penalty is
-        ``relu(λ_max(y_max² I − (σ·s)² C P Cᵀ))`` — zero once the physical image
-        covers the data envelope in every direction, else the largest remaining
-        per-direction deficit (for ``ne = 1`` just
-        ``relu(y_max² − (σ·s)²·CPCᵀ)``).
-
-        No-op (returns 0) when ``y_max`` is unset. This is the differentiable
-        training surrogate for the exact binding SDP in
-        :meth:`solve_output_coverage_certificate`.
-        """
-        zero = torch.zeros((), device=self.P.device, dtype=self.P.dtype)
-        if self.y_max is None or bool(torch.isnan(self.y_max)):
-            return (zero, zero) if return_margin else zero
-
-        CPCt = self.C @ self.P @ self.C.T  # (ne, ne), symmetric
-        deficit = self.y_max**2 * torch.eye(
-            self.ne, device=self.P.device, dtype=self.P.dtype
-        ) - (self.output_std * self.s)**2 * CPCt
-        # Coverage <=> deficit ⪯ 0 <=> lambda_max(deficit) <= 0.
-        lam_max = torch.linalg.eigvalsh(deficit)[-1]
-        reg_loss = torch.relu(lam_max)
-
-        if return_margin:
-            return reg_loss, lam_max
-        return reg_loss
-
-    def get_regularization_activity(
-        self,
-        w: torch.Tensor,
-        w_star: float,
-        warmup_steps: int = 0,
-        return_activity: bool = False,
-    ):
-        """Dead-zone activity penalty — prevent the degenerate *linear collapse*.
-
-        For the dead-zone nonlinearity ``w = Δ(z) = z − hardtanh(z)`` the rollout
-        follows the pure LTI part exactly when ``w = 0`` (pre-activations stay in
-        the dead band ``|z| ≤ 1``). That degenerate "linear collapse" is a poor
-        fit for nonlinear data (and trivially globally stable). This penalty
-        rewards the dead-zone to *fire* (``w ≠ 0``), pushing the model into its
-        nonlinear regime.
-
-        Caveat — this is **not** a certificate-level anti-global mechanism. Firing
-        the nonlinearity does *not* by itself make the global (``H = 0``)
-        certificate infeasible: ``H = 0`` means the *global* sector condition is
-        used, and tanh/dzn satisfy sector ``[0, 1]`` **globally**, so a model can
-        be globally absolutely stable with a fully active nonlinearity
-        (``w ≠ 0``). Hence ``H = 0`` does **not** imply a linear model. Making
-        ``H = 0`` genuinely infeasible requires shaping the *linear* dynamics so
-        the global-sector LMI fails — a separate lever. This term only removes the
-        ``w ≡ 0`` collapse; it is a behavioral heuristic that *correlates* with,
-        but does not guarantee, a non-global model.
-
-        Penalty ``relu(w_star − a)`` with ``a = ⟨‖w_k‖₂⟩`` the mean per-step
-        activation norm over the (warmup-skipped) rollout; zero once the mean
-        activity reaches the target ``w_star``. ``w_star ≤ 0`` disables it
-        (no-op). It reads the rollout, not the certificate, so it does not
-        directly touch P, L, s.
-
-        Note: only meaningful for the ``dzn`` (dead-zone) activation, where
-        ``w = 0`` ⇔ the linear regime. For ``sat``/``tanh`` (linear near 0,
-        saturating for large ``z``) small ``w`` is *not* the linear regime, so
-        the sign of "activity" is different — do not enable it there unchanged.
-
-        Args:
-            w: nonlinearity output ``(B, N, nw)`` from ``forward``.
-            w_star: target mean activation norm (the hinge threshold).
-            warmup_steps: leading steps skipped (match the prediction loss).
-            return_activity: also return the scalar mean activity ``a``.
-        """
-        zero = torch.zeros((), device=self.P.device, dtype=self.P.dtype)
-        if w_star is None or float(w_star) <= 0.0:
-            return (zero, zero) if return_activity else zero
-
-        N = w.shape[1]
-        w_active = w[:, warmup_steps:N, :]
-        # Mean over batch and time of the per-step L2 activation norm.
-        activity = torch.linalg.vector_norm(w_active, dim=-1).mean()
-        reg_loss = torch.relu(float(w_star) - activity)
-
-        if return_activity:
-            return reg_loss, activity
-        return reg_loss
-
-    def get_regularization_H(self, h_star, return_norm: bool = False):
-        """Anti-global-certificate penalty — push the coupling ``H = L P⁻¹``
-        away from zero.
-
-        The regionality certificate collapses to the *global* sector condition
-        exactly when ``H = L P⁻¹ = 0`` (no locality restriction — a globally
-        absolutely stable, typically near-linear model). Unlike
-        :meth:`get_regularization_activity`, which only removes the ``w ≡ 0``
-        rollout collapse and does *not* make the ``H = 0`` certificate infeasible,
-        this term acts directly on the certificate parameters (L, P), so it
-        directly discourages the global certificate. It hinges on the coupling
-        norm::
-
-            relu(h_star − ‖H‖_F)
-
-        zero once ``‖H‖_F ≥ h_star`` (the target coupling magnitude), else the
-        remaining deficit; minimizing it grows ‖H‖. The Frobenius norm is
-        computed with a tiny additive floor so the gradient is finite (rather
-        than NaN) at the ``H = 0`` cone point — training escapes zero as soon as
-        the SDP init / prediction loss make ``L`` nonzero.
-
-        ``h_star ≤ 0`` disables it (no-op). Requires ``learn_L`` (``H`` is
-        identically zero and non-trainable otherwise, so the term would be a
-        constant no-op there too).
-
-        Args:
-            h_star: target coupling norm ‖H‖_F (the hinge threshold).
-            return_norm: also return the scalar ‖H‖_F.
-        """
-        zero = torch.zeros((), device=self.P.device, dtype=self.P.dtype)
-        if h_star is None or float(h_star) <= 0.0 or not self.learn_L:
-            return (zero, zero) if return_norm else zero
-
-        H = self.L @ torch.linalg.inv(self.P)
-        # Frobenius norm with a small floor: sqrt(0) has a NaN gradient, so the
-        # floor keeps the gradient finite at H = 0 without changing the value
-        # meaningfully once H is nonzero.
-        norm_H = torch.sqrt((H ** 2).sum() + EPS ** 2)
-        reg_loss = torch.relu(float(h_star) - norm_H)
-
-        if return_norm:
-            return reg_loss, norm_H
-        return reg_loss
-
 
 class SimpleLureSafe(SimpleLure):
     """SimpleLure with the safety input filter wired into the forward pass.

@@ -297,14 +297,14 @@ def main():
 
         # ------------------------------------------------------------------
         # Post-processing: solve the two (now cleanly separated) certificate
-        # SDPs and set the model to the LARGEST invariant set. See
+        # SDPs and set the model to the LARGEST regional invariant set. See
         # SimpleLure.post_process for the full description:
-        #   Problem 1 (MaxVol, _max_vol_sdp): max ellipsoid volume sⁿˣ·√(det P)
-        #       over the s-sweep -> the operative certificate written back into
-        #       the model. Reports the volume, ȳ_c, ‖H‖, s (and the MaxS ceiling
-        #       s_feas) and whether the coverage floor (σ·s)²·CPCᵀ ≥ y_max² holds.
-        #   Problem 2 (coverage sweep, _coverage_sdp over a grid of s): the
-        #       tightest coverage ȳ_f (reported only, not applied).
+        #   Problem 1 (MaxS, max_s): max feasible s -> the operative certificate
+        #       written back into the model (well conditioned, moderate s).
+        #       Reports the ellipsoid volume, ȳ_c, ‖H‖, s and whether the coverage
+        #       floor (σ·s)²·CPCᵀ ≥ y_max² holds.
+        #   Problem 2 (coverage sweep over a grid of s): the tightest coverage ȳ_f
+        #       (reported only, not applied), plus ρ = vol(MaxS)/vol(cov).
         # ------------------------------------------------------------------
         logger.info("Calling model.post_process()...")
         result = model.post_process(y_max=y_max_train, n_grid=20)
@@ -312,24 +312,25 @@ def main():
             logger.error(f"Post-processing failed: {result.get('status', 'unknown')}")
             sys.exit(1)
 
-        max_vol = result["max_vol"]
+        max_s = result["max_s"]
         cov = result["coverage"]
 
-        # Problem 1 — max-volume certificate (operative; largest invariant set).
+        # Problem 1 — max-feasible-s certificate (operative; largest regional set).
         logger.info(
-            f"[Problem 1: MaxVol] volume={max_vol['volume']:.3e}, y_bar (ȳ_c)={max_vol['y_bar']}, "
-            f"s={max_vol['s']:.4f} (ceiling s_feas={max_vol['s_feas']:.4f}), "
-            f"norm_H={max_vol['norm_H']:.4f}, coverage_ok={max_vol['coverage_ok']}"
+            f"[Problem 1: MaxS] volume={max_s['volume']:.3e}, y_bar (ȳ_c)={max_s['y_bar']}, "
+            f"s={max_s['s']:.4f}, norm_H={max_s['norm_H']:.4f}, "
+            f"coverage_ok={max_s['coverage_ok']}, rho={max_s['rho']}"
         )
-        mlflow.log_metric("post_process/max_vol/volume", max_vol["volume"])
-        mlflow.log_metric("post_process/max_vol/s", max_vol["s"])
-        mlflow.log_metric("post_process/max_vol/s_feas", max_vol["s_feas"])
-        mlflow.log_metric("post_process/max_vol/norm_H", max_vol["norm_H"])
-        mlflow.log_metric("post_process/max_vol/max_eig_F", max_vol["max_eig_F"])
-        if max_vol["y_bar"] is not None:
-            mlflow.log_metric("post_process/max_vol/y_bar", max_vol["y_bar"])  # ȳ_c
-        if max_vol["coverage_ok"] is not None:
-            mlflow.log_metric("post_process/max_vol/coverage_ok", int(max_vol["coverage_ok"]))
+        mlflow.log_metric("post_process/max_s/volume", max_s["volume"])
+        mlflow.log_metric("post_process/max_s/s", max_s["s"])
+        mlflow.log_metric("post_process/max_s/norm_H", max_s["norm_H"])
+        mlflow.log_metric("post_process/max_s/max_eig_F", max_s["max_eig_F"])
+        if max_s["y_bar"] is not None:
+            mlflow.log_metric("post_process/max_s/y_bar", max_s["y_bar"])  # ȳ_c
+        if max_s["coverage_ok"] is not None:
+            mlflow.log_metric("post_process/max_s/coverage_ok", int(max_s["coverage_ok"]))
+        if max_s["rho"] is not None:
+            mlflow.log_metric("post_process/max_s/rho", max_s["rho"])
 
         # Problem 2 — tightest coverage over the s-grid (report only).
         logger.info(
@@ -347,10 +348,10 @@ def main():
         )
         mlflow.log_metric("post_process/y_max", result["y_max"])
 
-        # --- Test on the training data under the APPLIED (MaxVol) certificate --
+        # --- Test on the training data under the APPLIED (MaxS) certificate ----
         n_stable_opt, n_unstable_opt = check_input_condition(
             model, u_train_n, x0_train, warmup_steps, run_output_dir,
-            tag="opt", title="Post-processed (MaxVol) training trajectories",horizon=10
+            tag="opt", title="Post-processed (MaxS) training trajectories",horizon=10
         )
         mlflow.log_metric("post_process/opt/stable_train_trajectories", n_stable_opt)
         mlflow.log_metric("post_process/opt/unstable_train_trajectories", n_unstable_opt)
@@ -369,10 +370,10 @@ def main():
                else np.zeros((model.nz, model.nx))),
             s=model.s.cpu().detach().numpy(),
             alpha=alpha,
-            y_c=np.nan if max_vol["y_bar"] is None else max_vol["y_bar"],
+            y_c=np.nan if max_s["y_bar"] is None else max_s["y_bar"],
             y_f=np.nan if cov["y_bar"] is None else cov["y_bar"],
-            volume=max_vol["volume"],
-            norm_H=max_vol["norm_H"],
+            volume=max_s["volume"],
+            norm_H=max_s["norm_H"],
             y_max=y_max_train,
             A=model.A.cpu().detach().numpy(),
             B=model.B.cpu().detach().numpy(),

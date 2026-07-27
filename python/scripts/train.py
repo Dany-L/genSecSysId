@@ -471,6 +471,8 @@ def main():
                 "max_epochs": config.training.max_epochs,
                 "warmup_steps": config.training.warmup_steps,
                 "input_regularization_weight": config.training.input_regularization_weight,
+                "output_regularization_weight": getattr(config.training, "output_regularization_weight", 0.0),
+                "tightness_regularization_weight": getattr(config.training, "tightness_regularization_weight", 0.0),
                 "activity_regularization_weight": getattr(config.training, "activity_regularization_weight", 0.0),
                 "activity_target": getattr(config.training, "activity_target", 0.0),
                 "h_regularization_weight": getattr(config.training, "h_regularization_weight", 0.0),
@@ -557,6 +559,11 @@ def main():
             input_regularization_weight=getattr(config.training, "input_regularization_weight", 0.01),
             output_regularization_weight=(
                 getattr(config.training, "output_regularization_weight", 0.0)
+                if config.training.use_custom_regularization
+                else 0.0
+            ),
+            tightness_regularization_weight=(
+                getattr(config.training, "tightness_regularization_weight", 0.0)
                 if config.training.use_custom_regularization
                 else 0.0
             ),

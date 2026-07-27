@@ -1,12 +1,12 @@
 """Tests for the certificate SDPs on SimpleLure.
 
-The clean design has these SDPs (see the wiki certificate-synthesis notes):
-  * MaxVol (``_max_vol_sdp`` / ``_max_vol_at_s``) — max invariant-ellipsoid
-    *volume* sⁿˣ·√(det P) over the s-sweep; the OPERATIVE certificate.
-  * MaxS  (``_max_s_sdp``)        — max feasible s; the feasibility ceiling that
-    brackets the MaxVol sweep and the coverage sweep (no longer applied).
-  * Feasibility (``feasibility_problem`` / ``_feasibility_sdp``) — repair P,M,L
-    at a FIXED s (the within-epoch step 3.1); s is never changed here.
+The certificate SDPs live on ``LureCertificateSynthesizer``:
+  * MaxS  (``synthesizer.max_s``) — max feasible s; the OPERATIVE certificate
+    (largest regional invariant set, well conditioned).
+  * MaxVol (``synthesizer.max_vol`` / ``max_vol_at_s``) — max invariant-ellipsoid
+    *volume* sⁿˣ·√(det P) over the s-sweep; available but no longer operative.
+  * Feasibility (``feasibility_problem`` / ``synthesizer.feasibility``) — repair
+    P,M,L at a FIXED s (the within-epoch step 3.1); s is never changed here.
   * MinTrProb (``solve_output_coverage_certificate``) — tested in
     tests/test_output_coverage.py.
 
@@ -100,14 +100,14 @@ class TestMaxS:
         m._apply_certificate_solution(sol)
         assert m.check_constraints()
 
-    def test_post_process_ceiling_matches_max_s(self):
-        """post_process (MaxVol) reports max_s's s as the feasibility ceiling
-        s_feas, and its operative (volume-optimal) s never exceeds that ceiling."""
+    def test_post_process_applies_max_s(self):
+        """post_process now applies MaxS as the operative certificate, so its
+        operative s equals the direct MaxS s."""
         s_direct = _synth(_make_model()).max_s().s
         out = _make_model().post_process()
         assert out["success"]
-        assert out["max_vol"]["s_feas"] == pytest.approx(s_direct, rel=1e-4)
-        assert 0.0 < out["s_opt"] <= s_direct * (1.0 + 1e-6)
+        assert out["max_s"]["s"] == pytest.approx(s_direct, rel=1e-4)
+        assert out["s_opt"] == pytest.approx(out["max_s"]["s"], rel=1e-12)
 
     def test_multiplier_is_nonnegative(self):
         m = _make_moderate_model()
@@ -130,12 +130,39 @@ class TestMaxS:
         assert m.check_constraints()
 
     def test_post_process_runs_for_global_model(self):
-        """post_process routes through MaxVol for the global (L=0) model;
-        s stays fixed (nothing to sweep)."""
+        """post_process routes through MaxS for the global (L=0) model;
+        s stays fixed."""
         out = _make_global_model(s_value=1.0).post_process()
         assert out["success"]
         assert out["s_opt"] == pytest.approx(1.0, rel=1e-9)
         assert out["constraints_satisfied"]
+
+    def test_gamma_zero_is_pure_max_s(self):
+        """gamma=0 (default) must reproduce the pure MaxS certificate exactly —
+        the ceiling semantics (feasibility bracket / s_feas) rely on it."""
+        synth = _synth(_make_moderate_model())
+        base = synth.max_s()
+        g0 = synth.max_s(gamma=0.0)
+        assert base is not None and g0 is not None
+        assert g0.s == pytest.approx(base.s, rel=1e-9)
+        assert np.allclose(g0.P, base.P, rtol=1e-6, atol=1e-9)
+
+    def test_gamma_slides_certificate_along_s_P_gauge(self):
+        """The -gamma*log det P pull is a conditioning knob: larger gamma keeps P
+        off zero (||P|| up, min-eig up) and pulls s down off the MaxS extreme,
+        while the stability LMI stays satisfied (F < 0)."""
+        synth = _synth(_make_moderate_model())
+        sols = [synth.max_s(gamma=g) for g in (0.0, 1.0, 10.0)]
+        assert all(s is not None for s in sols)
+        s_vals = [s.s for s in sols]
+        normP = [float(np.linalg.norm(s.P, 2)) for s in sols]
+        mineigP = [float(np.min(np.linalg.eigvalsh(s.P))) for s in sols]
+        # monotone: gamma up -> ||P|| up, min-eig(P) up, s down
+        assert normP[0] < normP[1] < normP[2]
+        assert mineigP[0] < mineigP[1] < mineigP[2]
+        assert s_vals[0] >= s_vals[1] >= s_vals[2] - 1e-9
+        # stability preserved throughout
+        assert all(s.max_eig_F < 0 for s in sols)
 
 
 @requires_mosek
@@ -228,47 +255,81 @@ def _make_coverage_model(y_max: float = 1.0) -> SimpleLure:
 
 @requires_mosek
 class TestC2Calibration:
-    """C2 calibration: scale C2 so the max-volume set *just* covers the coverage
-    set (rho = vol(MaxVol)/vol(tightest coverage) driven toward 1 from above)."""
+    """C2 calibration: scale C2 so the operative (MaxS) set *just* covers the
+    coverage set (rho = vol(𝒳_MaxS)/vol(tightest coverage) driven toward 1)."""
 
     def test_rho_is_monotone_decreasing_in_c2(self):
-        """More C2 coupling -> smaller certifiable set -> lower volume and lower
-        rho. This is the premise the search relies on."""
+        """More C2 coupling -> smaller MaxS set -> lower volume and lower rho.
+        This is the premise the search relies on."""
         synth = _synth(_make_coverage_model(y_max=1.0))
-        lo = synth.coverage_ratio_at_c2(0.5, 1.0, mv_n_grid=10, cov_n_grid=10)
-        hi = synth.coverage_ratio_at_c2(4.0, 1.0, mv_n_grid=10, cov_n_grid=10)
-        assert lo.max_vol.volume > hi.max_vol.volume  # volume drops
-        assert lo.rho > hi.rho                        # rho drops
+        lo = synth.coverage_ratio_at_c2(0.5, 1.0)
+        hi = synth.coverage_ratio_at_c2(4.0, 1.0)
+        assert lo.cert_volume > hi.cert_volume  # MaxS volume drops
+        assert lo.rho > hi.rho                  # rho drops
 
     def test_calibration_returns_covering_regional_factor(self):
         """Calibration returns the smallest covering set: a finite rho >= 1
         (regional, still covers y_max), reached by growing C2. The synthesizer is
         pure, so the caller scales C2 by the winning factor to apply it."""
         m = _make_coverage_model(y_max=1.0)
-        cal = _synth(m).calibrate_c2(
-            1.0, eps=0.05, max_iter=15, mv_n_grid=10, cov_n_grid=10
-        )
+        cal = _synth(m).calibrate_c2(1.0, eps=0.05, max_iter=15)
         assert cal is not None
         assert 1e-3 <= cal.f <= 1e3
-        # Smallest covering set: rho finite and >= 1 (max set still contains the
-        # coverage requirement); the base was well above the band, so C2 grew.
+        # Smallest covering set: rho finite and >= 1 (MaxS set still contains the
+        # coverage requirement); the base was above the band, so C2 grew.
         assert np.isfinite(cal.rho) and cal.rho >= 1.0 - 1e-6
         assert cal.f > 1.0
         # Apply the winning factor + certificate (what initialize_parameters does)
         # and verify the model is feasible.
         m.C2.data = m.C2.data * cal.f
-        m._apply_certificate_solution(cal.max_vol)
+        m._apply_certificate_solution(cal.cert)
         assert m.check_constraints()
 
     def test_calibration_in_band_flag_matches_rho(self):
         """in_band is exactly the 0 <= rho-1 < eps test on the returned rho."""
         eps = 0.05
         cal = _synth(_make_coverage_model(y_max=2.0)).calibrate_c2(
-            2.0, eps=eps, max_iter=15, mv_n_grid=10, cov_n_grid=10
+            2.0, eps=eps, max_iter=15
         )
         assert cal is not None
         expected = bool(np.isfinite(cal.rho) and 0.0 <= cal.rho - 1.0 < eps)
         assert cal.in_band == expected
+
+    def test_c2_only_calibration_is_stable_and_covering(self):
+        """Single-knob (C2) calibration: largest C2 with zero input-condition
+        violations AND coverage. Admissible (small) inputs -> feasible, stable."""
+        m = _make_coverage_model(y_max=1.0)
+        base = m.C2.detach().cpu().numpy().copy()
+        inputs = 0.02 * torch.ones(3, 40, 1, dtype=torch.float64)  # small -> admissible
+        res = m._calibrate_nonlinearity(inputs, 1.0, knobs=["C2"], eps=0.1, max_iter=12)
+        assert res is not None
+        assert {"factors", "feasible", "cert", "rho", "cov_ok", "n_input_violations"} <= set(res)
+        assert res["knobs"] == ["C2"]
+        # leaves C2 at the winning factor, with the certificate applied + feasible
+        assert np.allclose(m.C2.detach().cpu().numpy(), base * res["factors"]["C2"])
+        assert res["feasible"] and res["n_input_violations"] == 0 and res["cov_ok"]
+        assert m.check_constraints()
+        x0 = torch.zeros(inputs.shape[0], m.nx, dtype=torch.float64)
+        assert m._count_input_violations(inputs, x0, 0) == 0
+
+    def test_multiknob_calibration_no_looser_than_c2_only(self):
+        """Adding B2/D21 as knobs can only find a rho <= the C2-only optimum (same
+        objective, larger feasible set), and leaves all three knobs scaled + feasible."""
+        inp = 0.02 * torch.ones(3, 40, 1, dtype=torch.float64)
+        c2only = _make_coverage_model(y_max=1.0)._calibrate_nonlinearity(
+            inp, 1.0, knobs=["C2"], eps=0.1, max_iter=12
+        )
+        m = _make_coverage_model(y_max=1.0)
+        b2, d21 = m.B2.detach().numpy().copy(), m.D21.detach().numpy().copy()
+        multi = m._calibrate_nonlinearity(inp, 1.0, knobs=["C2", "B2", "D21"], eps=0.1, max_iter=12)
+        assert multi is not None and multi["feasible"] and multi["n_input_violations"] == 0
+        assert set(multi["factors"]) == {"C2", "B2", "D21"}
+        # B2/D21 left at their winning factors; model feasible.
+        assert np.allclose(m.B2.detach().numpy(), b2 * multi["factors"]["B2"])
+        assert np.allclose(m.D21.detach().numpy(), d21 * multi["factors"]["D21"])
+        assert m.check_constraints()
+        # more knobs -> at least as tight (rho no larger, within solver tolerance)
+        assert multi["rho"] <= c2only["rho"] * (1.0 + 1e-3)
 
 
 @requires_mosek
@@ -325,7 +386,7 @@ class TestInitializationInfeasible:
     def test_initialize_parameters_raises_when_max_s_fails(self, monkeypatch):
         m = _make_model()
         # Simulate an infeasible/failed certificate SDP at its root (MaxS): the
-        # calibration, MaxVol and the ceiling all bottom out here.
+        # the calibration, MaxS operative and the ceiling all bottom out here.
         monkeypatch.setattr(LureCertificateSynthesizer, "max_s", lambda self: None)
 
         u = np.zeros((2, 4, 1))

@@ -100,18 +100,22 @@ class CoverageSweepResult:
 
 @dataclass
 class CoverageRatio:
-    """One evaluation of ``rho = vol(MaxVol)/vol(tightest coverage)`` at a given
-    ``C2`` scale factor ``f`` — the search state of the C2 calibration.
+    """One evaluation of ``rho = (ȳ_MaxS/y_max)ⁿˣ = vol(𝒳_MaxS)/vol(𝒳c)`` at a
+    given ``C2`` scale factor ``f`` — the search state of the C2 calibration.
+    ``cert`` is the operative (MaxS) certificate, ``cert_volume`` its ellipsoid
+    volume, and ``cov_volume`` the minimal-covering-set volume (``cert_volume/rho``).
 
-    ``rho`` encodes the degenerate ends so a sign test on ``rho - 1`` brackets the
-    sweet spot: ``+∞`` while globally stable (grow ``f``), ``0`` when ``y_max`` is
-    uncertifiable (shrink ``f``), finite otherwise.
+    ``rho ≥ 1`` ⇔ the MaxS set covers ``y_max`` (grow ``f`` to tighten); ``rho < 1``
+    ⇔ even the max-s set cannot reach ``y_max`` (shrink ``f``). Monotone decreasing
+    in ``f``, so a sign test on ``rho - 1`` brackets the tightest covering ``C2``.
+    ``feasible=False`` (``rho=0``) only when MaxS itself is infeasible.
     """
 
     f: float
     rho: float
     feasible: bool
-    max_vol: Optional[MaxVolSolution] = None
+    cert: Optional[CertificateSolution] = None
+    cert_volume: Optional[float] = None
     cov_sol: Optional[CoverageSolution] = None
     cov_volume: Optional[float] = None
 
@@ -120,27 +124,28 @@ class CoverageRatio:
 class InitializationReport:
     """Flat, log/mlflow-friendly summary of the certificate established at init.
 
-    Aggregates the operative MaxVol certificate diagnostics and (when it ran) the
-    C2 calibration. :meth:`to_metrics` yields the finite scalar metrics for mlflow
-    under the ``initialization/`` namespace.
+    Aggregates the operative MaxS certificate diagnostics (``volume`` is the MaxS
+    ellipsoid volume) and (when it ran) the C2 calibration. :meth:`to_metrics`
+    yields the finite scalar metrics for mlflow under the ``initialization/``
+    namespace.
     """
 
     volume: float
     s: float
-    s_feas: Optional[float]
     norm_H: float
     max_eig_F: float
-    unbounded_volume: bool
     constraints_satisfied: bool
     y_bar: Optional[float] = None
     y_max: Optional[float] = None
     coverage_ok: Optional[bool] = None
     calibrated: bool = False
     c2_factor: Optional[float] = None
+    b2_factor: Optional[float] = None
+    d21_factor: Optional[float] = None
     rho: Optional[float] = None
-    rho_in_band: Optional[bool] = None
+    calibration_feasible: Optional[bool] = None
     calibration_iterations: Optional[int] = None
-    cov_volume: Optional[float] = None
+    n_input_violations: Optional[int] = None
 
     def to_metrics(self) -> dict:
         """The report as ``{metric_name: float}`` — finite scalars only (bools
@@ -149,20 +154,20 @@ class InitializationReport:
         raw = {
             "volume": self.volume,
             "s": self.s,
-            "s_feas": self.s_feas,
             "norm_H": self.norm_H,
             "max_eig_F": self.max_eig_F,
-            "unbounded_volume": self.unbounded_volume,
             "constraints_satisfied": self.constraints_satisfied,
             "y_bar": self.y_bar,
             "y_max": self.y_max,
             "coverage_ok": self.coverage_ok,
             "calibrated": self.calibrated,
             "c2_factor": self.c2_factor,
+            "b2_factor": self.b2_factor,
+            "d21_factor": self.d21_factor,
             "rho": self.rho,
-            "rho_in_band": self.rho_in_band,
+            "calibration_feasible": self.calibration_feasible,
             "calibration_iterations": self.calibration_iterations,
-            "cov_volume": self.cov_volume,
+            "n_input_violations": self.n_input_violations,
         }
         metrics = {}
         for name, value in raw.items():
@@ -176,17 +181,20 @@ class InitializationReport:
 
 @dataclass
 class CalibrationResult:
-    """Result of scaling ``C2`` so the max-volume set just covers the coverage set.
+    """Result of scaling ``C2`` so the operative (MaxS) set just covers the coverage set.
 
     ``f`` is the winning multiplicative factor on the base ``C2``; ``rho`` is
-    ``vol(MaxVol)/vol(tightest coverage)`` at ``f`` (driven toward 1 from above);
-    ``in_band`` is ``0 ≤ rho - 1 < eps``.
+    ``vol(𝒳_MaxS)/vol(tightest coverage)`` at ``f`` (driven toward 1 from above);
+    ``in_band`` is ``0 ≤ rho - 1 < eps``. ``cert`` is the operative MaxS
+    certificate at the winning ``f`` (apply it after scaling C2), ``cert_volume``
+    its ellipsoid volume.
     """
 
     f: float
     rho: float
     in_band: bool
-    max_vol: MaxVolSolution
+    cert: CertificateSolution
+    cert_volume: float
     cov_sol: Optional[CoverageSolution]
     cov_volume: Optional[float]
     iterations: int

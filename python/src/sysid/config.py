@@ -2,9 +2,9 @@
 
 import json
 import logging
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -92,15 +92,23 @@ class InitializationConfig:
     # Upper end of the s sweep band (simple preset; see solve_output_coverage_certificate).
     init_s_max: float = 20.0
 
-    # Calibrate the C2 std at init so the max-volume invariant set *just* covers
-    # the coverage set. Searches a scalar factor on the initialized C2 for
-    # 0 <= rho - 1 < calibrate_c2_eps, where rho = vol(MaxVol)/vol(tightest
-    # coverage): a globally stable init has rho = ∞ (unbounded set), so C2 is
-    # grown until the model turns regional and the set shrinks onto the coverage
-    # requirement. Disable to keep the config C2 std unchanged.
+    # Calibrate the C2 std at init so BOTH conditions hold under the operative
+    # MaxS certificate: (input) the training rollout has zero input-condition
+    # violations (||u_k||^2 <= s^2 - alpha^2 x_k^T P^-1 x_k) -> the trajectory
+    # stays in the invariant set so predictions do not diverge; and (output) the
+    # certified image covers y_max. Searches a scalar factor on the initialized C2
+    # (bisection, relative tol calibrate_c2_eps): both hold for small C2 (large s)
+    # and fail as C2 grows, so it keeps the LARGEST C2 (tightest region) that is
+    # still stable and covering. Disable to keep the config C2 std unchanged.
     calibrate_c2_for_coverage: bool = True
     calibrate_c2_eps: float = 0.05
     calibrate_c2_max_iter: int = 30
+    # Which nonlinearity-shaping maps the calibration may scale. C2 (state->NL) is
+    # the primary tightness knob (bisected); D21 (input->NL) and B2 (NL->state) are
+    # grid-searched — smaller D21 relaxes the input condition and lets C2 grow, so
+    # jointly they reach a much tighter input-admissible certificate. ["C2"] falls
+    # back to the single-knob C2 calibration.
+    calibrate_knobs: List[str] = field(default_factory=lambda: ["C2", "B2", "D21"])
 
 
 @dataclass
@@ -206,6 +214,16 @@ class TrainingConfig:
     # (normalized) safe level (bind Corollary 1): pushes the certified output
     # image to reach the physical data level y_max. 0.0 disables it (default).
     output_regularization_weight: float = 0.0
+
+    # Output-TIGHTNESS regularization weight. The complement of the coverage term:
+    # penalizes relu(lambda_max((output_std*s)^2 C P C^T - y_max^2 I)) (C P C^T
+    # detached, so only the scale s carries gradient), pulling the certified
+    # output half-width y_bar = output_std*s*sqrt(CPC^T) DOWN onto y_max so the
+    # certificate stays tight (y_bar ~ y_max) instead of over-conservative. Use
+    # alongside output_regularization_weight to sandwich y_bar at y_max. Like the
+    # activity/H terms it is NOT decayed (tightness must hold all through
+    # training). 0.0 disables it (default).
+    tightness_regularization_weight: float = 0.0
 
     # Dead-zone activity regularization. Penalizes relu(activity_target - mean||w||)
     # on the rollout so the dead-zone nonlinearity fires, preventing the degenerate
