@@ -21,6 +21,8 @@ import pandas as pd
 import pytest
 import yaml
 
+from tests.solver_utils import requires_mosek
+
 REPO_PY = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_PY / "scripts"
 
@@ -355,8 +357,14 @@ def sweep_integration_root(tmp_path_factory):
     return root, sweep_cfg_path
 
 
+@requires_mosek
 def test_sweep_full_pipeline_single_task(sweep_integration_root):
-    """sweep.py --task-id 0 must exit 0 and produce model + evaluation artefacts."""
+    """sweep.py --task-id 0 must exit 0 and produce model + evaluation artefacts.
+
+    Runs train.py, whose crnn init solves the MaxS certificate SDP via MOSEK;
+    skipped when MOSEK is unavailable (e.g. CI). The fast schema tests above
+    stay unconditional.
+    """
     root, sweep_cfg_path = sweep_integration_root
     subprocess.run(
         [sys.executable, str(SCRIPTS / "sweep.py"),
