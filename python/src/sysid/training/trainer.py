@@ -460,8 +460,9 @@ class Trainer:
                 reg_feasibility_value = reg_feasibility_loss.item()
 
                 loss = pred_loss_div + self.regularization_weight * reg_feasibility_loss
-
-            loss = pred_loss_div
+            else:
+                loss = pred_loss_div
+                
             loss.backward()
 
             if self.gradient_clip_value is not None:

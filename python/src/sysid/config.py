@@ -195,7 +195,7 @@ class TrainingConfig:
     max_epochs: int = 1000
     early_stopping_patience: int = 1000
     checkpoint_frequency: int = 10  # save every N epochs
-    gradient_clip_value: Optional[float] = 1.0
+    gradient_clip_value: Optional[float] = None
 
     # Loss function
     loss_type: str = "mse"  # "mse", "mae", "huber"

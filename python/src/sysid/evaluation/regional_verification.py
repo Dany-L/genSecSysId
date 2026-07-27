@@ -190,7 +190,9 @@ def regional_verification(
     Two regimes are run:
       * **Input violation** — ``x0`` inside the ellipse, LP-filtered noise
         excitation with peak ``factor · s`` (``factor < 1`` is a sanity
-        baseline, ``factor ≥ 1`` violates the input bound).
+        baseline, ``factor ≥ 1`` violates the input bound), followed by a
+        zero-input tail so the state can settle before the final-state
+        feasibility check.
       * **Initial-state violation** — ``x0`` outside the ellipse (radius
         ``initial_state_scale · s/α`` along the ellipse axes), modest
         LP-filtered excitation within the input bound.
@@ -255,10 +257,11 @@ def regional_verification(
     # ------------------------------------------------------------------
     in_amps = [float(f) * s for f in factors]                  # per-factor peak ‖u_n‖
     in_x0 = _sample_on_ellipsoid(rng, X, radius=0.2 * s / max(alpha, 1e-12), n=n_traj)
-    # in_u_per_factor = [
-        
-    #     for amp in in_amps
-    # ]  
+    # For each factor, build one LP-noise excitation per trajectory and append
+    # 400 zero-input steps. The trailing zero tail lets the state settle after
+    # the excitation stops, so the final-state feasibility check (c[-1] > 0)
+    # distinguishes trajectories that return to the safe set from those that
+    # have genuinely diverged.
     in_u_per_factor = []
     for amp in in_amps:
         us = []
@@ -268,7 +271,7 @@ def regional_verification(
             us.append(u_i)
         us = np.stack(us)
         in_u_per_factor.append(us)
-    # list of (n_traj, horizon)
+    # list of (n_traj, horizon + 400)
 
 
 
@@ -292,12 +295,10 @@ def regional_verification(
             _, c = model.get_regularization_input(u_used, xs, return_c=True)
         xs_np = xs.cpu().detach().numpy()
         c_np = c.cpu().detach().numpy()
-        # Divergence: any |state| > threshold OR non-finite anywhere.
-        # max_abs = np.nanmax(np.abs(np.where(np.isfinite(xs_np), xs_np, np.nan)),
-        #                     axis=(1, 2))
-        # any_nan = ~np.isfinite(xs_np).all(axis=(1, 2))
-        # diverged = (max_abs > DIVERGE_THRESHOLD) | any_nan
-        diverged = c_np[:,-1]>0
+        # Divergence: the trajectory is considered diverging if its *last* state
+        # leaves the feasibility region, i.e. the constraint margin c
+        # (from α² xᵀ X x + ‖u‖² ≤ s²) is positive at the final timestep.
+        diverged = c_np[:, -1] > 0
         return xs_np, c_np, diverged
 
     # Concatenate input-violation trajectories across factors for a single
