@@ -1,5 +1,10 @@
 """Evaluation utilities."""
 
+from .divergence_checks import (
+    check_initial_state,
+    check_input_scaling,
+    check_output_bounds,
+)
 from .evaluator import Evaluator
 from .metrics import compute_metrics
 from .post_processing import check_input_condition, plot_post_process_trajectories
@@ -14,6 +19,9 @@ __all__ = [
     "Evaluator",
     "compute_metrics",
     "check_input_condition",
+    "check_initial_state",
+    "check_input_scaling",
+    "check_output_bounds",
     "plot_post_process_trajectories",
     "regional_verification",
     "simulate_model",

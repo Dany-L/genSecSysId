@@ -32,13 +32,15 @@ COLUMNS: List[Tuple[str, str, str]] = [
 ]
 
 # Row order matches the template (\MLtiRnn, \MGenSec, \MStdSec).
-MODEL_ORDER: List[str] = [r"\MLtiRnn{}", r"\MGenSec{}", r"\MStdSec{}"]
+MODEL_ORDER: List[str] = [r"\MLtiRnn{}", r"\MGenSec{}", r"\MGenSec{}_s", r"\MStdSec{}", r"\MStdSec{}_s"]
 
 # stab_type tag value -> template row label (default; the notebook can override).
 STAB_TO_MODEL: Dict[str, str] = {
     "none": r"\MLtiRnn{}",
     "regional": r"\MGenSec{}",
+    "regional_s": r"\MGenSec{}_s",
     "global": r"\MStdSec{}",
+    "global_s": r"\MGenSec{}_s",
 }
 
 Cell = Optional[Tuple[float, float, int]]  # (mean, std, n) or None
@@ -250,12 +252,16 @@ def collect_nrmse_cells(
     verbose: bool = True,
     extra_tags: Optional[Dict[str, object]] = None,
     extra_filter: Optional[str] = None,
+    aggregate: str = "best_group",
 ) -> Dict[str, Dict[Tuple[str, str, str], Cell]]:
     """Pull per-cell ``(mean, std, n)`` NRMSE from MLflow for ``build_table``.
 
-    Per (model x training condition) the best HP group is selected by lowest
-    mean ``rank_metric``; the six categorized NRMSE metrics are then averaged
-    over that group's repeated runs.
+    Per (model x training condition) ``runs.select_best_group`` chooses which
+    runs to aggregate — the same selector ``collect_best_runs`` uses:
+      * ``aggregate="best_group"`` (default): the HP group with the lowest mean
+        ``rank_metric``.
+      * ``aggregate="all"``: every matched run (stab/div tags = whole class).
+    The six categorized NRMSE metrics are then averaged over the selected runs.
 
     ``extra_tags`` / ``extra_filter`` restrict the search further, e.g.
     ``extra_tags={"model.nw": 16}`` to build the table for a single
@@ -278,7 +284,9 @@ def collect_nrmse_cells(
                 if verbose:
                     print(f"  [{stab_key}/{div_key}] no runs — cells left as '--'")
                 continue
-            grp = select_best_group(runs, f"metrics.{rank_metric}")
+            grp = select_best_group(
+                runs, f"metrics.{rank_metric}", aggregate=aggregate
+            )
             if grp is None or grp.empty:
                 if verbose:
                     print(f"  [{stab_key}/{div_key}] no usable HP group")
@@ -295,7 +303,8 @@ def collect_nrmse_cells(
                     std = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
                     cells[model][(tg, dist, traj)] = (mean, std, len(vals))
             if verbose:
-                print(f"  [{stab_key}/{div_key}] best group: n={len(grp)} runs")
+                scope = "class (all)" if aggregate == "all" else "best group"
+                print(f"  [{stab_key}/{div_key}] {scope}: n={len(grp)} runs")
     return cells
 
 

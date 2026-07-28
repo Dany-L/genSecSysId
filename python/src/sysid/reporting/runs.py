@@ -96,19 +96,31 @@ def _group_keys(runs: pd.DataFrame) -> pd.Series:
     return pd.Series("all", index=runs.index)
 
 
-def get_best_mean_group(runs: pd.DataFrame, metric_col: str):
-    """Group with the lowest mean ``metric_col``.
+def get_best_mean_group(
+    runs: pd.DataFrame, metric_col: str, aggregate: str = "best_group"
+):
+    """Best HP group's summary, or the whole class when ``aggregate="all"``.
 
-    Returns ``(run_id, best_val, vals, all_run_ids, mean, std)`` where ``run_id``
-    is the best single run inside the group and ``std`` is ``None`` for n=1.
+    Returns ``(run_id, best_val, vals, all_run_ids, mean, std, group_key)`` where
+    ``run_id`` is the best single run inside the selected group and ``std`` is
+    ``None`` for n=1.
+
+    ``aggregate``:
+      * ``"best_group"`` (default): partition runs into HP groups (see
+        ``_group_keys``) and pick the group with the lowest mean ``metric_col``.
+      * ``"all"``: treat every matched run as one class and aggregate over all of
+        them. Use when the leftover, non-filtered tags are nuisance variation
+        (e.g. initial-parameter scale) rather than tuned hyper-parameters, so the
+        HP sub-grouping would split the class spuriously.
+
+    ``group_key`` identifies the selected group — the ``parentRunId``/param-tuple
+    for ``"best_group"``, the literal ``"all"`` for ``"all"``.
     """
-    keys = _group_keys(runs)
-    best_group, best_mean = None, float("inf")
-    for gk in keys.unique():
-        grp = runs[keys == gk]
-        gm = float(grp[metric_col].mean())
-        if gm < best_mean:
-            best_mean, best_group = gm, grp
+    best_group = select_best_group(runs, metric_col, aggregate=aggregate)
+    group_key = (
+        "all" if aggregate == "all"
+        else _group_keys(runs).loc[best_group.index[0]]
+    )
 
     vals = best_group[metric_col].tolist()
     all_run_ids = best_group["run_id"].tolist()
@@ -122,11 +134,27 @@ def get_best_mean_group(runs: pd.DataFrame, metric_col: str):
         all_run_ids,
         mean,
         std,
+        group_key,
     )
 
 
-def select_best_group(runs: pd.DataFrame, rank_col: str) -> Optional[pd.DataFrame]:
-    """Run DataFrame of the HP group with the lowest mean ``rank_col``."""
+def select_best_group(
+    runs: pd.DataFrame, rank_col: str, aggregate: str = "best_group"
+) -> Optional[pd.DataFrame]:
+    """Run DataFrame of the group to aggregate — the shared selector.
+
+    ``aggregate="best_group"`` (default) returns the HP group with the lowest
+    mean ``rank_col``; ``aggregate="all"`` returns every matched run as a single
+    group (the stab/div tags define the whole class, so the HP sub-grouping is
+    skipped). Used by both ``get_best_mean_group`` and
+    ``tables.collect_nrmse_cells`` so the two stay in sync.
+    """
+    if aggregate not in ("best_group", "all"):
+        raise ValueError(
+            f"aggregate must be 'best_group' or 'all', got {aggregate!r}"
+        )
+    if aggregate == "all":
+        return runs
     keys = _group_keys(runs)
     best_grp, best_mean = None, float("inf")
     for gk in keys.unique():
@@ -151,11 +179,20 @@ def collect_best_runs(
     verbose: bool = True,
     extra_tags: Optional[Dict[str, object]] = None,
     extra_filter: Optional[str] = None,
+    aggregate: str = "best_group",
 ) -> Dict[str, Optional[dict]]:
-    """Best individual run + best HP group per (stab_type x div) combination.
+    """Best individual run + aggregated group per (stab_type x div) combination.
 
     Returns a dict keyed ``"stab=<k>_div=<k>"`` mirroring the notebook's prior
-    ``best_runs`` structure (value ``None`` when nothing matched).
+    ``best_runs`` structure (value ``None`` when nothing matched). Each entry also
+    carries ``group_key`` identifying the aggregated group.
+
+    ``aggregate`` (forwarded to ``get_best_mean_group``): ``"best_group"``
+    (default) aggregates the single best HP sub-group; ``"all"`` aggregates over
+    every matched run, treating the stab/div tags as the whole class definition —
+    use when the leftover tags are nuisance variation (e.g. initial-parameter
+    scale) rather than tuned hyper-parameters. The ``indiv_*`` fields report the
+    best single run over the whole class either way.
 
     ``extra_tags`` / ``extra_filter`` restrict the search further, e.g.
     ``extra_tags={"model.nw": 16}`` to only consider one architecture size
@@ -183,8 +220,8 @@ def collect_best_runs(
                 continue
 
             i_run_id, i_val = get_best_individual(runs, metric_col)
-            m_run_id, m_val, vals, all_run_ids, mean, std = get_best_mean_group(
-                runs, metric_col
+            m_run_id, m_val, vals, all_run_ids, mean, std, group_key = (
+                get_best_mean_group(runs, metric_col, aggregate=aggregate)
             )
             if verbose:
                 std_str = f"{std:.6f}" if std is not None else "N/A"
@@ -192,6 +229,7 @@ def collect_best_runs(
                     f"  [{stab_key}/{div_key}]  indiv={i_val:.6f}  "
                     f"mean={mean:.6f}  std={std_str}  n={len(vals)}"
                 )
+                print(f"      selected group [{group_key}]: {all_run_ids}")
 
             best_runs[label] = {
                 "stab_key": stab_key,
@@ -200,6 +238,7 @@ def collect_best_runs(
                 "indiv_nrmse": i_val,
                 "run_id": m_run_id,
                 "nrmse": m_val,
+                "group_key": group_key,
                 "all_run_ids": all_run_ids,
                 "all_nrmse": vals,
                 "mean": mean,
