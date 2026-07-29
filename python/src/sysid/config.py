@@ -248,6 +248,38 @@ class TrainingConfig:
     h_regularization_weight: float = 0.0
     h_target: float = 0.0  # h_star: target coupling norm ||H||_F (hinge threshold)
 
+    # --- Certificate ownership: theta <- SGD, (P, L, la, s) <- the SDPs ---------
+    # See the wiki note training/certificate-resynthesis. None of P, L, la, s (nor
+    # alpha) appears in the prediction loss, so their only gradient is the
+    # interior-point barrier's -- which has a preferred direction and no
+    # counterweight (the locality barrier rewards 1/s^2 -> inf, i.e. s -> 0, and
+    # the -alpha^2 P block rewards alpha -> 1). Freezing them removes that drift;
+    # the certificate is then re-solved from theta at the epoch boundary instead.
+    freeze_certificate: bool = False
+    freeze_alpha: bool = True  # also freeze tau (alpha); only used with freeze_certificate
+
+    # Hard coverage floor (sigma*s)^2 C P C^T >= y_max^2 I inside the in-epoch
+    # repair, so a repair cannot buy feasibility by shrinking the certified output
+    # image. Two-tier: if the floor makes the repair infeasible the trainer retries
+    # without it (feasible but under-covering) rather than stalling the epoch.
+    # Part of the ownership scheme -- off by default so existing configs are
+    # unchanged; turn it on together with resynthesize_certificate. Needs y_max
+    # (derived from the training targets when not already set by initialization).
+    repair_enforce_coverage: bool = False
+
+    # Per-epoch certificate re-synthesis (TightCert): re-solve (P, L, M, s_hat) for
+    # the current theta with the coverage band as HARD constraints, so
+    # rho = (y_bar/y_max)^nx stays in [1, beta^nx] instead of drifting. One SDP
+    # (~250 ms at nx=2/nz=20); triggered by the FREE rho monitor or by the cadence.
+    # Without y_max it degenerates to MaxS and only the cadence triggers.
+    resynthesize_certificate: bool = False
+    resynthesis_every: int = 1  # cadence in epochs (rho drift triggers regardless)
+    resynthesis_beta: float = 2.0  # initial over-claim budget: y_bar <= beta*y_max
+    resynthesis_beta_min: float = 1.0  # tightest budget the anneal may reach
+    resynthesis_beta_decay: float = 0.9  # per-epoch tightening factor
+    resynthesis_beta_grow: float = 1.5  # widening factor after an all-rollback epoch
+    resynthesis_guard: bool = True  # reject a new cert that adds input violations
+
     # Gradient monitoring
     log_gradients: bool = True  # Log gradient statistics to MLflow
 

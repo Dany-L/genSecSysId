@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Literal, Optional, Tuple, Union, overload
+from typing import Dict, List, Literal, Optional, Tuple, Union, overload
 
 import cvxpy as cp
 import numpy as np
@@ -103,6 +103,11 @@ class SimpleLure(LureInitializationMixin, LureRegularizationMixin, nn.Module):
 
         self.la = nn.Parameter(torch.ones(nz))
         # self.M = torch.diag(self.la)
+
+        # True once freeze_certificate() has run: (P, L, la, s) are SDP-owned and
+        # carry no gradient. Purely informational — the barrier detects the
+        # constant terms from requires_grad, not from this flag.
+        self.certificate_frozen = False
 
         # Create system matrices with structural constraints
         self.A = self._create_constrained_parameter(
@@ -561,7 +566,7 @@ class SimpleLure(LureInitializationMixin, LureRegularizationMixin, nn.Module):
         """
         return LureCertificateSynthesizer.from_model(self)
 
-    def feasibility_problem(self) -> bool:
+    def feasibility_problem(self, enforce_coverage: bool = False) -> bool:
         """Repair the certificate at the **current** (fixed) ``s`` — the
         within-epoch step 3.1.
 
@@ -569,11 +574,20 @@ class SimpleLure(LureInitializationMixin, LureRegularizationMixin, nn.Module):
         SDP (:meth:`LureCertificateSynthesizer.feasibility`) at ``self.s``
         (unchanged) for feasible P, M, L and write them back. Returns ``True`` on
         success; ``False`` when no feasible P, M, L exists at that ``s`` (→ the
-        trainer rolls the step back). ``s`` is owned by gradient + the
-        input/output penalties and is never modified here.
+        trainer rolls the step back or drops to the second tier). ``s`` is never
+        modified here — it is set only by initialization and re-synthesis.
+
+        ``enforce_coverage=True`` adds the **hard coverage floor**
+        ``(σ·s)²·C P Cᵀ ⪰ y_max²·I`` to the repair, so it cannot restore
+        feasibility by shrinking the certified output image. Requires ``y_max``
+        to be set; silently falls back to the floor-free repair otherwise. This
+        is the first tier of the trainer's two-tier repair.
         """
         s = float(self.s.cpu().detach().numpy())
-        sol = self._synth().feasibility(s)
+        y_max = None
+        if enforce_coverage and self.y_max is not None and not bool(torch.isnan(self.y_max)):
+            y_max = float(self.y_max)
+        sol = self._synth().feasibility(s, y_max=y_max)
         if sol is None:
             return False
         # Write back P, L, Λ only — s stays fixed.
@@ -583,6 +597,183 @@ class SimpleLure(LureInitializationMixin, LureRegularizationMixin, nn.Module):
             self.L.data = torch.tensor(sol.L, device=device, dtype=dtype)
         self.la.data = torch.tensor(np.diag(sol.M), device=device, dtype=dtype)
         return True
+
+    # ------------------------------------------------- certificate ownership
+    def freeze_certificate(self, freeze_alpha: bool = True) -> List[str]:
+        """Take the certificate out of the gradient — the ownership split of the
+        re-synthesis scheme: **θ is owned by SGD, (P, L, Λ, s) by the SDPs**.
+
+        Rationale: none of ``P, L, Λ, s`` appears in the prediction loss (the
+        rollout uses only A, B, B2, C, C2, D, D12, D21), so their only gradient is
+        the interior-point barrier's — which has a preferred direction and no
+        counterweight. The locality barrier ``-log det[1/s², l; lᵀ, P]`` rewards
+        ``1/s² → ∞``, i.e. ``s → 0``, which is exactly the observed drift.
+
+        ``freeze_alpha`` also freezes ``τ`` (hence ``α``). ``α`` is *not* in the
+        rollout either, and the ``-α²P`` block means larger ``α`` slackens the
+        stability LMI, so the barrier pushes ``α → 1`` (the weakest contraction
+        claim) with nothing pushing back — the same defect as ``s → 0``, bounded
+        only by the sigmoid.
+
+        After freezing, the ``nz`` locality LMIs contain **no θ at all**, so their
+        barrier terms become additive constants (dropped by
+        :meth:`get_regularization_loss`) and a gradient step can no longer violate
+        them — only the stability LMI can break.
+
+        Returns the names of the parameters that were frozen.
+        """
+        frozen: List[str] = []
+        names = ["P", "la", "s"] + (["L"] if self.learn_L else [])
+        if freeze_alpha:
+            names.append("tau")
+        for name in names:
+            param = getattr(self, name, None)
+            if isinstance(param, nn.Parameter) and param.requires_grad:
+                param.requires_grad = False
+                frozen.append(name)
+        self.certificate_frozen = True
+        logger.info(
+            f"Certificate frozen from autograd: {frozen or 'nothing (already frozen)'} "
+            "(P, L, Λ, s are now SDP-owned)"
+        )
+        return frozen
+
+    def coverage_ratio(self) -> Optional[float]:
+        """The tightness ratio ``ρ = (ȳ/y_max)ⁿˣ`` of the **current** certificate.
+
+        ``ȳ = σ·s·√(λ_min(C P Cᵀ))`` is the certified physical output half-width in
+        the worst output direction, so ``ρ ≥ 1`` ⇔ the certified image covers the
+        data level and ``ρ`` is the volume ratio against the minimal covering set.
+
+        This is the **free drift monitor** of the re-synthesis scheme: a few small
+        matrix products on parameters already in memory, no SDP. Returns ``None``
+        when ``y_max`` is unset (then there is no reference level and re-synthesis
+        must run on a cadence instead).
+        """
+        if self.y_max is None or bool(torch.isnan(self.y_max)):
+            return None
+        y_max = float(self.y_max)
+        if y_max <= 0:
+            return None
+        with torch.no_grad():
+            CPCt = self.C @ self.P @ self.C.T
+            lam_min = max(float(torch.linalg.eigvalsh(CPCt).min()), 0.0)
+            y_bar = float(self.output_std) * float(self.s) * float(np.sqrt(lam_min))
+        return float((y_bar / y_max) ** self.nx)
+
+    def resynthesize_certificate(
+        self,
+        y_max: Optional[float] = None,
+        beta: Optional[float] = 2.0,
+        guard_inputs: Optional[torch.Tensor] = None,
+        guard_x0: Optional[torch.Tensor] = None,
+        warmup_steps: int = 0,
+    ) -> dict:
+        """Re-solve the certificate from the **current θ** and write it back — the
+        per-epoch step of the re-synthesis scheme.
+
+        Calls :meth:`LureCertificateSynthesizer.tight_cert`, which pins
+        ``ρ ∈ [1, βⁿˣ]`` by construction (one SDP; see that method for why the
+        ``ŝ = 1/s²`` substitution makes it convex). Without ``y_max`` the band
+        drops and it degenerates to MaxS.
+
+        ``guard_inputs`` enables the **accept guard**: re-synthesis moves the
+        certificate discontinuously, which moves the input-condition landscape
+        ``‖u_k‖² ≤ s² − α²x_kᵀP⁻¹x_k`` mid-training, so a new certificate is
+        rejected when it would **break a currently clean rollout** — i.e. only when
+        the old certificate had *zero* violating trajectories and the new one has
+        some.
+
+        The guard deliberately does **not** compare counts. A ``n_new ≤ n_old``
+        test locks the certificate up exactly when it must adapt: while the model
+        is diverging, every candidate certificate shows violations, so the test
+        can never pass and κ stays frozen at a stale value through the whole
+        excursion (observed on Duffing — a θ blow-up at epoch 23 vetoed
+        re-synthesis for two epochs while ρ ran to 17). Once the rollout is
+        already violating, the freshly synthesized certificate is the best
+        available claim about the current θ and is always accepted.
+
+        Without ``guard_inputs`` the new certificate is accepted whenever the SDP
+        succeeds.
+
+        Returns a flat, log-friendly dict::
+
+            {"success", "applied", "reason", "s", "rho", "y_bar", "beta",
+             "band_enforced", "norm_P", "n_violations", "n_violations_before"}
+        """
+        if y_max is None and self.y_max is not None and not bool(torch.isnan(self.y_max)):
+            y_max = float(self.y_max)
+
+        saved = {
+            "P": self.P.detach().clone(),
+            "L": self.L.detach().clone(),
+            "la": self.la.detach().clone(),
+            "s": self.s.detach().clone(),
+        }
+
+        def _restore():
+            with torch.no_grad():
+                self.P.data.copy_(saved["P"])
+                self.L.data.copy_(saved["L"])
+                self.la.data.copy_(saved["la"])
+                self.s.data.copy_(saved["s"])
+
+        n_viol_before = (
+            self._count_input_violations(guard_inputs, guard_x0, warmup_steps)
+            if guard_inputs is not None else None
+        )
+
+        sol = self._synth().tight_cert(y_max=y_max, beta=beta)
+        if sol is None:
+            return {
+                "success": False,
+                "applied": False,
+                "reason": "sdp_infeasible",
+                "n_violations_before": n_viol_before,
+            }
+
+        self._apply_certificate_solution(sol)
+
+        n_viol = None
+        if guard_inputs is not None:
+            n_viol = self._count_input_violations(guard_inputs, guard_x0, warmup_steps)
+            # Veto only a clean -> dirty transition; never while the rollout is
+            # already violating (see the docstring: a count comparison would
+            # freeze the certificate for the whole excursion).
+            if n_viol_before == 0 and n_viol > 0:
+                _restore()
+                logger.info(
+                    f"Re-synthesis rejected by the input-condition guard "
+                    f"(clean rollout → {n_viol} violating trajectories); keeping the old "
+                    "certificate."
+                )
+                return {
+                    "success": True,
+                    "applied": False,
+                    "reason": "guard_rejected",
+                    "s": float(sol.s),
+                    "rho": sol.rho,
+                    "y_bar": sol.y_bar,
+                    "beta": sol.beta,
+                    "band_enforced": sol.band_enforced,
+                    "norm_P": sol.norm_P,
+                    "n_violations": n_viol,
+                    "n_violations_before": n_viol_before,
+                }
+
+        return {
+            "success": True,
+            "applied": True,
+            "reason": "ok",
+            "s": float(sol.s),
+            "rho": sol.rho,
+            "y_bar": sol.y_bar,
+            "beta": sol.beta,
+            "band_enforced": sol.band_enforced,
+            "norm_P": sol.norm_P,
+            "n_violations": n_viol,
+            "n_violations_before": n_viol_before,
+        }
 
     def analysis_problem_init(self, learn_B: bool= False, learn_D21: bool = False) -> bool:
 

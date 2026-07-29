@@ -55,6 +55,16 @@ class Trainer:
         output_std: float = 1.0,
         train_div_loader: Optional[DataLoader] = None,
         val_div_loader: Optional[DataLoader] = None,
+        freeze_certificate: bool = False,
+        freeze_alpha: bool = True,
+        repair_enforce_coverage: bool = False,
+        resynthesize_certificate: bool = False,
+        resynthesis_every: int = 1,
+        resynthesis_beta: float = 2.0,
+        resynthesis_beta_min: float = 1.0,
+        resynthesis_beta_decay: float = 0.9,
+        resynthesis_beta_grow: float = 1.5,
+        resynthesis_guard: bool = True,
     ):
         """
         Initialize trainer.
@@ -134,6 +144,29 @@ class Trainer:
         # used only by the _init_output_coverage_level fallback.
         self.output_std = float(output_std)
 
+        # --- Certificate ownership (see the wiki note training/certificate-resynthesis)
+        # theta <- SGD, (P, L, la, s) <- the SDPs. `freeze_certificate` removes the
+        # certificate from autograd (killing the barrier's s -> 0 drift, which has
+        # no counterweight since s is not in the prediction loss);
+        # `resynthesize_certificate` re-solves it from the current theta once per
+        # epoch with the coverage band as a HARD constraint, so rho stays ~1.
+        self.freeze_certificate_flag = bool(freeze_certificate)
+        self.freeze_alpha = bool(freeze_alpha)
+        self.repair_enforce_coverage = bool(repair_enforce_coverage)
+        self.resynthesize_certificate_flag = bool(resynthesize_certificate)
+        self.resynthesis_every = max(int(resynthesis_every), 1)
+        self.resynthesis_beta = float(resynthesis_beta)
+        self.resynthesis_beta_min = float(resynthesis_beta_min)
+        self.resynthesis_beta_decay = float(resynthesis_beta_decay)
+        self.resynthesis_beta_grow = float(resynthesis_beta_grow)
+        self.resynthesis_guard = bool(resynthesis_guard)
+        # Counters / cached guard batch
+        self.resynthesis_applied = 0
+        self.resynthesis_rejected = 0
+        self.resynthesis_failed = 0
+        self.epoch_coverage_repair_fallbacks = 0
+        self._guard_batch: Optional[tuple] = None
+
         # Rollback tracking
         self.rollback_count = 0
         self.epoch_rollback_count = 0
@@ -163,17 +196,40 @@ class Trainer:
         # and hand it to the model for the output-coverage penalty.
         self._init_output_coverage_level()
 
+        # Hand the certificate to the SDPs (must happen after the model is on the
+        # device; safe after the optimizer was built — optimizer.step() skips
+        # parameters whose grad is None).
+        if self.freeze_certificate_flag and hasattr(self.model, "freeze_certificate"):
+            self.model.freeze_certificate(freeze_alpha=self.freeze_alpha)
+        if self.resynthesize_certificate_flag:
+            y_max = getattr(self.model, "y_max", None)
+            has_y_max = y_max is not None and not bool(torch.isnan(y_max))
+            logging.info(
+                "Certificate re-synthesis: enabled "
+                f"(every {self.resynthesis_every} epoch(s), beta0={self.resynthesis_beta}, "
+                f"guard={'on' if self.resynthesis_guard else 'off'})"
+                + ("" if has_y_max else " — y_max unset, TightCert degenerates to MaxS "
+                   "and the rho trigger is unavailable (cadence only)")
+            )
+
     def _init_output_coverage_level(self):
         """Set the model's PHYSICAL safe output level ``y_max`` (fallback path).
 
-        No-op unless output-coverage OR tightness regularization is requested and
-        the model supports it, and skipped when the model already has ``y_max``
-        set — in the normal pipeline ``initialize_parameters`` sets both ``y_max``
-        and ``output_std`` from the raw data + normalizer, so this only fires for
+        No-op unless something needs ``y_max`` — output-coverage or tightness
+        regularization, the hard coverage floor in the repair, or per-epoch
+        re-synthesis — and skipped when the model already has ``y_max`` set: in the
+        normal pipeline ``initialize_parameters`` sets both ``y_max`` and
+        ``output_std`` from the raw data + normalizer, so this only fires for
         directly-constructed / loaded models. The loader yields *normalized*
         targets, so ``max |e| · output_std`` is the physical ``y_max``.
         """
-        if self.output_regularization_weight <= 0 and self.tightness_regularization_weight <= 0:
+        needs_y_max = (
+            self.output_regularization_weight > 0
+            or self.tightness_regularization_weight > 0
+            or self.repair_enforce_coverage
+            or self.resynthesize_certificate_flag
+        )
+        if not needs_y_max:
             return
         if not hasattr(self.model, "set_output_coverage_level"):
             return
@@ -404,6 +460,119 @@ class Trainer:
                 f"Output regularization weight decayed: {old_output_weight:.6e} → {self.output_regularization_weight:.6e}"
             )
 
+    def _get_guard_batch(self):
+        """One cached training batch ``(d, x0)`` for the re-synthesis accept guard."""
+        if self._guard_batch is None:
+            for batch in self.train_loader:
+                d = batch[0].to(self.device)
+                x0 = (
+                    batch[2].to(device=self.device, dtype=d.dtype)
+                    if len(batch) == 3 and batch[2] is not None else None
+                )
+                self._guard_batch = (d, x0)
+                break
+        return self._guard_batch
+
+    def _resynthesize_certificate(self, epoch: int) -> Dict[str, Any]:
+        """Per-epoch certificate re-synthesis — the epoch-boundary step of the
+        ownership scheme (wiki: ``training/certificate-resynthesis``).
+
+        1. Read the **free** drift monitor ``ρ = (ȳ/y_max)ⁿˣ`` (no SDP: a couple of
+           small matrix products on parameters already in memory).
+        2. Re-solve TightCert only when ``ρ`` has left the band ``[1, βⁿˣ]`` or the
+           cadence fires. Without ``y_max`` there is no ``ρ``, so the cadence is
+           the only trigger and TightCert degenerates to MaxS.
+        3. Accept the new certificate unless it increases the input-condition
+           violation count on the cached guard batch.
+        4. Anneal ``β``: widen after an all-rollback epoch (give the model slack
+           back), otherwise tighten geometrically toward ``β_min``.
+
+        Returns the metrics for this epoch (empty when re-synthesis is off).
+        """
+        if not self.resynthesize_certificate_flag or not isinstance(self.model, SimpleLure):
+            return {}
+
+        metrics: Dict[str, Any] = {"beta": self.resynthesis_beta}
+        rho_before = self.model.coverage_ratio()
+        if rho_before is not None:
+            metrics["rho"] = rho_before
+
+        band_hi = self.resynthesis_beta ** self.model.nx
+        out_of_band = rho_before is not None and not (1.0 <= rho_before <= band_hi)
+        cadence = (epoch % self.resynthesis_every) == 0
+        if out_of_band or cadence:
+            guard = self._get_guard_batch() if self.resynthesis_guard else None
+            result = self.model.resynthesize_certificate(
+                beta=self.resynthesis_beta,
+                guard_inputs=guard[0] if guard is not None else None,
+                guard_x0=guard[1] if guard is not None else None,
+                warmup_steps=self.warmup_steps,
+            )
+            metrics["resynth_trigger"] = 1.0 if out_of_band else 0.5  # drift vs cadence
+            if not result["success"]:
+                self.resynthesis_failed += 1
+                logging.warning(
+                    f"Epoch {epoch}: certificate re-synthesis failed "
+                    f"({result['reason']}); keeping the current certificate."
+                )
+            elif result["applied"]:
+                self.resynthesis_applied += 1
+                rho_after = self.model.coverage_ratio()
+                if rho_after is not None:
+                    metrics["rho"] = rho_after
+                metrics["s_resynth"] = result["s"]
+                if result.get("norm_P") is not None:
+                    metrics["norm_P"] = result["norm_P"]
+                logging.info(
+                    f"Epoch {epoch}: certificate re-synthesized — s={result['s']:.4g}, "
+                    f"rho={result['rho'] if result['rho'] is None else round(result['rho'], 4)}"
+                    f" (band [1, {band_hi:.3g}], beta={self.resynthesis_beta:.3g})"
+                )
+            else:
+                self.resynthesis_rejected += 1
+        metrics["resynth_applied"] = float(self.resynthesis_applied)
+        metrics["resynth_rejected"] = float(self.resynthesis_rejected)
+        metrics["resynth_failed"] = float(self.resynthesis_failed)
+
+        # Anneal beta: widen after a fully-rolled-back epoch, else tighten.
+        if self.epoch_rollback_count >= max(len(self.train_loader), 1):
+            self.resynthesis_beta *= self.resynthesis_beta_grow
+        else:
+            self.resynthesis_beta = max(
+                self.resynthesis_beta * self.resynthesis_beta_decay,
+                self.resynthesis_beta_min,
+            )
+        return metrics
+
+    def _repair_certificate(self) -> bool:
+        """Two-tier fixed-``s`` certificate repair. ``False`` ⇒ the caller rolls back.
+
+        Tier 1 repairs P, L, Λ **with** the hard coverage floor
+        ``(σ·s)²·C P Cᵀ ⪰ y_max²·I``, so a repair cannot buy feasibility by
+        shrinking the certified output image. Tier 2 (only if tier 1 is
+        infeasible) drops the floor: the certificate is then feasible but may
+        under-cover, which is preferable to stalling the whole epoch — at
+        ρ ≈ 1 the floor-constrained repair fails often, and the epoch-boundary
+        re-synthesis restores coverage with ``s`` free anyway.
+
+        With ``repair_enforce_coverage=False`` (or no ``y_max``) tier 1 *is* the
+        historical floor-free repair and tier 2 never runs.
+        """
+        if self.model.feasibility_problem(enforce_coverage=self.repair_enforce_coverage):
+            return True
+        if not self.repair_enforce_coverage:
+            return False
+        # Tier 2: retry without the coverage floor.
+        if self.model.feasibility_problem(enforce_coverage=False):
+            self.epoch_coverage_repair_fallbacks += 1
+            logging.debug(
+                "Repair infeasible with the coverage floor; fell back to the "
+                "floor-free repair (certificate may under-cover until the next "
+                "re-synthesis)."
+            )
+            return True
+        return False
+
     def reduce_lr_on_rollback(self, factor: float = 0.5):
         """
         Reduce learning rate when rollbacks occur frequently.
@@ -483,7 +652,7 @@ class Trainer:
 
             if isinstance(self.model, SimpleLure):
                 if not self.model.check_constraints() and self.regularization_weight > 0:
-                    b_feasible = self.model.feasibility_problem()
+                    b_feasible = self._repair_certificate()
                     if not b_feasible:
                         logging.warning(
                             "Diverging batch: Feasibility SDP failed, rolling back parameters"
@@ -522,6 +691,8 @@ class Trainer:
 
         # Reset epoch rollback counter
         self.epoch_rollback_count = 0
+        # Reset the per-epoch count of repairs that had to drop the coverage floor
+        self.epoch_coverage_repair_fallbacks = 0
 
         # Accumulate gradient stats over epoch
         epoch_grad_stats: dict[str, list[float]] = {}
@@ -646,8 +817,8 @@ class Trainer:
             if isinstance(self.model, SimpleLure):
                 if not self.model.check_constraints() and self.regularization_weight > 0:
                     # Constraints violated - repair P, L, M at the current s (fixed-s
-                    # Feasibility); roll back the update if no feasible cert exists.
-                    b_feasible = self.model.feasibility_problem()
+                    # Feasibility, two-tier); roll back if no feasible cert exists.
+                    b_feasible = self._repair_certificate()
 
                     if not b_feasible:
                         # SDP failed - roll back to previous parameters
@@ -826,6 +997,12 @@ class Trainer:
                 ]
             }
 
+            # Epoch boundary: re-solve the certificate for the current theta so it
+            # stays the tightest one this theta admits (rho ~ 1) instead of drifting.
+            # Runs before validation/logging so every metric below reflects the
+            # certificate the model actually carries into the next epoch.
+            resynth_metrics = self._resynthesize_certificate(epoch)
+
             self.train_losses.append(train_loss)
             self.train_pred_losses.append(train_pred_loss)
             self.train_reg_feasibility.append(train_reg_feasibility)
@@ -881,6 +1058,8 @@ class Trainer:
             }
             if "min_eig" in feas_margins:
                 progress_metrics["min_eig"] = f"{feas_margins['min_eig']:.2e}"
+            if "rho" in resynth_metrics:
+                progress_metrics["rho"] = f"{resynth_metrics['rho']:.3g}"
             if train_pred_loss_div is not None:
                 progress_metrics["pred_div"] = f"{train_pred_loss_div:.4f}"
             if val_loss_div is not None:
@@ -963,6 +1142,17 @@ class Trainer:
                 if self.log_gradients:
                     for stat_name, stat_value in grad_stats.items():
                         mlflow.log_metric(stat_name, stat_value, step=epoch)
+
+                # Certificate re-synthesis diagnostics (rho, beta, applied/rejected/
+                # failed counters, the re-synthesized s and ||P||).
+                for name, value in resynth_metrics.items():
+                    mlflow.log_metric(f"resynthesis/{name}", float(value), step=epoch)
+                if self.repair_enforce_coverage:
+                    mlflow.log_metric(
+                        "coverage_repair_fallbacks",
+                        float(self.epoch_coverage_repair_fallbacks),
+                        step=epoch,
+                    )
 
                 if isinstance(self.model, SimpleLure):
                     alpha = 1/(1+ np.exp(-self.model.tau.cpu().detach().numpy()))

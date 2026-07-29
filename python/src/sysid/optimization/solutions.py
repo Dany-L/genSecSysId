@@ -81,6 +81,26 @@ class CoverageSolution(CertificateSolution):
 
 
 @dataclass
+class TightCertSolution(CertificateSolution):
+    """**TightCert** — the ρ-pinned re-synthesis certificate.
+
+    The certificate found with the scale ``ŝ = 1/s²`` as a *decision variable* and
+    the coverage band as hard constraints, so ``ρ = (ȳ/y_max)ⁿˣ ∈ [1, βⁿˣ]`` holds
+    by construction (see the wiki note ``training/certificate-resynthesis``).
+
+    ``band_enforced`` is ``False`` when the band was dropped — no ``y_max``, in
+    which case this degenerates to MaxS and ``rho``/``y_bar`` are ``None``.
+    """
+
+    y_bar: Optional[float] = None
+    rho: Optional[float] = None
+    beta: Optional[float] = None
+    band_enforced: bool = True
+    max_eig_F: float = 0.0
+    norm_P: float = 0.0
+
+
+@dataclass
 class CoveragePoint:
     """One point of the coverage s-sweep."""
 

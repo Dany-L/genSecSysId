@@ -478,6 +478,34 @@ def main():
                 "h_regularization_weight": getattr(config.training, "h_regularization_weight", 0.0),
                 "h_target": getattr(config.training, "h_target", 0.0),
                 "custom_parameters": str(getattr(config.model, "custom_params", None)),
+                # Certificate ownership / re-synthesis — logged so ownership runs
+                # are distinguishable from baseline runs in mlflow.
+                "use_diverging_trajectories": getattr(
+                    config.data, "use_diverging_trajectories", False
+                ),
+                "gradient_clip_value": config.training.gradient_clip_value,
+                "regularization_weight": (
+                    config.training.regularization_weight
+                    if config.training.use_custom_regularization else 0.0
+                ),
+                "freeze_certificate": getattr(config.training, "freeze_certificate", False),
+                "freeze_alpha": getattr(config.training, "freeze_alpha", True),
+                "repair_enforce_coverage": getattr(
+                    config.training, "repair_enforce_coverage", False
+                ),
+                "resynthesize_certificate": getattr(
+                    config.training, "resynthesize_certificate", False
+                ),
+                "resynthesis_every": getattr(config.training, "resynthesis_every", 1),
+                "resynthesis_beta": getattr(config.training, "resynthesis_beta", 2.0),
+                "resynthesis_beta_min": getattr(config.training, "resynthesis_beta_min", 1.0),
+                "resynthesis_beta_decay": getattr(
+                    config.training, "resynthesis_beta_decay", 0.9
+                ),
+                "resynthesis_beta_grow": getattr(
+                    config.training, "resynthesis_beta_grow", 1.5
+                ),
+                "resynthesis_guard": getattr(config.training, "resynthesis_guard", True),
             }
         )
 
@@ -579,6 +607,23 @@ def main():
                 else 0.0
             ),
             h_target=getattr(config.training, "h_target", 0.0),
+            # Certificate ownership / re-synthesis (wiki: training/certificate-resynthesis)
+            freeze_certificate=getattr(config.training, "freeze_certificate", False),
+            freeze_alpha=getattr(config.training, "freeze_alpha", True),
+            repair_enforce_coverage=getattr(
+                config.training, "repair_enforce_coverage", False
+            ),
+            resynthesize_certificate=getattr(
+                config.training, "resynthesize_certificate", False
+            ),
+            resynthesis_every=getattr(config.training, "resynthesis_every", 1),
+            resynthesis_beta=getattr(config.training, "resynthesis_beta", 2.0),
+            resynthesis_beta_min=getattr(config.training, "resynthesis_beta_min", 1.0),
+            resynthesis_beta_decay=getattr(
+                config.training, "resynthesis_beta_decay", 0.9
+            ),
+            resynthesis_beta_grow=getattr(config.training, "resynthesis_beta_grow", 1.5),
+            resynthesis_guard=getattr(config.training, "resynthesis_guard", True),
             output_std=(
                 float(np.asarray(normalizer.output_std).reshape(-1)[0])
                 if normalizer is not None and getattr(normalizer, "output_std", None) is not None

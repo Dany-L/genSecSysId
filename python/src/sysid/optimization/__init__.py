@@ -15,6 +15,7 @@ from .solutions import (
     InitializationReport,
     MaxSSolution,
     MaxVolSolution,
+    TightCertSolution,
     VolumePoint,
 )
 from .synthesizer import LureCertificateSynthesizer
@@ -31,4 +32,5 @@ __all__ = [
     "CoverageRatio",
     "CalibrationResult",
     "InitializationReport",
+    "TightCertSolution",
 ]

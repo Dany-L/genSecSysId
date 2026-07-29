@@ -10,7 +10,8 @@ SDP, each returning a typed result from :mod:`sysid.optimization.solutions`:
 * :meth:`max_vol`        — MaxVol: the max-*volume* invariant-set certificate.
 * :meth:`coverage_at_s`  — the fixed-``s`` binding-coverage SDP.
 * :meth:`coverage_sweep` — the tightest coverage over an s-grid.
-* :meth:`feasibility`    — fixed-``s`` certificate repair.
+* :meth:`feasibility`    — fixed-``s`` certificate repair (optional hard coverage floor).
+* :meth:`tight_cert`     — TightCert: the ρ-pinned re-synthesis solve (``ŝ`` free).
 * :meth:`calibrate_c2`   — scale ``C2`` so MaxVol just covers the coverage set.
 
 Every solve is **pure**: it reads the synthesizer's arrays and returns a solution;
@@ -38,6 +39,7 @@ from .solutions import (
     CoverageSweepResult,
     MaxSSolution,
     MaxVolSolution,
+    TightCertSolution,
     VolumePoint,
 )
 
@@ -375,10 +377,19 @@ class LureCertificateSynthesizer:
         )
 
     # ------------------------------------------------------------- Feasibility
-    def feasibility(self, s: float) -> Optional[CertificateSolution]:
+    def feasibility(
+        self, s: float, y_max: Optional[float] = None
+    ) -> Optional[CertificateSolution]:
         """Fixed-``s`` certificate repair: find P ≻ 0, M ⪰ 0, L satisfying the
         stability + (constant-``1/s²``) locality LMIs, with a well-conditioning
-        ``min t`` (‖P‖ ≤ t, ‖M‖ ≤ t). ``None`` if infeasible / solver fails."""
+        ``min t`` (‖P‖ ≤ t, ‖M‖ ≤ t). ``None`` if infeasible / solver fails.
+
+        ``y_max`` (physical) adds the **hard coverage floor**
+        ``(σ·s)²·C P Cᵀ ⪰ y_max²·I`` so a repair can no longer buy feasibility by
+        shrinking the certified output image. At fixed ``s`` this is just another
+        LMI in ``P``. ``None`` (default) keeps the historical, floor-free repair —
+        the trainer uses it as the second tier when the floor makes the repair
+        infeasible."""
         eps = self.eps
         s_hat = 1.0 / float(s) ** 2
         P = cp.Variable((self.nx, self.nx), symmetric=True)
@@ -393,6 +404,13 @@ class LureCertificateSynthesizer:
             li = L[i, :].reshape((1, -1), order="C")
             constraints.append(
                 cp.bmat([[np.array([[s_hat]]), li], [li.T, P]]) >> eps * np.eye(self.nx + 1)
+            )
+
+        if y_max is not None and float(y_max) > 0:
+            constraints.append(
+                (self.output_std ** 2) / s_hat * self.C @ P @ self.C.T
+                - float(y_max) ** 2 * np.eye(self.ne)
+                >> eps * np.eye(self.ne)
             )
 
         t = cp.Variable((1, 1))
@@ -410,6 +428,129 @@ class LureCertificateSynthesizer:
             L=L.value if self.learn_L else L,
             M=M.value,
             s=float(s),
+        )
+
+    # ---------------------------------------------------------- TightCert (ρ≈1)
+    def tight_cert(
+        self, y_max: Optional[float] = None, beta: Optional[float] = 2.0
+    ) -> Optional[TightCertSolution]:
+        """**TightCert** — re-synthesize the certificate with ``ρ`` pinned into
+        ``[1, βⁿˣ]``. The per-epoch solve of the certificate-re-synthesis scheme.
+
+        The key structural fact: substituting ``ŝ = 1/s²`` makes *every* constraint
+        jointly linear in ``(P, L, M, ŝ)`` — the stability LMI ``F`` contains no
+        ``s`` at all, locality is ``[[ŝ, lᵢ], [lᵢᵀ, P]] ⪰ 0``, and both coverage
+        sides come from multiplying through by ``ŝ > 0``::
+
+            (C↓)  (σ·s)²·C P Cᵀ ⪰ y_max²·I    ⟺   σ²·C P Cᵀ ⪰ y_max²·ŝ·I
+            (C↑)  (σ·s)²·C P Cᵀ ⪯ β²y_max²·I  ⟺   σ²·C P Cᵀ ⪯ β²y_max²·ŝ·I
+
+        so this is ONE SDP — no s-grid, no bisection. (The *irreducible*
+        bilinearity of the coverage problem is ``ŝ·Ỹ`` with a **variable** output
+        level ``Ỹ``; here the level is the constant ``y_max``, so it does not
+        appear. Likewise the volume objective ``log det P − nx·log ŝ`` would be
+        non-convex, which is why the objective below is conditioning, not volume.)
+
+        Objective ``min t`` s.t. ``‖P‖ ≤ t, ‖M‖ ≤ t``: with (C↓) binding,
+        shrinking ``‖P‖`` *forces* ``ŝ`` down, i.e. ``s`` **up** — the counter-push
+        the ``-log det`` barrier lacks. ``ŝ`` cannot run away because the
+        non-homogeneous disturbance blocks of ``F`` bound ``P`` from below.
+
+        Degenerate cases:
+
+        * ``y_max is None`` (or ``β`` unset, or ``ne`` mismatch) — the band drops
+          and ``min t`` no longer pins the scale at all, so this falls back to
+          :meth:`max_s` (``min ŝ``), the operative certificate today. The returned
+          solution has ``band_enforced=False``.
+        * ``not learn_L`` — ``s`` is frozen and locality is dropped; ``ŝ`` is held
+          at ``1/s_fixed²`` and only ``P, M`` move under the band.
+
+        Note for ``ne > 1``: the two-sided band constrains *every* output
+        direction, which forces a near-isotropic certified image. Intended for
+        ``ne == 1``; pass ``beta=None`` for a floor-only solve otherwise.
+        """
+        if y_max is None or float(y_max) <= 0:
+            sol = self.max_s()
+            if sol is None:
+                return None
+            return TightCertSolution(
+                P=sol.P, L=sol.L, M=sol.M, s=sol.s,
+                y_bar=None, rho=None, beta=None, band_enforced=False,
+                max_eig_F=sol.max_eig_F,
+                norm_P=float(np.linalg.norm(sol.P, ord=2)),
+            )
+
+        eps = self.eps
+        y_max = float(y_max)
+        sigma = self.output_std
+
+        P = cp.Variable((self.nx, self.nx), symmetric=True)
+        m = cp.Variable((self.nz, 1))
+        M = cp.diag(m)
+        L = cp.Variable((self.nz, self.nx)) if self.learn_L else self.L_fixed
+        # ŝ = 1/s² is a decision variable exactly when s is (i.e. with learn_L).
+        S_hat = (
+            cp.Variable(nonneg=True) if self.learn_L
+            else 1.0 / float(self.s_fixed) ** 2
+        )
+
+        F = self._build_F(P, L, M)
+        nF = F.shape[0]
+        constraints = [F << -eps * np.eye(nF), m >= 0]
+
+        if self.learn_L:
+            S_block = cp.reshape(S_hat, (1, 1), order="C")
+            for i in range(self.nz):
+                li = L[i, :].reshape((1, -1), order="C")
+                constraints.append(
+                    cp.bmat([[S_block, li], [li.T, P]]) >> eps * np.eye(self.nx + 1)
+                )
+
+        I_e = np.eye(self.ne)
+        CPCt = (sigma ** 2) * self.C @ P @ self.C.T
+        constraints.append(CPCt - (y_max ** 2) * S_hat * I_e >> eps * I_e)  # (C↓)
+        if beta is not None and float(beta) > 0:
+            constraints.append(
+                (float(beta) ** 2) * (y_max ** 2) * S_hat * I_e - CPCt >> 0
+            )  # (C↑)
+
+        t = cp.Variable((1, 1))
+        constraints += [cp.norm(P) <= t, cp.norm(M) <= t]
+        problem = cp.Problem(cp.Minimize(t), constraints)
+        try:
+            problem.solve(solver=cp.MOSEK, verbose=False)
+        except Exception as e:
+            logger.debug(f"TightCert SDP failed (y_max={y_max:.4g}, beta={beta}): {e}")
+            return None
+        if problem.status not in ("optimal", "optimal_inaccurate"):
+            logger.debug(
+                f"TightCert SDP status={problem.status} (y_max={y_max:.4g}, beta={beta})"
+            )
+            return None
+
+        P_val = P.value
+        s_star = (
+            float(1.0 / np.sqrt(float(S_hat.value))) if self.learn_L else float(self.s_fixed)
+        )
+        CPCt_val = self.C @ P_val @ self.C.T
+        lam_min = max(float(np.min(np.linalg.eigvalsh(CPCt_val))), 0.0)
+        y_bar = float(sigma * s_star * np.sqrt(lam_min))
+        rho = float((y_bar / y_max) ** self.nx)
+        logger.debug(
+            f"TightCert solved: s={s_star:.4g}, ȳ={y_bar:.4g} (y_max={y_max:.4g}), "
+            f"rho={rho:.4g}, ‖P‖={np.linalg.norm(P_val, ord=2):.4g}"
+        )
+        return TightCertSolution(
+            P=P_val,
+            L=L.value if self.learn_L else L,
+            M=M.value,
+            s=s_star,
+            y_bar=y_bar,
+            rho=rho,
+            beta=float(beta) if beta is not None else None,
+            band_enforced=True,
+            max_eig_F=float(np.max(np.real(np.linalg.eigvals(F.value)))),
+            norm_P=float(np.linalg.norm(P_val, ord=2)),
         )
 
     # ------------------------------------------------------- C2 calibration

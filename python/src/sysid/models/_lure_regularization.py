@@ -23,16 +23,38 @@ class LureRegularizationMixin:
         parameters (all eigenvalues > 0); the barrier grows to ``+∞`` as any
         constraint approaches its boundary.
 
+        **Constant terms are skipped.** A term whose matrix does not require grad
+        contributes nothing but a constant offset to the loss. This matters once
+        the certificate is SDP-owned (:meth:`SimpleLure.freeze_certificate`): the
+        ``nz`` locality LMIs ``[1/s², l_i; l_iᵀ, P]`` are built from ``s, L, P``
+        **only** — no θ — so with the certificate frozen they become constants and
+        the barrier reduces to the single stability term ``-log det(-F(θ; κ))``.
+        That is also precisely why freezing removes the ``s → 0`` drift: the
+        ``∂/∂s ≈ +2·nz/s`` push came from terms that are now constant. (Skipping
+        them also saves ``nz`` small log-dets per batch; the reported
+        ``reg_feasibility`` value drops the constant offset accordingly.)
+
         Returns:
             Regularization loss (sum of negative log-determinants).
         """
+        # Only skip constants when a gradient is actually being built; under
+        # ``no_grad`` (monitoring/eval) nothing requires grad, so the full barrier
+        # value is still reported.
+        skip_constants = torch.is_grad_enabled()
+
         feasibility_loss = torch.tensor(0.0, device=self.P.device)
         for f_i in self.get_lmis():
-            # feasibility_loss += torch.relu(-torch.logdet(f_i()))
-            feasibility_loss += -torch.logdet(f_i())
+            F = f_i()
+            if skip_constants and not F.requires_grad:
+                continue  # constant term (frozen certificate) — no gradient
+            # feasibility_loss += torch.relu(-torch.logdet(F))
+            feasibility_loss += -torch.logdet(F)
         for s_i in self.get_scalar_inequalities():
-            # feasibility_loss += torch.relu(-torch.log(s_i()).squeeze())
-            feasibility_loss += -torch.log(s_i()).squeeze()
+            val = s_i()
+            if skip_constants and torch.is_tensor(val) and not val.requires_grad:
+                continue
+            # feasibility_loss += torch.relu(-torch.log(val).squeeze())
+            feasibility_loss += -torch.log(val).squeeze()
 
         return feasibility_loss
 
