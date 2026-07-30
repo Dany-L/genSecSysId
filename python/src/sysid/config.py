@@ -110,6 +110,17 @@ class InitializationConfig:
     # back to the single-knob C2 calibration.
     calibrate_knobs: List[str] = field(default_factory=lambda: ["C2", "B2", "D21"])
 
+    # Subsample the calibration rollout (0 = use everything). Each candidate costs
+    # one SDP (~200 ms) PLUS one rollout of the training set, and the rollout is a
+    # python loop over the sequence, so at 60x4000 it is ~76% of the candidate.
+    # The "rho" objective evaluates ~275 candidates (36 (B2,D21) combos x a C2
+    # bisection) => ~4 min per model, i.e. hours for a sweep. Calibrating a SCALE
+    # does not need the whole dataset: 8x1500 is ~20x cheaper. Caveat: the
+    # input-violation count and the firing rate are then estimated on the subset,
+    # so keep enough trajectories to contain the input peaks.
+    calibrate_rollout_trajectories: int = 0
+    calibrate_rollout_steps: int = 0
+
 
 @dataclass
 class ModelConfig:

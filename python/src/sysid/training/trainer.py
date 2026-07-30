@@ -523,7 +523,7 @@ class Trainer:
                 metrics["s_resynth"] = result["s"]
                 if result.get("norm_P") is not None:
                     metrics["norm_P"] = result["norm_P"]
-                logging.info(
+                logging.debug(
                     f"Epoch {epoch}: certificate re-synthesized — s={result['s']:.4g}, "
                     f"rho={result['rho'] if result['rho'] is None else round(result['rho'], 4)}"
                     f" (band [1, {band_hi:.3g}], beta={self.resynthesis_beta:.3g})"
@@ -1147,6 +1147,19 @@ class Trainer:
                 # failed counters, the re-synthesized s and ||P||).
                 for name, value in resynth_metrics.items():
                     mlflow.log_metric(f"resynthesis/{name}", float(value), step=epoch)
+
+                # Dead-zone activity: firing_rate == 0 means the nonlinearity is inert
+                # on the data, i.e. the model is LTI in this regime and no gradient
+                # reaches B2/C2/D21 (Delta'(z) = 0 in the band) — an absorbing state
+                # that only the initialization can avoid. Watch it from epoch 0.
+                if hasattr(self.model, "deadzone_activity"):
+                    guard = self._get_guard_batch()
+                    if guard is not None:
+                        act = self.model.deadzone_activity(
+                            guard[0], guard[1], warmup_steps=self.warmup_steps
+                        )
+                        for name, value in act.items():
+                            mlflow.log_metric(f"deadzone/{name}", float(value), step=epoch)
                 if self.repair_enforce_coverage:
                     mlflow.log_metric(
                         "coverage_repair_fallbacks",

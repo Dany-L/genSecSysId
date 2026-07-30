@@ -638,6 +638,55 @@ class SimpleLure(LureInitializationMixin, LureRegularizationMixin, nn.Module):
         )
         return frozen
 
+    def deadzone_activity(
+        self,
+        inputs: torch.Tensor,
+        x0: Optional[torch.Tensor] = None,
+        warmup_steps: int = 0,
+    ) -> Dict[str, float]:
+        """How much the nonlinearity actually fires on a rollout.
+
+        Rolls the model out on ``inputs`` and reports where the pre-activation
+        ``z_k = C2·x_k + D21·d_k`` leaves the dead band ``|z| ≤ 1``:
+
+        * ``firing_rate`` — fraction of (step, unit) pairs with ``|z| > 1``;
+        * ``steps_firing`` — fraction of steps where *any* unit fires;
+        * ``units_firing`` — fraction of units that fire at least once;
+        * ``max_abs_z`` — the largest ``|z|`` reached.
+
+        Why this matters: for the dead-zone activation ``Δ'(z) = 0`` inside the
+        band, so when ``firing_rate == 0`` **no gradient from the prediction loss
+        reaches B2, C2 or D21** — the model is LTI on that data and the collapse is
+        an absorbing state that training cannot escape (only the initialization
+        can). It is therefore a first-class init/training diagnostic, not a
+        curiosity. Note a *small* rate is normal and can be optimal: the
+        nonlinearity's job may be the peaks and the out-of-regime behaviour rather
+        than the bulk of the fit.
+
+        Only meaningful for the ``dzn`` activation, where ``|z| ≤ 1`` is exactly
+        the linear regime.
+        """
+        with torch.no_grad():
+            if hasattr(self, "forward_unfiltered"):
+                _, (x, _), d_applied = self.forward_unfiltered(inputs, x0)
+            else:
+                _, (x, _), d_applied = self.forward(inputs, x0, warmup_steps=warmup_steps)
+            if x.dim() == 4:
+                x = x.squeeze(-1)
+            n = min(x.shape[1], d_applied.shape[1])
+            x, d = x[:, warmup_steps:n, :], d_applied[:, warmup_steps:n, :]
+            if x.shape[1] == 0:
+                return {"firing_rate": 0.0, "steps_firing": 0.0,
+                        "units_firing": 0.0, "max_abs_z": 0.0}
+            z = x @ self.C2.T + d @ self.D21.T  # (B, N, nz)
+            fired = z.abs() > 1.0
+            return {
+                "firing_rate": float(fired.double().mean()),
+                "steps_firing": float(fired.any(dim=-1).double().mean()),
+                "units_firing": float(fired.any(dim=0).any(dim=0).double().mean()),
+                "max_abs_z": float(z.abs().max()),
+            }
+
     def coverage_ratio(self) -> Optional[float]:
         """The tightness ratio ``ρ = (ȳ/y_max)ⁿˣ`` of the **current** certificate.
 

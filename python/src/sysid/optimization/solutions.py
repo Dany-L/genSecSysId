@@ -166,6 +166,16 @@ class InitializationReport:
     calibration_feasible: Optional[bool] = None
     calibration_iterations: Optional[int] = None
     n_input_violations: Optional[int] = None
+    # Dead-zone activity on the training rollout at init. ``firing_rate`` is the
+    # fraction of (step, unit) pairs outside the dead band, ``units_firing`` the
+    # fraction of units that ever fire and ``max_abs_z`` the largest |z| reached.
+    # firing_rate == 0 means the nonlinearity is inert on the training data: the
+    # model is LTI *in that regime*, and — because Δ'(z) = 0 inside the dead band —
+    # no gradient reaches B2/C2/D21 through the prediction loss, so training can
+    # never escape it. Watch this whenever the calibration runs.
+    firing_rate: Optional[float] = None
+    units_firing: Optional[float] = None
+    max_abs_z: Optional[float] = None
 
     def to_metrics(self) -> dict:
         """The report as ``{metric_name: float}`` — finite scalars only (bools
@@ -188,6 +198,9 @@ class InitializationReport:
             "calibration_feasible": self.calibration_feasible,
             "calibration_iterations": self.calibration_iterations,
             "n_input_violations": self.n_input_violations,
+            "firing_rate": self.firing_rate,
+            "units_firing": self.units_firing,
+            "max_abs_z": self.max_abs_z,
         }
         metrics = {}
         for name, value in raw.items():

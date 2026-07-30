@@ -10,6 +10,7 @@ provided at runtime via the MRO.
 import itertools
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -69,8 +70,11 @@ class LureInitializationMixin:
 
         # Normalize inputs for the MinTrProb init below (initialize_s_from_conditions
         # expects normalized inputs).
+        train_outputs_n = train_outputs
         if normalizer is not None:
             train_inputs = normalizer.transform_inputs(train_inputs)
+            if hasattr(normalizer, "transform_outputs"):
+                train_outputs_n = normalizer.transform_outputs(train_outputs)
 
         self._init_identity(normalizer)
 
@@ -111,7 +115,9 @@ class LureInitializationMixin:
             # _calibrate_nonlinearity logs its own header/per-combo/summary progress
             # and leaves the knob params + certificate at the winning point.
             cal = self._calibrate_nonlinearity(
-                train_inputs, y_max, knobs=knobs, eps=eps, max_iter=max_iter
+                train_inputs, y_max, knobs=knobs, eps=eps, max_iter=max_iter,
+                rollout_trajectories=int(getattr(init_config, "calibrate_rollout_trajectories", 0)),
+                rollout_steps=int(getattr(init_config, "calibrate_rollout_steps", 0)),
             )
 
         # Operative certificate: MaxS — the largest regional invariant set, well
@@ -144,6 +150,23 @@ class LureInitializationMixin:
         self._apply_certificate_solution(cert_sol)
         constraints_ok = self.check_constraints()
 
+        # Dead-zone activity of the final initialized model. Reported always (not
+        # just when the calibration ran): firing_rate == 0 means the nonlinearity is
+        # inert on the training data and, because Δ'(z) = 0 in the dead band, training
+        # can never revive it — so this is the number that decides whether the model
+        # class is usable at all.
+        activity: Dict[str, float] = {}
+        if train_inputs is not None:
+            try:
+                inp = torch.as_tensor(
+                    np.asarray(train_inputs), dtype=self.C2.dtype, device=self.C2.device
+                )
+                if inp.dim() == 2:
+                    inp = inp.unsqueeze(-1)
+                activity = self.deadzone_activity(inp)
+            except Exception as exc:  # diagnostics must never break initialization
+                logger.debug(f"Dead-zone activity probe failed: {exc}")
+
         report = InitializationReport(
             volume=volume_c,
             s=float(s_c),
@@ -164,6 +187,9 @@ class LureInitializationMixin:
                 int(cal["n_input_violations"])
                 if cal is not None and cal["n_input_violations"] is not None else None
             ),
+            firing_rate=activity.get("firing_rate"),
+            units_firing=activity.get("units_firing"),
+            max_abs_z=activity.get("max_abs_z"),
         )
         logger.info(
             "INITIALIZATION certificate (MaxS): "
@@ -173,6 +199,20 @@ class LureInitializationMixin:
             f"calibration_feasible={report.calibration_feasible}, "
             f"constraints_satisfied={constraints_ok}"
         )
+        if report.firing_rate is not None:
+            logger.info(
+                f"INITIALIZATION dead-zone activity: firing_rate="
+                f"{100 * report.firing_rate:.3f}% of (step, unit) pairs, "
+                f"units_firing={100 * (report.units_firing or 0.0):.0f}%, "
+                f"max|z|={report.max_abs_z:.3f} (dead band |z|<=1)"
+            )
+            if report.firing_rate <= 0.0:
+                logger.warning(
+                    "INITIALIZATION: the dead zone is INERT on the training data — the "
+                    "model is LTI in this regime and, since Δ'(z)=0 inside the band, no "
+                    "gradient reaches B2/C2/D21, so training cannot revive it. "
+                    "Diagnostic only; the initialization does not optimize for firing."
+                )
         self._last_init_report = report
         return report
 
@@ -186,6 +226,8 @@ class LureInitializationMixin:
         grid: Tuple[float, ...] = (0.01, 0.03, 0.1, 0.3, 1.0, 3.0),
         f_min: float = 1e-3,
         f_max: float = 1e3,
+        rollout_trajectories: int = 0,
+        rollout_steps: int = 0,
     ) -> Optional[dict]:
         """Scale the nonlinearity-shaping maps ``{C2, B2, D21}`` so the operative
         MaxS certificate is the **tightest** one for which BOTH init conditions
@@ -215,11 +257,32 @@ class LureInitializationMixin:
         this and gets stuck. ``knobs=["C2"]`` reduces to the single-knob C2
         bisection (no grid).
 
+        **Cost.** Each candidate is one ``max_s`` SDP (~200 ms) *plus* one full
+        rollout of the training set, and the rollout is a Python loop over the
+        sequence, so at 60×4000 it dominates (~700 ms, 76 % of the candidate).
+        The ``rho`` path evaluates ~275 candidates (36 ``(B2, D21)`` combos, each
+        with a C2 bisection) ⇒ ~4 min *per model*, which is what makes a sweep take
+        hours. Three levers, in order of effect:
+
+        * ``rollout_trajectories`` / ``rollout_steps`` subsample the calibration
+          rollout (0 = use everything). This is a *scale* decision, so a handful of
+          trajectories is ample; 5×1000 is ~5× cheaper than 60×4000. Caveat: the
+          input-violation count and the firing rate are then estimated on the
+          subsample, so keep enough trajectories to contain the input peaks.
+        * a candidate that already fails the coverage gate is infeasible whatever
+          the rollout says, so its rollout is **skipped** (free; big on the ``rho``
+          path, where the bisection spends most evaluations below the coverage
+          floor).
+        * ``knobs=["C2"]`` reduces the search to a single ~7-evaluation bisection
+          instead of 36 combos x a bisection each.
+
         Needs the (normalised) training inputs for the rollout. Mutates the knob
         params + certificate during the search and leaves them at the winning
-        point. Returns a result dict (``factors`` per knob, ``rho``, ``feasible``,
-        ``cov_ok``, ``n_input_violations``, ``cert``, ``knobs``, ``n_evals``).
+        point. Returns a result dict (``factors`` per knob, ``rho``,
+        ``firing_rate``, ``feasible``, ``cov_ok``, ``n_input_violations``,
+        ``cert``, ``knobs``, ``n_evals``).
         """
+        t_start = time.perf_counter()
         device, dtype = self.C2.device, self.C2.dtype
         ALL = ["C2", "B2", "D21"]
         requested = list(knobs) if knobs is not None else list(ALL)
@@ -241,19 +304,44 @@ class LureInitializationMixin:
         inputs = torch.as_tensor(np.asarray(inputs_n), dtype=dtype, device=device)
         if inputs.dim() == 2:
             inputs = inputs.unsqueeze(-1)
+
+        # Subsample the calibration rollout — it is ~76% of every candidate's cost.
+        n_traj_all, n_step_all = inputs.shape[0], inputs.shape[1]
+        if rollout_trajectories and 0 < int(rollout_trajectories) < n_traj_all:
+            # Evenly spaced, so the subset keeps the spread of the input amplitudes.
+            idx = torch.linspace(
+                0, n_traj_all - 1, int(rollout_trajectories), device=device
+            ).round().long().unique()
+            inputs = inputs[idx]
+        if rollout_steps and 0 < int(rollout_steps) < n_step_all:
+            inputs = inputs[:, : int(rollout_steps)]
+        if inputs.shape[0] != n_traj_all or inputs.shape[1] != n_step_all:
+            logger.info(
+                f"  calibration rollout subsampled: {n_traj_all}x{n_step_all} -> "
+                f"{inputs.shape[0]}x{inputs.shape[1]} "
+                f"({(n_traj_all * n_step_all) / (inputs.shape[0] * inputs.shape[1]):.1f}x cheaper; "
+                "the input-violation count and firing rate are estimated on this subset), "
+                f"max|u_n| kept = {float(inputs.abs().max()):.4g} of {float(torch.as_tensor(np.asarray(inputs_n)).abs().max()):.4g}"
+            )
         x0 = torch.zeros((inputs.shape[0], self.nx), dtype=dtype, device=device)
         logger.info(
             f"Nonlinearity calibration: knobs={active}, y_max={y_max:.4g}, "
             f"max|u_n|={float(inputs.abs().max()):.4g}, grid={tuple(float(g) for g in grid)} "
-            f"— minimizing rho s.t. 0 input violations + coverage."
+            "— minimizing rho s.t. 0 input violations + coverage."
         )
 
         memo: Dict[tuple, dict] = {}
-        best = {"rho": float("inf"), "feasible": False, "cert": None, "cov_ok": False,
-                "n_input_violations": None, "factors": {k: 1.0 for k in ALL}}
+        _EMPTY = {"rho": float("inf"), "firing_rate": 0.0,
+                  "feasible": False, "cert": None, "cov_ok": False,
+                  "n_input_violations": None, "factors": {k: 1.0 for k in ALL}}
+        best = dict(_EMPTY)
+        # Best-scoring candidate that merely HAS a certificate, ignoring the other
+        # gates — a far better fallback than the smallest-C2 corner when nothing is
+        # strictly feasible.
+        best_any = dict(_EMPTY)
 
         def eval_at(factors: dict) -> dict:
-            nonlocal best
+            nonlocal best, best_any
             key = tuple(round(float(factors[k]), 12) for k in ALL)
             if key in memo:
                 return memo[key]
@@ -264,6 +352,7 @@ class LureInitializationMixin:
             mv = self._synth().max_s()
             if mv is None:
                 memo[key] = {"feasible": False, "cert": None, "rho": float("inf"),
+                             "firing_rate": 0.0,
                              "cov_ok": False, "n_input_violations": None,
                              "factors": dict(factors)}
                 return memo[key]
@@ -274,23 +363,41 @@ class LureInitializationMixin:
             y_bar = float(sigma * mv.s * np.sqrt(lam_min))            # worst output dir
             rho = float((y_bar / y_max) ** self.nx) if y_max > 0 else float("inf")
             cov_ok = bool(y_bar >= y_max)
+            if not cov_ok:
+                # Already infeasible on a criterion the SDP alone decides — the
+                # rollout (the expensive part) cannot change that verdict. On the
+                # rho path the bisection spends most of its evaluations here.
+                r = {"feasible": False, "cert": mv, "rho": rho,
+                     "firing_rate": 0.0, "cov_ok": False, "n_input_violations": None,
+                     "factors": dict(factors), "rollout_skipped": True}
+                memo[key] = r
+                return r
             # Input condition over the FULL rollout (warmup 0): a divergent rollout
             # gives huge/±inf/nan c_k -> map those to a violation (unlike
             # _count_input_violations, which maps nan to -inf).
             with torch.no_grad():
                 if hasattr(self, "forward_unfiltered"):
-                    _, (x, _), u_applied = self.forward_unfiltered(inputs, x0)
+                    e_hat, (x, _), u_applied = self.forward_unfiltered(inputs, x0)
                 else:
-                    _, (x, _), u_applied = self.forward(inputs, x0, warmup_steps=0)
+                    e_hat, (x, _), u_applied = self.forward(inputs, x0, warmup_steps=0)
                 _, c = self.get_regularization_input(u_applied, x, return_c=True, warmup_steps=0)
                 c = torch.nan_to_num(c, nan=1.0, posinf=1.0, neginf=-1.0)
                 n_viol = int((c > 0).any(dim=1).sum())
+                # Same rollout, two more numbers: does the dead zone fire, and how
+                # well does this candidate predict? Both are free here.
+                xs = x.squeeze(-1) if x.dim() == 4 else x
+                n = min(xs.shape[1], u_applied.shape[1])
+                z = xs[:, :n, :] @ self.C2.T + u_applied[:, :n, :] @ self.D21.T
+                firing = float((z.abs() > 1.0).double().mean())
             feasible = bool(cov_ok and n_viol == 0)
-            r = {"feasible": feasible, "cert": mv, "rho": rho, "cov_ok": cov_ok,
+            r = {"feasible": feasible, "cert": mv, "rho": rho,
+                 "firing_rate": firing, "cov_ok": cov_ok,
                  "n_input_violations": n_viol, "factors": dict(factors)}
             memo[key] = r
-            if feasible and rho < best["rho"]:
+            if feasible and r["rho"] < best["rho"]:
                 best = dict(r)
+            if r["rho"] < best_any["rho"]:
+                best_any = dict(r)
             return r
 
         def bisect_c2(factors: dict) -> dict:
@@ -340,14 +447,29 @@ class LureInitializationMixin:
                 s_str = f"{res['cert'].s:.3f}" if res.get("cert") is not None else "n/a"
                 logger.info(
                     f"  [{i_c}/{len(combos)}] {combo_str}: C2×{res['factors']['C2']:.3g} "
-                    f"-> s={s_str}, rho={res['rho']:.4g}, input_viol={res['n_input_violations']}, "
+                    f"-> s={s_str}, rho={res['rho']:.4g}, firing={100*res['firing_rate']:.3f}%, "
+                    f"input_viol={res['n_input_violations']}, "
                     f"feasible={res['feasible']}  (running best rho={best['rho']:.4g})"
                 )
         else:
             eval_at({k: 1.0 for k in ALL})  # no active knobs -> evaluate the base
 
         if best["cert"] is None:
-            # Nothing feasible was found. Fall back to the most-global attempt
+            # Nothing satisfied every gate. Prefer the best-SCORING candidate that at
+            # least admits a certificate over the smallest-C2 corner: that corner has
+            # a huge s and a vacuous rho, and (with a divergent rollout) can even look
+            # "firing" and "input-admissible" while being useless.
+            if best_any["cert"] is not None:
+                logger.warning(
+                    "Nonlinearity calibration: no candidate satisfied every gate; "
+                    "keeping the best-rho certified candidate instead "
+                    f"(rho={best_any['rho']:.5g}, "
+                    f"input_viol={best_any['n_input_violations']}, "
+                    f"firing={100 * best_any['firing_rate']:.3f}%)."
+                )
+                best = dict(best_any)
+        if best["cert"] is None:
+            # Not even a certificate anywhere: fall back to the most-global attempt
             # (smallest C2 -> largest s -> most likely stable + covering), else base.
             logger.warning(
                 "Nonlinearity calibration: no (stable + covering) factors found; "
@@ -359,6 +481,7 @@ class LureInitializationMixin:
                     getattr(self, k).data = torch.tensor(bases[k], device=device, dtype=dtype)
                 mv = self._synth().max_s()
                 best = {"feasible": False, "cert": mv, "rho": float("nan"),
+                        "firing_rate": float("nan"),
                         "cov_ok": False, "n_input_violations": None,
                         "factors": {k: 1.0 for k in ALL}}
 
@@ -371,12 +494,28 @@ class LureInitializationMixin:
             self._apply_certificate_solution(best["cert"])
         best["knobs"] = active
         best["n_evals"] = len(memo)
+        n_skipped = sum(1 for v in memo.values() if v.get("rollout_skipped"))
+        elapsed = time.perf_counter() - t_start
+        logger.info(
+            f"Nonlinearity calibration cost: {elapsed:.1f}s, {len(memo)} candidates "
+            f"({n_skipped} rollouts skipped as already-infeasible), "
+            f"rollout {inputs.shape[0]}x{inputs.shape[1]}"
+        )
         facs = ", ".join(f"{k}×{best['factors'][k]:.3g}" for k in active) or "(none)"
         logger.info(
-            f"Nonlinearity calibration DONE: [{facs}] rho={best['rho']:.4f}, "
+            f"Nonlinearity calibration DONE: [{facs}] "
+            f"rho={best['rho']:.4f}, "
+            f"firing={100 * best.get('firing_rate', float('nan')):.3f}%, "
             f"input_viol={best['n_input_violations']}, coverage_ok={best['cov_ok']}, "
             f"feasible={best['feasible']}, n_evals={best['n_evals']}"
         )
+        if not best.get("firing_rate"):
+            logger.warning(
+                "Nonlinearity calibration: the dead zone NEVER fires on the training "
+                "rollout — the model is LTI in this regime and, since Δ'(z)=0 inside "
+                "the band, no gradient will reach B2/C2/D21. Reported as a diagnostic; "
+                "the calibration does not optimize for it."
+            )
         return best
 
     def _resolve_init_spec(
@@ -484,7 +623,7 @@ class LureInitializationMixin:
                 # )
             self._set_param_data('B', B_init)
 
-        # --- B2, C2, D21: random (configurable std) ---
+        # --- B2, C2, D21: random (configurable std), or C2 by breakpoint placement ---
         if not self._should_skip_initialization('B2'):
             B2_init = self._resolve_init_spec('B2', (self.nx, self.nw), default_std=float(self.ts))
             self._set_param_data('B2', B2_init)
