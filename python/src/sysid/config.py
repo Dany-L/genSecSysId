@@ -284,12 +284,21 @@ class TrainingConfig:
     # (~250 ms at nx=2/nz=20); triggered by the FREE rho monitor or by the cadence.
     # Without y_max it degenerates to MaxS and only the cadence triggers.
     resynthesize_certificate: bool = False
-    resynthesis_every: int = 1  # cadence in epochs (rho drift triggers regardless)
+    # Cadence in epochs for an UNCONDITIONAL re-solve. 0 = off, i.e. re-synthesize
+    # only when rho actually leaves [1, beta^nx] -- which is the point: if rho is in
+    # band there is nothing to fix, the certificate is valid (the per-batch repair
+    # keeps the LMIs satisfied) and tight. Keep a large value only as a safety net.
+    resynthesis_every: int = 0
     resynthesis_beta: float = 2.0  # initial over-claim budget: y_bar <= beta*y_max
     resynthesis_beta_min: float = 1.0  # tightest budget the anneal may reach
     resynthesis_beta_decay: float = 0.9  # per-epoch tightening factor
     resynthesis_beta_grow: float = 1.5  # widening factor after an all-rollback epoch
     resynthesis_guard: bool = True  # reject a new cert that adds input violations
+    # Restore rho to the geometric middle of [1, beta^nx] rather than its lower
+    # edge. Without this the solve's min-||P|| objective lands rho ON the alarm
+    # line (measured: rho = 1.029 in a band of [1, 1.1025]), so the drift test
+    # fires almost every epoch however the cadence is set.
+    resynthesis_target_mid: bool = True
 
     # Gradient monitoring
     log_gradients: bool = True  # Log gradient statistics to MLflow

@@ -406,6 +406,47 @@ class TestTrainerOwnership:
         t = _make_trainer(tmp_path, m)
         assert t._resynthesize_certificate(0) == {}
 
+    def test_cadence_off_means_rho_only(self, tmp_path, monkeypatch):
+        """resynthesis_every <= 0: nothing fires while rho stays inside the band."""
+        m = _make_model(s_value=0.05)
+        m.set_output_coverage_level(0.01, output_std=1.0)   # rho = 25, inside [1, 1e12]
+        t = _make_trainer(
+            tmp_path, m, resynthesize_certificate=True, resynthesis_every=0,
+            resynthesis_beta=1e6, resynthesis_beta_decay=1.0, resynthesis_beta_min=1e6,
+        )
+        seen = []
+        monkeypatch.setattr(m, "resynthesize_certificate",
+                            lambda **kw: (seen.append(1), {"success": True, "applied": True,
+                                                           "s": 1.0, "rho": 1.0, "reason": "ok",
+                                                           "norm_P": 1.0})[1])
+        for epoch in range(5):
+            t._resynthesize_certificate(epoch)
+        assert seen == []
+
+    def test_logs_rho_before_and_after(self, tmp_path, monkeypatch):
+        """The drift itself must be visible: `rho` alone is the POST value."""
+        m = _make_model(s_value=0.05)
+        m.set_output_coverage_level(100.0, output_std=1.0)   # rho << 1 -> triggers
+        t = _make_trainer(tmp_path, m, resynthesize_certificate=True, resynthesis_every=0)
+        monkeypatch.setattr(m, "resynthesize_certificate", lambda **kw: {
+            "success": True, "applied": False, "reason": "guard_rejected"})
+        out = t._resynthesize_certificate(3)
+        assert "rho_before" in out and out["rho_before"] < 1.0
+        assert out["resynth_trigger"] == 1.0
+
+    def test_target_mid_inflates_the_solved_level(self, tmp_path, monkeypatch):
+        """Restore to the middle of [1, beta^nx], not to its lower edge."""
+        m = _make_model(s_value=0.05)
+        m.set_output_coverage_level(1.0, output_std=1.0)
+        t = _make_trainer(tmp_path, m, resynthesize_certificate=True, resynthesis_every=1,
+                          resynthesis_beta=4.0, resynthesis_target_mid=True)
+        seen = {}
+        monkeypatch.setattr(m, "resynthesize_certificate", lambda **kw: (
+            seen.update(kw), {"success": True, "applied": False, "reason": "guard_rejected"})[1])
+        t._resynthesize_certificate(0)
+        assert seen["y_max"] == pytest.approx(2.0)   # sqrt(beta) * y_max
+        assert seen["beta"] == pytest.approx(2.0)    # sqrt(beta)
+
     def test_cadence_skips_epochs(self, tmp_path, monkeypatch):
         m = _make_model(s_value=0.05)
         # ȳ = 0.05 vs y_max = 0.01 -> rho = 25, inside the [1, (1e6)^2] band, so
@@ -444,11 +485,35 @@ class TestTrainerOwnership:
         assert len(seen) == 1
         assert t.resynthesis_rejected == 1
 
+    def test_beta_holds_still_on_a_triggered_epoch(self, tmp_path, monkeypatch):
+        """The requirement must not move while the certificate is chasing it."""
+        m = _make_model(s_value=0.05)
+        m.set_output_coverage_level(100.0, output_std=1.0)   # rho << 1 -> out of band
+        t = _make_trainer(tmp_path, m, resynthesize_certificate=True, resynthesis_every=0,
+                          resynthesis_beta=2.0, resynthesis_beta_decay=0.5,
+                          resynthesis_beta_min=1.0)
+        monkeypatch.setattr(m, "resynthesize_certificate", lambda **kw: {
+            "success": True, "applied": True, "s": 1.0, "rho": 1.0,
+            "reason": "ok", "norm_P": 1.0})
+        t._resynthesize_certificate(0)
+        assert t.resynthesis_beta == pytest.approx(2.0)   # unchanged
+
+    def test_beta_tightens_on_a_healthy_epoch(self, tmp_path, monkeypatch):
+        """rho comfortably in band => the band is too loose => squeeze it."""
+        m = _make_model(s_value=0.05)
+        m.set_output_coverage_level(0.01, output_std=1.0)   # rho = 25, well inside
+        t = _make_trainer(tmp_path, m, resynthesize_certificate=True, resynthesis_every=0,
+                          resynthesis_beta=1e6, resynthesis_beta_decay=0.5,
+                          resynthesis_beta_min=1.0)
+        t._resynthesize_certificate(0)
+        assert t.resynthesis_beta == pytest.approx(0.5e6)
+
     def test_beta_anneals_down_and_floors(self, tmp_path, monkeypatch):
-        m = _make_model()
-        m.set_output_coverage_level(0.9, output_std=1.0)
+        m = _make_model(s_value=2.0)
+        # y_bar = 2.0 => rho = (2/1.3333)^2 = 2.25, inside [1, beta^2 = 4]
+        m.set_output_coverage_level(1.33333333, output_std=1.0)
         t = _make_trainer(
-            tmp_path, m, resynthesize_certificate=True, resynthesis_every=1000,
+            tmp_path, m, resynthesize_certificate=True, resynthesis_every=1,
             resynthesis_beta=2.0, resynthesis_beta_decay=0.5, resynthesis_beta_min=1.1,
         )
         monkeypatch.setattr(m, "resynthesize_certificate", lambda **kw: {

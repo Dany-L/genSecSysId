@@ -59,12 +59,13 @@ class Trainer:
         freeze_alpha: bool = True,
         repair_enforce_coverage: bool = False,
         resynthesize_certificate: bool = False,
-        resynthesis_every: int = 1,
+        resynthesis_every: int = 0,
         resynthesis_beta: float = 2.0,
         resynthesis_beta_min: float = 1.0,
         resynthesis_beta_decay: float = 0.9,
         resynthesis_beta_grow: float = 1.5,
         resynthesis_guard: bool = True,
+        resynthesis_target_mid: bool = True,
     ):
         """
         Initialize trainer.
@@ -154,12 +155,16 @@ class Trainer:
         self.freeze_alpha = bool(freeze_alpha)
         self.repair_enforce_coverage = bool(repair_enforce_coverage)
         self.resynthesize_certificate_flag = bool(resynthesize_certificate)
-        self.resynthesis_every = max(int(resynthesis_every), 1)
+        # <= 0 disables the cadence: re-synthesize only when rho leaves the band.
+        self.resynthesis_every = int(resynthesis_every)
         self.resynthesis_beta = float(resynthesis_beta)
         self.resynthesis_beta_min = float(resynthesis_beta_min)
         self.resynthesis_beta_decay = float(resynthesis_beta_decay)
         self.resynthesis_beta_grow = float(resynthesis_beta_grow)
         self.resynthesis_guard = bool(resynthesis_guard)
+        # Restore rho to the geometric middle of [1, beta^nx] instead of its
+        # lower edge, so the drift test is not a knife edge.
+        self.resynthesis_target_mid = bool(resynthesis_target_mid)
         # Counters / cached guard batch
         self.resynthesis_applied = 0
         self.resynthesis_rejected = 0
@@ -206,7 +211,8 @@ class Trainer:
             has_y_max = y_max is not None and not bool(torch.isnan(y_max))
             logging.info(
                 "Certificate re-synthesis: enabled "
-                f"(every {self.resynthesis_every} epoch(s), beta0={self.resynthesis_beta}, "
+                f"({'cadence off — rho-triggered only' if self.resynthesis_every <= 0 else f'every {self.resynthesis_every} epoch(s)'}"
+                f", beta0={self.resynthesis_beta}, "
                 f"guard={'on' if self.resynthesis_guard else 'off'})"
                 + ("" if has_y_max else " — y_max unset, TightCert degenerates to MaxS "
                    "and the rho trigger is unavailable (cadence only)")
@@ -496,14 +502,33 @@ class Trainer:
         rho_before = self.model.coverage_ratio()
         if rho_before is not None:
             metrics["rho"] = rho_before
+            metrics["rho_before"] = rho_before  # kept even when the solve overwrites `rho`
 
+        # Alarm at the band EDGE, restore to the band MIDDLE. The solve's objective
+        # (min ‖P‖ subject to the coverage floor) otherwise lands ρ *on* the lower
+        # edge, so the next epoch's drift crosses it whatever the cadence is —
+        # measured: ρ = 1.029 against a band of [1, 1.1025], i.e. 2.9 % of headroom,
+        # and the drift test fired on 51 of 100 epochs. Solving against a slightly
+        # inflated y_max puts ρ at the geometric middle instead, leaving room on
+        # both sides. Note ρ < 1 means the certified image no longer covers the data,
+        # so the LOWER edge gets no tolerance — only the target moves.
         band_hi = self.resynthesis_beta ** self.model.nx
         out_of_band = rho_before is not None and not (1.0 <= rho_before <= band_hi)
-        cadence = (epoch % self.resynthesis_every) == 0
+        # `resynthesis_every <= 0` disables the cadence entirely (event-driven only).
+        cadence = self.resynthesis_every > 0 and (epoch % self.resynthesis_every) == 0
         if out_of_band or cadence:
             guard = self._get_guard_batch() if self.resynthesis_guard else None
+            y_max_target = None
+            if self.resynthesis_target_mid:
+                y_max = getattr(self.model, "y_max", None)
+                if y_max is not None and not bool(torch.isnan(y_max)):
+                    # ȳ target = √β · y_max  ⇒  ρ_target = β^(nx/2), the geometric
+                    # middle of [1, β^nx]. The band handed to the SDP shrinks to
+                    # [√β, β] · y_max, which stays inside the requested band.
+                    y_max_target = float(y_max) * float(np.sqrt(self.resynthesis_beta))
             result = self.model.resynthesize_certificate(
-                beta=self.resynthesis_beta,
+                y_max=y_max_target,
+                beta=float(np.sqrt(self.resynthesis_beta)) if y_max_target else self.resynthesis_beta,
                 guard_inputs=guard[0] if guard is not None else None,
                 guard_x0=guard[1] if guard is not None else None,
                 warmup_steps=self.warmup_steps,
@@ -520,6 +545,7 @@ class Trainer:
                 rho_after = self.model.coverage_ratio()
                 if rho_after is not None:
                     metrics["rho"] = rho_after
+                    metrics["rho_after"] = rho_after
                 metrics["s_resynth"] = result["s"]
                 if result.get("norm_P") is not None:
                     metrics["norm_P"] = result["norm_P"]
@@ -534,10 +560,18 @@ class Trainer:
         metrics["resynth_rejected"] = float(self.resynthesis_rejected)
         metrics["resynth_failed"] = float(self.resynthesis_failed)
 
-        # Anneal beta: widen after a fully-rolled-back epoch, else tighten.
+        # Anneal beta. It is the band that *drives* tightening, so it cannot be
+        # left to move only when the band is violated: with a loose start nothing
+        # would ever trigger, so beta would never shrink and the certificate would
+        # stay loose forever. Nor should it march on the clock — that squeezes rho
+        # out of the band by itself and manufactures a re-solve every epoch.
+        # The rule is therefore: tighten on a HEALTHY epoch (rho stayed in the band
+        # and the model is not rolling back) — the band is then demonstrably looser
+        # than it needs to be. Hold it still on an epoch that already needed a
+        # re-solve; widen after an all-rollback epoch.
         if self.epoch_rollback_count >= max(len(self.train_loader), 1):
             self.resynthesis_beta *= self.resynthesis_beta_grow
-        else:
+        elif not out_of_band:
             self.resynthesis_beta = max(
                 self.resynthesis_beta * self.resynthesis_beta_decay,
                 self.resynthesis_beta_min,

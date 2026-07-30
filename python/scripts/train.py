@@ -496,7 +496,7 @@ def main():
                 "resynthesize_certificate": getattr(
                     config.training, "resynthesize_certificate", False
                 ),
-                "resynthesis_every": getattr(config.training, "resynthesis_every", 1),
+                "resynthesis_every": getattr(config.training, "resynthesis_every", 0),
                 "resynthesis_beta": getattr(config.training, "resynthesis_beta", 2.0),
                 "resynthesis_beta_min": getattr(config.training, "resynthesis_beta_min", 1.0),
                 "resynthesis_beta_decay": getattr(
@@ -506,6 +506,7 @@ def main():
                     config.training, "resynthesis_beta_grow", 1.5
                 ),
                 "resynthesis_guard": getattr(config.training, "resynthesis_guard", True),
+                "resynthesis_target_mid": getattr(config.training, "resynthesis_target_mid", True),
             }
         )
 
@@ -616,7 +617,7 @@ def main():
             resynthesize_certificate=getattr(
                 config.training, "resynthesize_certificate", False
             ),
-            resynthesis_every=getattr(config.training, "resynthesis_every", 1),
+            resynthesis_every=getattr(config.training, "resynthesis_every", 0),
             resynthesis_beta=getattr(config.training, "resynthesis_beta", 2.0),
             resynthesis_beta_min=getattr(config.training, "resynthesis_beta_min", 1.0),
             resynthesis_beta_decay=getattr(
@@ -624,6 +625,7 @@ def main():
             ),
             resynthesis_beta_grow=getattr(config.training, "resynthesis_beta_grow", 1.5),
             resynthesis_guard=getattr(config.training, "resynthesis_guard", True),
+            resynthesis_target_mid=getattr(config.training, "resynthesis_target_mid", True),
             output_std=(
                 float(np.asarray(normalizer.output_std).reshape(-1)[0])
                 if normalizer is not None and getattr(normalizer, "output_std", None) is not None
