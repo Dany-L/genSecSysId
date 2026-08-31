@@ -42,7 +42,8 @@ def test_format_cell_other_styles_and_std_decimals():
 
 
 def test_build_table_per_column_emphasis():
-    means = {r"\MLtiRnn{}": 0.3, r"\MGenSec{}": 0.1, r"\MStdSec{}": 0.2}
+    means = {r"\MLtiRnn{}": 0.3, r"\MGenSec{}": 0.1, r"\MStdSec{}": 0.2,
+             r"\MGenSec{}_s": 0.4, r"\MStdSec{}_s": 0.5}
     cells = {m: {c: (means[m], 0.01, 3) for c in tables.COLUMNS} for m in tables.MODEL_ORDER}
     tex = tables.build_table(cells)
     lines = {m: next(l for l in tex.splitlines() if l.startswith(m)) for m in tables.MODEL_ORDER}
@@ -57,7 +58,8 @@ def test_build_table_per_column_emphasis():
 
 
 def test_build_table_train_six_columns():
-    means = {r"\MLtiRnn{}": 0.3, r"\MGenSec{}": 0.1, r"\MStdSec{}": 0.2}
+    means = {r"\MLtiRnn{}": 0.3, r"\MGenSec{}": 0.1, r"\MStdSec{}": 0.2,
+             r"\MGenSec{}_s": 0.4, r"\MStdSec{}_s": 0.5}
     cells = {
         m: {("yes", d, t): (means[m], 0.01, 3) for d in tables.DISTS for t in tables.TRAJS}
         for m in tables.MODEL_ORDER

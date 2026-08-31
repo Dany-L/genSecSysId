@@ -1,16 +1,13 @@
-"""Tests for the dead-zone firing diagnostic and the fit-ranked calibration.
+"""Tests for the dead-zone firing diagnostic and the ZOH discretisation.
 
 Background: for the ``dzn`` activation ``Δ'(z) = 0`` inside the dead band, so a
 model whose nonlinearity never fires on the training data is LTI *in that regime*
 **and unrecoverable** — no gradient from the prediction loss ever reaches B2, C2 or
-D21. Only the initialization can prevent it. These tests cover the three pieces
-that make that visible and avoidable:
+D21. Only the initialization can prevent it.
 
 - ``deadzone_activity`` — the firing-rate DIAGNOSTIC (init report + per epoch).
   The initialization deliberately does **not** optimize for firing; this only
   makes an inert nonlinearity visible.
-- ``_calibrate_nonlinearity`` — unchanged min-rho semantics, plus the rollout
-  subsampling / already-infeasible skip that make it affordable.
 """
 
 import numpy as np
@@ -72,16 +69,45 @@ class TestDeadzoneActivity:
         assert act["max_abs_z"] > 1.0
         assert 0.0 <= act["steps_firing"] <= 1.0
 
-    @requires_mosek
-    def test_rho_objective_is_unchanged(self):
-        """Back-compat: the default path still minimizes rho and reports the same keys."""
-        m = _make_model(nw=4)
-        u = 0.2 * torch.randn(2, 20, 1, dtype=m.C2.dtype).numpy()
-        cal = m._calibrate_nonlinearity(u, y_max=0.5, knobs=["C2"])
-        assert cal is not None
-        for key in ("factors", "rho", "feasible", "cov_ok", "n_input_violations",
-                    "cert", "knobs", "n_evals", "firing_rate"):
-            assert key in cal
+
+class TestZohDiscretisation:
+    """A must be the EXACT ZOH discretisation, not forward Euler.
+
+    Euler is what made the reference Lur'e model of the Duffing diverge on 2/60
+    training trajectories the plant handles (and cost 4x in open-loop nrmse) — the
+    error is the integrator, not the nonlinearity. See the wiki note
+    running-example/reference-model.
+    """
+
+    def test_matches_matrix_exponential(self):
+        from sysid.models._lure_initialization import _zoh_discretize
+        A_ct = torch.tensor([[0.0, 1.0], [-1.0, -0.3]], dtype=torch.float64)
+        ts = 0.05
+        d = _zoh_discretize(A_ct, ts)
+        assert torch.allclose(d["A"], torch.matrix_exp(A_ct * ts), atol=1e-12)
+        # the Duffing reference values from the wiki note
+        assert d["A"].numpy() == pytest.approx(
+            np.array([[0.99875649, 0.04960619], [-0.04960619, 0.98387463]]), abs=1e-8
+        )
+        B = d["int"] @ torch.tensor([[0.0], [1.0]], dtype=torch.float64)
+        assert B.ravel().numpy() == pytest.approx([0.00124351, 0.04960619], abs=1e-8)
+
+    def test_differs_from_euler_and_is_more_accurate(self):
+        from sysid.models._lure_initialization import _zoh_discretize
+        A_ct = torch.tensor([[0.0, 1.0], [-1.0, -0.3]], dtype=torch.float64)
+        ts = 0.05
+        zoh = _zoh_discretize(A_ct, ts)["A"]
+        euler = torch.eye(2, dtype=torch.float64) + A_ct * ts
+        exact = torch.matrix_exp(A_ct * ts)
+        assert not torch.allclose(zoh, euler, atol=1e-6)          # they really differ
+        assert (zoh - exact).abs().max() < (euler - exact).abs().max()
+
+    def test_zoh_integral_reduces_to_ts_for_a_nilpotent_free_case(self):
+        from sysid.models._lure_initialization import _zoh_discretize
+        A_ct = torch.zeros((2, 2), dtype=torch.float64)           # A_ct = 0 -> int = ts*I
+        d = _zoh_discretize(A_ct, 0.05)
+        assert torch.allclose(d["A"], torch.eye(2, dtype=torch.float64))
+        assert torch.allclose(d["int"], 0.05 * torch.eye(2, dtype=torch.float64))
 
 
 class TestInitializationReport:

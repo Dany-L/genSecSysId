@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..models.base import BaseRNN
-from .metrics import compute_metrics, compute_simulation_metrics
+from .metrics import compute_metrics
 
 
 class Evaluator:

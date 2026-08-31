@@ -1,11 +1,17 @@
-"""Tests for the output-coverage certificate (bind Corollary 1).
+"""Tests for the output-coverage certificate, as an ANALYSIS quantity.
+
+Coverage is no longer imposed anywhere: the floor ``(sigma*s)^2 C P C^T >= y_max^2 I``
+was dropped from training because the model class provably cannot reach it on this
+benchmark (the certified set is an ellipsoid inscribed in a non-ellipsoidal basin —
+see the wiki note certificate-synthesis/ellipsoidal-conservatism, and the fitted
+reference model measures rho = 0.42 < 1). What remains, and is tested here, is
+measuring and reporting it.
 
 Covers:
-- ``max_abs_output`` utility (the data-derived safe output level y_max).
-- ``SimpleLure.get_regularization_output`` output-coverage penalty and its
-  physical ``y_max`` / ``output_std`` buffers.
-- ``SimpleLure.solve_output_coverage_certificate`` final binding SDP + s-sweep
-  (needs MOSEK; skipped otherwise).
+- ``max_abs_output`` utility (the data-derived output level y_max).
+- the trainer RECORDING y_max/output_std on the model for reporting.
+- ``SimpleLure.solve_output_coverage_certificate`` binding SDP + s-sweep and the
+  post-process coverage report (needs MOSEK; skipped otherwise).
 """
 
 import numpy as np
@@ -96,94 +102,6 @@ class TestMaxAbsOutput:
         assert max_abs_output(y_phys / std) == pytest.approx(2.0)
 
 
-class TestOutputCoverageRegularization:
-    def test_zero_when_unset(self):
-        """No coverage level -> no-op penalty (0), no gradient."""
-        m = _make_model()
-        loss = m.get_regularization_output()
-        assert float(loss) == 0.0
-
-    def test_penalty_positive_when_undercovered(self):
-        """ybar = s*sqrt(CPC^T) with s,P small -> ybar << y_max -> penalty > 0."""
-        m = _make_model(s_value=0.05)  # tiny s -> tiny output image
-        m.set_output_coverage_level(1.0)  # demand a large certified output
-        loss, margin = m.get_regularization_output(return_margin=True)
-        assert float(loss) > 0.0
-        assert float(margin) > 0.0  # deficit = y_max^2 - s^2 CPC^T > 0
-
-    def test_zero_when_covered(self):
-        """Large s -> output image reaches the (small) demanded level -> 0."""
-        m = _make_model(s_value=5.0)  # s^2 = 25, C=[1,0], P=I -> s^2 CPC^T = 25
-        m.set_output_coverage_level(1.0)  # demand ybar >= 1 (25 >= 1)
-        loss = m.get_regularization_output()
-        assert float(loss) == pytest.approx(0.0, abs=1e-9)
-
-    def test_gradient_grows_the_output_image(self):
-        """The penalty gradient must push s (and CPC^T) up to reduce the deficit."""
-        m = _make_model(s_value=0.2)
-        m.set_output_coverage_level(1.0)
-        loss = m.get_regularization_output()
-        loss.backward()
-        # Increasing s reduces the deficit y_max^2 - s^2 CPC^T, so dL/ds < 0.
-        assert m.s.grad is not None
-        assert float(m.s.grad) < 0.0
-
-    def test_buffer_survives_to_device_and_dtype(self):
-        m = _make_model()
-        m.set_output_coverage_level(0.75)
-        assert float(m.y_max) == pytest.approx(0.75)  # stored physical
-        assert m.y_max.dtype == m.P.dtype
-
-    def test_physical_y_max_penalty_with_output_std(self):
-        """y_max stays physical; the floor is (output_std*s)^2 CPC^T >= y_max^2."""
-        m = _make_model(s_value=5.0)  # C=[1,0], P=I -> CPC^T = 1
-        # output_std=2, s=5 -> physical image (2*5)^2 * 1 = 100.
-        # y_max=2 -> 100 >= 4 -> covered.
-        m.set_output_coverage_level(2.0, output_std=2.0)
-        assert float(m.get_regularization_output()) == pytest.approx(0.0, abs=1e-9)
-        # y_max=20 -> 100 < 400 -> undercovered.
-        m.set_output_coverage_level(20.0, output_std=2.0)
-        assert float(m.get_regularization_output()) > 0.0
-
-
-class TestOutputTightnessRegularization:
-    """get_regularization_tightness: the over-coverage (ceiling) complement that
-    pulls the certified half-width down onto y_max, acting on s only."""
-
-    def test_zero_when_unset(self):
-        """No coverage level -> no-op penalty (0)."""
-        assert float(_make_model().get_regularization_tightness()) == 0.0
-
-    def test_zero_when_not_overcovered(self):
-        """ybar < y_max (under/at coverage) -> tightness is silent (it only
-        penalizes EXCESS, so it can never push below y_max on its own)."""
-        m = _make_model(s_value=0.05)  # C=[1,0], P=I -> ybar = s = 0.05 << 1
-        m.set_output_coverage_level(1.0, output_std=1.0)
-        assert float(m.get_regularization_tightness()) == pytest.approx(0.0, abs=1e-12)
-
-    def test_positive_when_overcovered(self):
-        """s=5, C=[1,0], P=I, output_std=1 -> ybar^2 = 25 >> y_max^2 = 1 -> excess>0."""
-        m = _make_model(s_value=5.0)
-        m.set_output_coverage_level(1.0, output_std=1.0)
-        loss, margin = m.get_regularization_tightness(return_margin=True)
-        assert float(loss) > 0.0
-        assert float(margin) == pytest.approx(25.0 - 1.0, rel=1e-6)  # (s^2 CPC^T) - y_max^2
-
-    def test_gradient_shrinks_s_only(self):
-        """The penalty gradient must push s DOWN (dL/ds > 0) and, because CPC^T is
-        detached, must leave C and P untouched (no gradient path)."""
-        m = _make_model(s_value=5.0)
-        m.set_output_coverage_level(1.0, output_std=1.0)
-        loss = m.get_regularization_tightness()
-        loss.backward()
-        # dL/ds = 2*output_std^2*s*CPC^T = 2*1*5*1 = 10 > 0 -> minimization lowers s.
-        assert m.s.grad is not None
-        assert float(m.s.grad) == pytest.approx(10.0, rel=1e-6)
-        # Detach routed the gradient away from the output map and the certificate P.
-        assert m.C.grad is None
-        assert m.P.grad is None
-
-
 def _make_loader(u_amp: float, y_level: float, N: int = 5, B: int = 4) -> DataLoader:
     """Constant-amplitude inputs with constant (normalized) target level."""
     d = u_amp * torch.ones(B, N, 1)
@@ -209,13 +127,12 @@ def _make_trainer(tmp_path, model, loader, lr=0.0, **kwargs) -> Trainer:
 
 
 class TestTrainerWiring:
-    def test_y_max_set_from_loader(self, tmp_path):
+    """The trainer records y_max so rho can be reported; it never constrains it."""
+
+    def test_y_max_recorded_from_the_loader(self, tmp_path):
         """Physical y_max = max|target| over the loader * output_std (=1 here)."""
         m = _make_model()
-        _make_trainer(
-            tmp_path, m, _make_loader(0.1, 0.9),
-            regularization_weight=1e-8, output_regularization_weight=1.0,
-        )
+        _make_trainer(tmp_path, m, _make_loader(0.1, 0.9), regularization_weight=1e-8)
         assert float(m.y_max) == pytest.approx(0.9)
 
     def test_y_max_scaled_by_output_std(self, tmp_path):
@@ -223,74 +140,38 @@ class TestTrainerWiring:
         m = _make_model()
         _make_trainer(
             tmp_path, m, _make_loader(0.1, 0.9),
-            regularization_weight=1e-8, output_regularization_weight=1.0,
-            output_std=3.0,
+            regularization_weight=1e-8, output_std=3.0,
         )
         assert float(m.y_max) == pytest.approx(0.9 * 3.0)
         assert float(m.output_std) == pytest.approx(3.0)
 
-    def test_y_max_unset_when_weight_zero(self, tmp_path):
-        """No output-coverage weight -> the level stays unset (penalty no-op)."""
+    def test_recording_does_not_overwrite_an_existing_level(self, tmp_path):
+        """initialize_parameters sets y_max from the RAW data; the trainer's
+        loader-derived fallback must not clobber it."""
         m = _make_model()
-        _make_trainer(
-            tmp_path, m, _make_loader(0.1, 0.9),
-            regularization_weight=1e-8, output_regularization_weight=0.0,
-        )
-        assert bool(torch.isnan(m.y_max))
+        m.set_output_coverage_level(2.5, 1.0)
+        _make_trainer(tmp_path, m, _make_loader(0.1, 0.9), regularization_weight=1e-8)
+        assert float(m.y_max) == pytest.approx(2.5)
 
-    def test_train_epoch_reports_positive_output_reg_when_undercovered(self, tmp_path):
-        """With lr=0 the model can't move (stays feasible, no rollback/SDP), so
-        this is MOSEK-free and just checks the term is wired and positive."""
-        m = _make_model(s_value=0.2)  # tiny image vs demanded 0.9
+    def test_training_carries_no_coverage_term(self, tmp_path):
+        """The objective is prediction loss + barrier (+ input) only — the
+        coverage and tightness penalties are gone, so no epoch metric reports them."""
+        m = _make_model(s_value=0.2)   # badly under-covering: would have been penalized
         t = _make_trainer(
-            tmp_path, m, _make_loader(0.1, 0.9), lr=0.0,
-            regularization_weight=1e-8, output_regularization_weight=1.0,
+            tmp_path, m, _make_loader(0.1, 0.9), lr=0.0, regularization_weight=1e-8,
         )
         out = t.train_epoch()
-        assert "reg_output" in out
-        assert out["reg_output"] > 0.0
+        assert "reg_output" not in out
+        assert "reg_tightness" not in out
+        assert not hasattr(m, "get_regularization_output")
+        assert not hasattr(m, "get_regularization_tightness")
 
-    def test_tightness_weight_sets_y_max_and_reports_positive_reg(self, tmp_path):
-        """Tightness weight alone (no coverage weight) still auto-sets y_max, and
-        with an over-covering model train_epoch reports positive reg_tightness.
-        lr=0 keeps it MOSEK-free (no move -> no rollback/SDP)."""
-        m = _make_model(s_value=5.0)  # ybar = 5 >> demanded 0.9 -> over-covered
-        t = _make_trainer(
-            tmp_path, m, _make_loader(0.1, 0.9), lr=0.0,
-            regularization_weight=1e-8,
-            output_regularization_weight=0.0,
-            tightness_regularization_weight=1.0,
-        )
-        assert not bool(torch.isnan(m.y_max))  # auto-set by the tightness weight
-        out = t.train_epoch()
-        assert "reg_tightness" in out
-        assert out["reg_tightness"] > 0.0
-
-    def test_train_epoch_output_reg_zero_when_weight_zero(self, tmp_path):
+    def test_rho_is_still_reportable(self, tmp_path):
+        """Dropping the constraint must not cost the diagnostic."""
         m = _make_model(s_value=0.2)
-        t = _make_trainer(
-            tmp_path, m, _make_loader(0.1, 0.9), lr=0.0,
-            regularization_weight=1e-8, output_regularization_weight=0.0,
-        )
-        out = t.train_epoch()
-        assert out["reg_output"] == 0.0
-
-    @requires_mosek
-    def test_short_run_reduces_coverage_margin(self, tmp_path):
-        """MSE (fit 0.9) and the coverage penalty both push the output image up,
-        so a few epochs must shrink the coverage deficit."""
-        m = _make_model(s_value=0.2)
-        t = _make_trainer(
-            tmp_path, m, _make_loader(0.1, 0.9), lr=1e-2,
-            regularization_weight=1e-6, output_regularization_weight=1.0,
-        )
-        with torch.no_grad():
-            _, margin_before = m.get_regularization_output(return_margin=True)
-        for _ in range(10):
-            t.train_epoch()
-        with torch.no_grad():
-            _, margin_after = m.get_regularization_output(return_margin=True)
-        assert float(margin_after) < float(margin_before)
+        _make_trainer(tmp_path, m, _make_loader(0.1, 0.9), regularization_weight=1e-8)
+        rho = m.coverage_ratio()
+        assert rho is not None and rho > 0.0
 
 
 @requires_mosek
@@ -501,46 +382,3 @@ class TestGlobalModelCoverage:
         assert res["constraints_satisfied"]
         assert res["s_opt"] == pytest.approx(1.0, rel=1e-9)  # s stays fixed
         assert res["max_s"]["norm_H"] == pytest.approx(0.0, abs=1e-9)  # H = L P^-1 = 0
-
-
-def test_init_config_flag_defaults_on():
-    """MinTrProb-at-init (output+input sweep) is the default; can be turned off."""
-    from sysid.config import InitializationConfig
-    assert InitializationConfig().init_s_from_conditions is True
-    assert InitializationConfig(init_s_from_conditions=False).init_s_from_conditions is False
-
-
-def test_c2_calibration_config_defaults():
-    """C2-std calibration is on by default (eps=0.05); can be disabled."""
-    from sysid.config import InitializationConfig
-    cfg = InitializationConfig()
-    assert cfg.calibrate_c2_for_coverage is True
-    assert cfg.calibrate_c2_eps == 0.05
-    assert cfg.calibrate_c2_max_iter == 30
-    assert InitializationConfig(calibrate_c2_for_coverage=False).calibrate_c2_for_coverage is False
-
-
-@requires_mosek
-class TestInitSFromConditions:
-    """initialize_s_from_conditions: pick s by the output+input sweep at init."""
-
-    def test_reachable_level_sets_s_in_band(self):
-        m = _make_model(s_value=0.05)  # arbitrary start; the sweep recomputes s
-        u = 0.02 * np.ones((4, 8, 1))  # tiny -> admissible
-        res = m.initialize_s_from_conditions(u, y_max=0.5, n_grid=12)
-        assert res["success"]
-        assert res["s_min"] <= res["s"] <= res["s_max"] * (1 + 1e-6)
-        assert res["violation_free"] is True
-        assert m.check_constraints()
-        assert float(m.y_max) == pytest.approx(0.5)  # physical level stored
-
-    def test_unreachable_level_falls_back_to_maxs(self):
-        m = _make_model(s_value=0.05)
-        u = 0.02 * np.ones((4, 8, 1))
-        res = m.initialize_s_from_conditions(u, y_max=1e6, n_grid=8)
-        # Coverage unreachable -> reported as not-success, but the model is left
-        # with a feasible max-s certificate to start training from.
-        assert not res["success"]
-        assert res["reason"] == "coverage_unreachable"
-        assert m.check_constraints()
-        assert float(m.s) > 0.0

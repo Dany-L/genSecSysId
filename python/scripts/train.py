@@ -5,11 +5,9 @@ import json
 import logging
 import os
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import torch
@@ -471,8 +469,9 @@ def main():
                 "max_epochs": config.training.max_epochs,
                 "warmup_steps": config.training.warmup_steps,
                 "input_regularization_weight": config.training.input_regularization_weight,
-                "output_regularization_weight": getattr(config.training, "output_regularization_weight", 0.0),
-                "tightness_regularization_weight": getattr(config.training, "tightness_regularization_weight", 0.0),
+                "solve_max_s_on_violation": getattr(
+                    config.training, "solve_max_s_on_violation", False
+                ),
                 "activity_regularization_weight": getattr(config.training, "activity_regularization_weight", 0.0),
                 "activity_target": getattr(config.training, "activity_target", 0.0),
                 "h_regularization_weight": getattr(config.training, "h_regularization_weight", 0.0),
@@ -488,25 +487,6 @@ def main():
                     config.training.regularization_weight
                     if config.training.use_custom_regularization else 0.0
                 ),
-                "freeze_certificate": getattr(config.training, "freeze_certificate", False),
-                "freeze_alpha": getattr(config.training, "freeze_alpha", True),
-                "repair_enforce_coverage": getattr(
-                    config.training, "repair_enforce_coverage", False
-                ),
-                "resynthesize_certificate": getattr(
-                    config.training, "resynthesize_certificate", False
-                ),
-                "resynthesis_every": getattr(config.training, "resynthesis_every", 0),
-                "resynthesis_beta": getattr(config.training, "resynthesis_beta", 2.0),
-                "resynthesis_beta_min": getattr(config.training, "resynthesis_beta_min", 1.0),
-                "resynthesis_beta_decay": getattr(
-                    config.training, "resynthesis_beta_decay", 0.9
-                ),
-                "resynthesis_beta_grow": getattr(
-                    config.training, "resynthesis_beta_grow", 1.5
-                ),
-                "resynthesis_guard": getattr(config.training, "resynthesis_guard", True),
-                "resynthesis_target_mid": getattr(config.training, "resynthesis_target_mid", True),
             }
         )
 
@@ -586,15 +566,8 @@ def main():
             log_gradients=getattr(config.training, "log_gradients", True),
             warmup_steps=config.training.warmup_steps,
             input_regularization_weight=getattr(config.training, "input_regularization_weight", 0.01),
-            output_regularization_weight=(
-                getattr(config.training, "output_regularization_weight", 0.0)
-                if config.training.use_custom_regularization
-                else 0.0
-            ),
-            tightness_regularization_weight=(
-                getattr(config.training, "tightness_regularization_weight", 0.0)
-                if config.training.use_custom_regularization
-                else 0.0
+            solve_max_s_on_violation=getattr(
+                config.training, "solve_max_s_on_violation", False
             ),
             activity_regularization_weight=(
                 getattr(config.training, "activity_regularization_weight", 0.0)
@@ -608,24 +581,6 @@ def main():
                 else 0.0
             ),
             h_target=getattr(config.training, "h_target", 0.0),
-            # Certificate ownership / re-synthesis (wiki: training/certificate-resynthesis)
-            freeze_certificate=getattr(config.training, "freeze_certificate", False),
-            freeze_alpha=getattr(config.training, "freeze_alpha", True),
-            repair_enforce_coverage=getattr(
-                config.training, "repair_enforce_coverage", False
-            ),
-            resynthesize_certificate=getattr(
-                config.training, "resynthesize_certificate", False
-            ),
-            resynthesis_every=getattr(config.training, "resynthesis_every", 0),
-            resynthesis_beta=getattr(config.training, "resynthesis_beta", 2.0),
-            resynthesis_beta_min=getattr(config.training, "resynthesis_beta_min", 1.0),
-            resynthesis_beta_decay=getattr(
-                config.training, "resynthesis_beta_decay", 0.9
-            ),
-            resynthesis_beta_grow=getattr(config.training, "resynthesis_beta_grow", 1.5),
-            resynthesis_guard=getattr(config.training, "resynthesis_guard", True),
-            resynthesis_target_mid=getattr(config.training, "resynthesis_target_mid", True),
             output_std=(
                 float(np.asarray(normalizer.output_std).reshape(-1)[0])
                 if normalizer is not None and getattr(normalizer, "output_std", None) is not None

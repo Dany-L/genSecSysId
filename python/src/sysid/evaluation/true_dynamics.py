@@ -47,11 +47,6 @@ def duffing_dt(x, u=0.0, Ts=DUFFING_TS, delta_d=DUFFING_DELTA_D):
     return sol.y[:, -1]
 
 
-def duffing_V_energy(q, dq):
-    """Hamiltonian-like energy. V > V_saddle ⇔ inside basin of attraction."""
-    return dq ** 2 / 2.0 - q ** 2 / 2.0 + q ** 4 / 4.0
-
-
 def simulate_duffing(
     x0,
     u_seq,

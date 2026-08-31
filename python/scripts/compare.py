@@ -22,7 +22,6 @@ Examples:
 import argparse
 import json
 import logging
-import sys
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -31,7 +30,6 @@ import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import tikzplotlib
 import torch
 

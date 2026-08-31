@@ -4,7 +4,6 @@ import json
 from typing import Literal, Tuple
 
 import numpy as np
-import torch
 
 
 class DataNormalizer:
@@ -141,33 +140,6 @@ class DataNormalizer:
 
         return denormalized
 
-    def inverse_transform_outputs_torch(self, outputs: torch.Tensor) -> torch.Tensor:
-        """Denormalize outputs (PyTorch version)."""
-        if not self.is_fitted:
-            raise RuntimeError("Normalizer must be fitted before inverse_transform")
-
-        device = outputs.device
-
-        if self.method == "minmax":
-            output_min = torch.from_numpy(self.output_min).float().to(device)
-            output_max = torch.from_numpy(self.output_max).float().to(device)
-
-            denormalized = (outputs - self.feature_range[0]) / (
-                self.feature_range[1] - self.feature_range[0]
-            )
-            denormalized = denormalized * (output_max - output_min) + output_min
-        elif self.method == "standard":  # standard
-            output_mean = torch.from_numpy(self.output_mean).float().to(device)
-            output_std = torch.from_numpy(self.output_std).float().to(device)
-
-            denormalized = outputs * output_std + output_mean
-        elif self.method == "scale_only":  # scale_only
-            output_std = torch.from_numpy(self.output_std).float().to(device)
-
-            denormalized = outputs * output_std
-
-        return denormalized
-
     def inverse_transform_inputs(self, inputs: np.ndarray) -> np.ndarray:
         """Denormalize inputs."""
         if not self.is_fitted:
@@ -182,33 +154,6 @@ class DataNormalizer:
             denormalized = inputs * self.input_std + self.input_mean
         elif self.method == "scale_only":  # scale_only
             denormalized = inputs * self.input_std
-
-        return denormalized
-
-    def inverse_transform_inputs_torch(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Denormalize inputs (PyTorch version)."""
-        if not self.is_fitted:
-            raise RuntimeError("Normalizer must be fitted before inverse_transform")
-
-        device = inputs.device
-
-        if self.method == "minmax":
-            input_min = torch.from_numpy(self.input_min).float().to(device)
-            input_max = torch.from_numpy(self.input_max).float().to(device)
-
-            denormalized = (inputs - self.feature_range[0]) / (
-                self.feature_range[1] - self.feature_range[0]
-            )
-            denormalized = denormalized * (input_max - input_min) + input_min
-        elif self.method == "standard":  # standard
-            input_mean = torch.from_numpy(self.input_mean).float().to(device)
-            input_std = torch.from_numpy(self.input_std).float().to(device)
-
-            denormalized = inputs * input_std + input_mean
-        elif self.method == "scale_only":  # scale_only
-            input_std = torch.from_numpy(self.input_std).float().to(device)
-
-            denormalized = inputs * input_std
 
         return denormalized
 

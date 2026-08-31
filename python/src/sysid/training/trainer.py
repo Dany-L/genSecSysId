@@ -46,8 +46,7 @@ class Trainer:
         log_gradients: bool = True,
         warmup_steps: int = 0,
         input_regularization_weight: float = 0.01,
-        output_regularization_weight: float = 0.0,
-        tightness_regularization_weight: float = 0.0,
+        solve_max_s_on_violation: bool = False,
         activity_regularization_weight: float = 0.0,
         activity_target: float = 0.0,
         h_regularization_weight: float = 0.0,
@@ -55,17 +54,6 @@ class Trainer:
         output_std: float = 1.0,
         train_div_loader: Optional[DataLoader] = None,
         val_div_loader: Optional[DataLoader] = None,
-        freeze_certificate: bool = False,
-        freeze_alpha: bool = True,
-        repair_enforce_coverage: bool = False,
-        resynthesize_certificate: bool = False,
-        resynthesis_every: int = 0,
-        resynthesis_beta: float = 2.0,
-        resynthesis_beta_min: float = 1.0,
-        resynthesis_beta_decay: float = 0.9,
-        resynthesis_beta_grow: float = 1.5,
-        resynthesis_guard: bool = True,
-        resynthesis_target_mid: bool = True,
     ):
         """
         Initialize trainer.
@@ -120,14 +108,9 @@ class Trainer:
         self.warmup_steps = warmup_steps  # Number of steps to skip before computing loss
         self.input_regularization_weight = input_regularization_weight  # Weight for input constraint regularization
         self.initial_input_regularization_weight = input_regularization_weight  # Store initial value
-        # Output-coverage regularization (bind Corollary 1): pushes the certified
-        # output image s^2 C P C^T to reach the physical safe data level y_max.
-        self.output_regularization_weight = output_regularization_weight
-        self.initial_output_regularization_weight = output_regularization_weight
-        # Output-tightness regularization: pulls the certified half-width y_bar DOWN
-        # onto y_max (complement of the coverage floor). NOT decayed — tightness
-        # must hold all through training.
-        self.tightness_regularization_weight = tightness_regularization_weight
+        # Re-solve MaxS after an epoch whose training data breached the input
+        # condition — see _maybe_maximize_s and TrainingConfig.
+        self.solve_max_s_on_violation = solve_max_s_on_violation
         # Dead-zone activity regularization: pushes mean ||w|| up to activity_target
         # so the nonlinearity fires, preventing the degenerate linear collapse
         # (w == 0 -> pure LTI rollout). NOTE: it does not by itself force a
@@ -141,36 +124,12 @@ class Trainer:
         # term. NOT decayed on purpose (must hold all through training).
         self.h_regularization_weight = float(h_regularization_weight)
         self.h_target = float(h_target)
-        # Physical output scale (relates normalized C/P/s to physical y_max);
-        # used only by the _init_output_coverage_level fallback.
+        # Physical output scale — relates the model's normalized C/P/s to the
+        # physical y_max it records for reporting.
         self.output_std = float(output_std)
 
-        # --- Certificate ownership (see the wiki note training/certificate-resynthesis)
-        # theta <- SGD, (P, L, la, s) <- the SDPs. `freeze_certificate` removes the
-        # certificate from autograd (killing the barrier's s -> 0 drift, which has
-        # no counterweight since s is not in the prediction loss);
-        # `resynthesize_certificate` re-solves it from the current theta once per
-        # epoch with the coverage band as a HARD constraint, so rho stays ~1.
-        self.freeze_certificate_flag = bool(freeze_certificate)
-        self.freeze_alpha = bool(freeze_alpha)
-        self.repair_enforce_coverage = bool(repair_enforce_coverage)
-        self.resynthesize_certificate_flag = bool(resynthesize_certificate)
-        # <= 0 disables the cadence: re-synthesize only when rho leaves the band.
-        self.resynthesis_every = int(resynthesis_every)
-        self.resynthesis_beta = float(resynthesis_beta)
-        self.resynthesis_beta_min = float(resynthesis_beta_min)
-        self.resynthesis_beta_decay = float(resynthesis_beta_decay)
-        self.resynthesis_beta_grow = float(resynthesis_beta_grow)
-        self.resynthesis_guard = bool(resynthesis_guard)
-        # Restore rho to the geometric middle of [1, beta^nx] instead of its
-        # lower edge, so the drift test is not a knife edge.
-        self.resynthesis_target_mid = bool(resynthesis_target_mid)
-        # Counters / cached guard batch
-        self.resynthesis_applied = 0
-        self.resynthesis_rejected = 0
-        self.resynthesis_failed = 0
-        self.epoch_coverage_repair_fallbacks = 0
-        self._guard_batch: Optional[tuple] = None
+        # Cached batch for the per-epoch dead-zone diagnostic
+        self._diag_batch: Optional[tuple] = None
 
         # Rollback tracking
         self.rollback_count = 0
@@ -197,46 +156,25 @@ class Trainer:
         # Scheduler (can be set later)
         self.scheduler = None
 
-        # Derive the (physical) safe output level y_max from the training targets
-        # and hand it to the model for the output-coverage penalty.
-        self._init_output_coverage_level()
+        # Record the (physical) data level y_max on the model. Nothing in training
+        # constrains the certificate to reach it — the model class provably cannot
+        # (see the wiki note certificate-synthesis/ellipsoidal-conservatism) — it is
+        # kept so rho = (y_bar/y_max)^nx can be REPORTED per epoch and at post-process.
+        self._record_output_level()
 
-        # Hand the certificate to the SDPs (must happen after the model is on the
-        # device; safe after the optimizer was built — optimizer.step() skips
-        # parameters whose grad is None).
-        if self.freeze_certificate_flag and hasattr(self.model, "freeze_certificate"):
-            self.model.freeze_certificate(freeze_alpha=self.freeze_alpha)
-        if self.resynthesize_certificate_flag:
-            y_max = getattr(self.model, "y_max", None)
-            has_y_max = y_max is not None and not bool(torch.isnan(y_max))
-            logging.info(
-                "Certificate re-synthesis: enabled "
-                f"({'cadence off — rho-triggered only' if self.resynthesis_every <= 0 else f'every {self.resynthesis_every} epoch(s)'}"
-                f", beta0={self.resynthesis_beta}, "
-                f"guard={'on' if self.resynthesis_guard else 'off'})"
-                + ("" if has_y_max else " — y_max unset, TightCert degenerates to MaxS "
-                   "and the rho trigger is unavailable (cadence only)")
-            )
+        # Input floor u_max = sup_k ||u_k||^2 over the training inputs, so every solve
+        # that chooses s respects s >= sqrt(u_max) (necessary for the input condition).
+        self._init_input_bound()
 
-    def _init_output_coverage_level(self):
-        """Set the model's PHYSICAL safe output level ``y_max`` (fallback path).
+    def _record_output_level(self):
+        """Store the PHYSICAL data level ``y_max`` on the model (fallback path).
 
-        No-op unless something needs ``y_max`` — output-coverage or tightness
-        regularization, the hard coverage floor in the repair, or per-epoch
-        re-synthesis — and skipped when the model already has ``y_max`` set: in the
+        Diagnostic only. Skipped when the model already has ``y_max``: in the
         normal pipeline ``initialize_parameters`` sets both ``y_max`` and
         ``output_std`` from the raw data + normalizer, so this only fires for
         directly-constructed / loaded models. The loader yields *normalized*
         targets, so ``max |e| · output_std`` is the physical ``y_max``.
         """
-        needs_y_max = (
-            self.output_regularization_weight > 0
-            or self.tightness_regularization_weight > 0
-            or self.repair_enforce_coverage
-            or self.resynthesize_certificate_flag
-        )
-        if not needs_y_max:
-            return
         if not hasattr(self.model, "set_output_coverage_level"):
             return
         y_max = getattr(self.model, "y_max", None)
@@ -252,7 +190,31 @@ class Trainer:
         if peak_n > 0.0:
             y_max_phys = peak_n * self.output_std
             self.model.set_output_coverage_level(y_max_phys, self.output_std)
-            logging.info(f"Output-coverage level y_max set from training data: {y_max_phys:.6f}")
+            logging.info(f"Data output level y_max recorded (reporting only): {y_max_phys:.6f}")
+
+    def _init_input_bound(self):
+        """Set the model's input floor ``u_max = sup_k ‖u_k‖²`` from the loader.
+
+        The input condition forces ``s² ≥ ‖u_k‖²`` for every sample regardless of
+        ``P`` (the quadratic form is non-negative), so this is the smallest scale
+        the data admits. Skipped when the model already has one (initialization
+        normally sets it) or does not support it."""
+        if not hasattr(self.model, "set_input_bound"):
+            return
+        u = getattr(self.model, "u_max", None)
+        if u is not None and not bool(torch.isnan(u)):
+            return
+        peak = 0.0
+        for batch in self.train_loader:
+            d = batch[0]
+            d = d[torch.isfinite(d)].reshape(-1, d.shape[-1]) if d.numel() else d
+            if d.numel():
+                peak = max(peak, float((d ** 2).sum(dim=-1).max()))
+        if peak > 0.0:
+            self.model.set_input_bound(peak)
+            logging.info(
+                f"Input floor u_max = {peak:.6g} from the training inputs -> s >= {peak ** 0.5:.4g}"
+            )
 
     def set_scheduler(self, scheduler):
         """Set learning rate scheduler."""
@@ -457,155 +419,89 @@ class Trainer:
                 f"Input regularization weight decayed: {old_input_weight:.6e} → {self.input_regularization_weight:.6e}"
             )
 
-        if self.output_regularization_weight > 0:
-            old_output_weight = self.output_regularization_weight
-            self.output_regularization_weight *= self.regularization_decay_factor
-            if self.output_regularization_weight < self.min_regularization_weight:
-                self.output_regularization_weight = self.min_regularization_weight
-            logging.info(
-                f"Output regularization weight decayed: {old_output_weight:.6e} → {self.output_regularization_weight:.6e}"
-            )
-
-    def _get_guard_batch(self):
-        """One cached training batch ``(d, x0)`` for the re-synthesis accept guard."""
-        if self._guard_batch is None:
+    def _diagnostic_batch(self):
+        """One cached training batch ``(d, x0)`` for the per-epoch dead-zone report."""
+        if self._diag_batch is None:
             for batch in self.train_loader:
                 d = batch[0].to(self.device)
                 x0 = (
                     batch[2].to(device=self.device, dtype=d.dtype)
                     if len(batch) == 3 and batch[2] is not None else None
                 )
-                self._guard_batch = (d, x0)
+                self._diag_batch = (d, x0)
                 break
-        return self._guard_batch
-
-    def _resynthesize_certificate(self, epoch: int) -> Dict[str, Any]:
-        """Per-epoch certificate re-synthesis — the epoch-boundary step of the
-        ownership scheme (wiki: ``training/certificate-resynthesis``).
-
-        1. Read the **free** drift monitor ``ρ = (ȳ/y_max)ⁿˣ`` (no SDP: a couple of
-           small matrix products on parameters already in memory).
-        2. Re-solve TightCert only when ``ρ`` has left the band ``[1, βⁿˣ]`` or the
-           cadence fires. Without ``y_max`` there is no ``ρ``, so the cadence is
-           the only trigger and TightCert degenerates to MaxS.
-        3. Accept the new certificate unless it increases the input-condition
-           violation count on the cached guard batch.
-        4. Anneal ``β``: widen after an all-rollback epoch (give the model slack
-           back), otherwise tighten geometrically toward ``β_min``.
-
-        Returns the metrics for this epoch (empty when re-synthesis is off).
-        """
-        if not self.resynthesize_certificate_flag or not isinstance(self.model, SimpleLure):
-            return {}
-
-        metrics: Dict[str, Any] = {"beta": self.resynthesis_beta}
-        rho_before = self.model.coverage_ratio()
-        if rho_before is not None:
-            metrics["rho"] = rho_before
-            metrics["rho_before"] = rho_before  # kept even when the solve overwrites `rho`
-
-        # Alarm at the band EDGE, restore to the band MIDDLE. The solve's objective
-        # (min ‖P‖ subject to the coverage floor) otherwise lands ρ *on* the lower
-        # edge, so the next epoch's drift crosses it whatever the cadence is —
-        # measured: ρ = 1.029 against a band of [1, 1.1025], i.e. 2.9 % of headroom,
-        # and the drift test fired on 51 of 100 epochs. Solving against a slightly
-        # inflated y_max puts ρ at the geometric middle instead, leaving room on
-        # both sides. Note ρ < 1 means the certified image no longer covers the data,
-        # so the LOWER edge gets no tolerance — only the target moves.
-        band_hi = self.resynthesis_beta ** self.model.nx
-        out_of_band = rho_before is not None and not (1.0 <= rho_before <= band_hi)
-        # `resynthesis_every <= 0` disables the cadence entirely (event-driven only).
-        cadence = self.resynthesis_every > 0 and (epoch % self.resynthesis_every) == 0
-        if out_of_band or cadence:
-            guard = self._get_guard_batch() if self.resynthesis_guard else None
-            y_max_target = None
-            if self.resynthesis_target_mid:
-                y_max = getattr(self.model, "y_max", None)
-                if y_max is not None and not bool(torch.isnan(y_max)):
-                    # ȳ target = √β · y_max  ⇒  ρ_target = β^(nx/2), the geometric
-                    # middle of [1, β^nx]. The band handed to the SDP shrinks to
-                    # [√β, β] · y_max, which stays inside the requested band.
-                    y_max_target = float(y_max) * float(np.sqrt(self.resynthesis_beta))
-            result = self.model.resynthesize_certificate(
-                y_max=y_max_target,
-                beta=float(np.sqrt(self.resynthesis_beta)) if y_max_target else self.resynthesis_beta,
-                guard_inputs=guard[0] if guard is not None else None,
-                guard_x0=guard[1] if guard is not None else None,
-                warmup_steps=self.warmup_steps,
-            )
-            metrics["resynth_trigger"] = 1.0 if out_of_band else 0.5  # drift vs cadence
-            if not result["success"]:
-                self.resynthesis_failed += 1
-                logging.warning(
-                    f"Epoch {epoch}: certificate re-synthesis failed "
-                    f"({result['reason']}); keeping the current certificate."
-                )
-            elif result["applied"]:
-                self.resynthesis_applied += 1
-                rho_after = self.model.coverage_ratio()
-                if rho_after is not None:
-                    metrics["rho"] = rho_after
-                    metrics["rho_after"] = rho_after
-                metrics["s_resynth"] = result["s"]
-                if result.get("norm_P") is not None:
-                    metrics["norm_P"] = result["norm_P"]
-                logging.debug(
-                    f"Epoch {epoch}: certificate re-synthesized — s={result['s']:.4g}, "
-                    f"rho={result['rho'] if result['rho'] is None else round(result['rho'], 4)}"
-                    f" (band [1, {band_hi:.3g}], beta={self.resynthesis_beta:.3g})"
-                )
-            else:
-                self.resynthesis_rejected += 1
-        metrics["resynth_applied"] = float(self.resynthesis_applied)
-        metrics["resynth_rejected"] = float(self.resynthesis_rejected)
-        metrics["resynth_failed"] = float(self.resynthesis_failed)
-
-        # Anneal beta. It is the band that *drives* tightening, so it cannot be
-        # left to move only when the band is violated: with a loose start nothing
-        # would ever trigger, so beta would never shrink and the certificate would
-        # stay loose forever. Nor should it march on the clock — that squeezes rho
-        # out of the band by itself and manufactures a re-solve every epoch.
-        # The rule is therefore: tighten on a HEALTHY epoch (rho stayed in the band
-        # and the model is not rolling back) — the band is then demonstrably looser
-        # than it needs to be. Hold it still on an epoch that already needed a
-        # re-solve; widen after an all-rollback epoch.
-        if self.epoch_rollback_count >= max(len(self.train_loader), 1):
-            self.resynthesis_beta *= self.resynthesis_beta_grow
-        elif not out_of_band:
-            self.resynthesis_beta = max(
-                self.resynthesis_beta * self.resynthesis_beta_decay,
-                self.resynthesis_beta_min,
-            )
-        return metrics
+        return self._diag_batch
 
     def _repair_certificate(self) -> bool:
-        """Two-tier fixed-``s`` certificate repair. ``False`` ⇒ the caller rolls back.
+        """Certificate repair after a step that broke the LMIs. ``False`` ⇒ roll back.
 
-        Tier 1 repairs P, L, Λ **with** the hard coverage floor
-        ``(σ·s)²·C P Cᵀ ⪰ y_max²·I``, so a repair cannot buy feasibility by
-        shrinking the certified output image. Tier 2 (only if tier 1 is
-        infeasible) drops the floor: the certificate is then feasible but may
-        under-cover, which is preferable to stalling the whole epoch — at
-        ρ ≈ 1 the floor-constrained repair fails often, and the epoch-boundary
-        re-synthesis restores coverage with ``s`` free anyway.
-
-        With ``repair_enforce_coverage=False`` (or no ``y_max``) tier 1 *is* the
-        historical floor-free repair and tier 2 never runs.
+        θ and α stay exactly where the optimizer put them; only the certificate
+        (P, L, Λ, and ``s`` if needed) is re-solved — see
+        :meth:`SimpleLure.feasibility_problem`. This is the whole constraint
+        machinery: barrier during the step, repair-or-rollback after it.
         """
-        if self.model.feasibility_problem(enforce_coverage=self.repair_enforce_coverage):
-            return True
-        if not self.repair_enforce_coverage:
-            return False
-        # Tier 2: retry without the coverage floor.
-        if self.model.feasibility_problem(enforce_coverage=False):
-            self.epoch_coverage_repair_fallbacks += 1
-            logging.debug(
-                "Repair infeasible with the coverage floor; fell back to the "
-                "floor-free repair (certificate may under-cover until the next "
-                "re-synthesis)."
+        return self.model.feasibility_problem()
+
+    def _maybe_maximize_s(self, epoch: int) -> Optional[float]:
+        """Re-solve MaxS (once per epoch) if the training data breaches the input
+        condition. Returns the new ``s``, or ``None`` if nothing was solved.
+
+        Two steps, so the SDP is decoupled from the mini-batching:
+
+        1. Scan *all* training batches (no grad) for the peak input-constraint
+           margin ``c_k = ||u_k||^2 - s^2 + alpha^2 V(x_k)``. That says whether
+           the currently certified set still covers the whole training set.
+        2. Only if it is breached somewhere (``max_k c_k > 0``) solve MaxS once.
+           The SDP fixes theta and optimizes (P, L, Lambda, s), so a single solve
+           re-certifies an enlarged ``s`` for the entire dataset.
+
+        Why it matters: ``s`` is learnable and the log-barrier only ever pushes it
+        DOWN. Nothing pushes back, so without this step ``s`` decays below the
+        input floor ``sqrt(u_max)``, every optimizer step then lands outside the
+        feasible set, and the per-batch repair SDP fires on every batch and mostly
+        fails into a rollback. Restored from cf9cb54, where it ran on 820 of 1500
+        epochs and held ``s`` near the floor with zero rollbacks.
+
+        No-op for non-SimpleLure models.
+        """
+        if not isinstance(self.model, SimpleLure):
+            return None
+
+        self.model.eval()
+        try:
+            c_max = float("-inf")
+            with torch.no_grad():
+                for batch in self.train_loader:
+                    d = batch[0].to(self.device)
+                    _, (x, _), _ = self.model(d, x0=None, warmup_steps=self.warmup_steps)
+                    _, c = self.model.get_regularization_input(d, x, return_c=True)
+                    # NaN positions come from padded trajectories; ignore them.
+                    c_max = max(c_max, float(torch.nan_to_num(c, nan=float("-inf")).max()))
+
+            if c_max <= 0:
+                return None
+
+            sol = self.model._synth().max_s()
+            if sol is None:
+                logging.warning(
+                    f"Epoch {epoch}: input condition violated (max c={c_max:.6f}) "
+                    "but the MaxS SDP failed; leaving s unchanged."
+                )
+                return None
+
+            s_before = float(self.model.s)
+            self.model._apply_certificate_solution(sol)
+            new_s = float(self.model.s)
+            logging.info(
+                f"Epoch {epoch}: input condition violated (max c={c_max:.6f}), "
+                f"solved MaxS, s {s_before:.6f} -> {new_s:.6f}"
             )
-            return True
-        return False
+            if self.mlflow_tracking:
+                mlflow.log_metric("max_s_solved", 1, step=epoch)
+                mlflow.log_metric("max_s_value", new_s, step=epoch)
+            return new_s
+        finally:
+            self.model.train()
 
     def reduce_lr_on_rollback(self, factor: float = 0.5):
         """
@@ -659,8 +555,6 @@ class Trainer:
             if self.regularization_weight > 0:
                 # feasibility loss
                 reg_feasibility_loss = self.model.get_regularization_loss()
-                # reg_feasibility_loss = torch.tensor(0.0)
-                reg_feasibility_value = reg_feasibility_loss.item()
 
                 loss = pred_loss_div + self.regularization_weight * reg_feasibility_loss
             else:
@@ -713,20 +607,14 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
         total_pred_loss = 0.0
-        total_reg_loss = 0.0
         total_reg_feasibility = 0.0
-        total_reg_parametric = 0.0
         total_reg_inputs = 0.0
-        total_reg_output = 0.0
-        total_reg_tightness = 0.0
         total_reg_activity = 0.0
         total_reg_H = 0.0
         num_batches = 0
 
         # Reset epoch rollback counter
         self.epoch_rollback_count = 0
-        # Reset the per-epoch count of repairs that had to drop the coverage floor
-        self.epoch_coverage_repair_fallbacks = 0
 
         # Accumulate gradient stats over epoch
         epoch_grad_stats: dict[str, list[float]] = {}
@@ -754,11 +642,8 @@ class Trainer:
             pred_loss = self.loss_fn(e_hat[:, self.warmup_steps:, :], e[:, self.warmup_steps:, :])
 
             # Add custom regularization
-            reg_loss_value = 0.0
             reg_feasibility_value = 0.0
             reg_input_value = 0.0
-            reg_output_value = 0.0
-            reg_tightness_value = 0.0
             reg_activity_value = 0.0
             reg_H_value = 0.0
             if self.regularization_weight > 0:
@@ -773,25 +658,6 @@ class Trainer:
                 reg_input_value = reg_input_loss.item()
 
                 loss = pred_loss + self.regularization_weight * reg_feasibility_loss + self.input_regularization_weight * reg_input_loss
-
-                # Output-coverage regularization (bind Corollary 1): push the
-                # certified output image to reach the physical safe level y_max.
-                # No-op when the weight is 0 or y_max is unset.
-                if self.output_regularization_weight > 0:
-                    reg_output_loss = self.model.get_regularization_output()
-                    reg_output_value = reg_output_loss.item()
-                    loss = loss + self.output_regularization_weight * reg_output_loss
-
-                # Output-tightness regularization: pull the certified half-width
-                # y_bar DOWN onto y_max (penalize over-coverage), so the certificate
-                # stays tight. C P C^T is detached inside the term, so it moves only
-                # the scale s. No-op when weight/y_max is 0/unset.
-                if self.tightness_regularization_weight > 0 and hasattr(
-                    self.model, "get_regularization_tightness"
-                ):
-                    reg_tightness_loss = self.model.get_regularization_tightness()
-                    reg_tightness_value = reg_tightness_loss.item()
-                    loss = loss + self.tightness_regularization_weight * reg_tightness_loss
 
                 # Dead-zone activity regularization: push mean ||w|| up to
                 # activity_target so the nonlinearity fires, preventing the
@@ -881,8 +747,6 @@ class Trainer:
             total_pred_loss += pred_loss.item()
             total_reg_feasibility += reg_feasibility_value
             total_reg_inputs += reg_input_value
-            total_reg_output += reg_output_value
-            total_reg_tightness += reg_tightness_value
             total_reg_activity += reg_activity_value
             total_reg_H += reg_H_value
             num_batches += 1
@@ -892,8 +756,6 @@ class Trainer:
         avg_pred_loss = total_pred_loss / num_batches
         avg_reg_feasibility = total_reg_feasibility / num_batches
         avg_reg_inputs = total_reg_inputs / num_batches
-        avg_reg_output = total_reg_output / num_batches
-        avg_reg_tightness = total_reg_tightness / num_batches
         avg_reg_activity = total_reg_activity / num_batches
         avg_reg_H = total_reg_H / num_batches
 
@@ -912,8 +774,6 @@ class Trainer:
             "pred_loss_div": pred_loss_div,
             "reg_feasibility": avg_reg_feasibility,
             "reg_input": avg_reg_inputs,
-            "reg_output": avg_reg_output,
-            "reg_tightness": avg_reg_tightness,
             "reg_activity": avg_reg_activity,
             "reg_H": avg_reg_H,
             "rollback_count": self.epoch_rollback_count,
@@ -1024,18 +884,19 @@ class Trainer:
                     "pred_loss_div",
                     "reg_feasibility",
                     "reg_input",
-                    "reg_output",
                     "reg_activity",
                     "reg_H",
                     "rollback_count",
                 ]
             }
 
-            # Epoch boundary: re-solve the certificate for the current theta so it
-            # stays the tightest one this theta admits (rho ~ 1) instead of drifting.
-            # Runs before validation/logging so every metric below reflects the
-            # certificate the model actually carries into the next epoch.
-            resynth_metrics = self._resynthesize_certificate(epoch)
+            # Coverage ratio rho = (y_bar/y_max)^nx — REPORTED, never enforced.
+            # A couple of matrix products on parameters already in memory, so it is
+            # free; None when y_max is unset.
+            rho = (
+                self.model.coverage_ratio()
+                if hasattr(self.model, "coverage_ratio") else None
+            )
 
             self.train_losses.append(train_loss)
             self.train_pred_losses.append(train_pred_loss)
@@ -1043,6 +904,12 @@ class Trainer:
             self.train_reg_inputs.append(train_results["reg_input"])
             if train_pred_loss_div is not None:
                 self.train_div_losses.append(train_pred_loss_div)
+
+            # Repair s: if the training inputs breached the input condition this
+            # epoch, re-solve MaxS so the certified set covers them again. Runs
+            # before validation so val reflects the updated certificate.
+            if self.solve_max_s_on_violation:
+                self._maybe_maximize_s(epoch)
 
             # Validate
             val_results = self.validate()
@@ -1092,8 +959,8 @@ class Trainer:
             }
             if "min_eig" in feas_margins:
                 progress_metrics["min_eig"] = f"{feas_margins['min_eig']:.2e}"
-            if "rho" in resynth_metrics:
-                progress_metrics["rho"] = f"{resynth_metrics['rho']:.3g}"
+            if rho is not None:
+                progress_metrics["rho"] = f"{rho:.3g}"
             if train_pred_loss_div is not None:
                 progress_metrics["pred_div"] = f"{train_pred_loss_div:.4f}"
             if val_loss_div is not None:
@@ -1118,31 +985,8 @@ class Trainer:
                 for margin_name, margin_value in feas_margins.items():
                     mlflow.log_metric(f"feas_margin/{margin_name}", margin_value, step=epoch)
                 mlflow.log_metric("train_reg_input", train_results["reg_input"], step=epoch)
-                if self.output_regularization_weight > 0:
-                    mlflow.log_metric("train_reg_output", train_results["reg_output"], step=epoch)
-                    mlflow.log_metric(
-                        "output_regularization_weight",
-                        self.output_regularization_weight,
-                        step=epoch,
-                    )
-                if self.tightness_regularization_weight > 0:
-                    mlflow.log_metric("train_reg_tightness", train_results["reg_tightness"], step=epoch)
-                    # Tightness margin: relu-arg (output_std*s)^2 lambda_max(CPC^T) - y_max^2.
-                    # ~0 means the certified image sits right at y_max (tight); >0 over-covers.
-                    if hasattr(self.model, "get_regularization_tightness"):
-                        with torch.no_grad():
-                            _, tight_margin = self.model.get_regularization_tightness(
-                                return_margin=True
-                            )
-                        mlflow.log_metric("output_tightness_margin", float(tight_margin), step=epoch)
                 if self.activity_regularization_weight > 0:
                     mlflow.log_metric("train_reg_activity", train_results["reg_activity"], step=epoch)
-                    # Coverage margin: lambda_max(y_max^2 I - (output_std*s)^2 CPC^T).
-                    # <=0 means the certified output image covers the safe level.
-                    if hasattr(self.model, "get_regularization_output"):
-                        with torch.no_grad():
-                            _, cov_margin = self.model.get_regularization_output(return_margin=True)
-                        mlflow.log_metric("output_coverage_margin", float(cov_margin), step=epoch)
                 if self.h_regularization_weight > 0:
                     mlflow.log_metric("train_reg_H", train_results["reg_H"], step=epoch)
                     # Current coupling norm ||H||_F (H = L P^-1): watch it climb
@@ -1154,6 +998,8 @@ class Trainer:
                                 return_norm=True,
                             )
                         mlflow.log_metric("norm_H", float(norm_H), step=epoch)
+                if rho is not None:
+                    mlflow.log_metric("rho", float(rho), step=epoch)
                 mlflow.log_metric("val_loss", val_loss, step=epoch)
                 if train_pred_loss_div is not None:
                     mlflow.log_metric("train_pred_loss_div", train_pred_loss_div, step=epoch)
@@ -1177,30 +1023,18 @@ class Trainer:
                     for stat_name, stat_value in grad_stats.items():
                         mlflow.log_metric(stat_name, stat_value, step=epoch)
 
-                # Certificate re-synthesis diagnostics (rho, beta, applied/rejected/
-                # failed counters, the re-synthesized s and ||P||).
-                for name, value in resynth_metrics.items():
-                    mlflow.log_metric(f"resynthesis/{name}", float(value), step=epoch)
-
                 # Dead-zone activity: firing_rate == 0 means the nonlinearity is inert
                 # on the data, i.e. the model is LTI in this regime and no gradient
                 # reaches B2/C2/D21 (Delta'(z) = 0 in the band) — an absorbing state
                 # that only the initialization can avoid. Watch it from epoch 0.
                 if hasattr(self.model, "deadzone_activity"):
-                    guard = self._get_guard_batch()
-                    if guard is not None:
+                    diag = self._diagnostic_batch()
+                    if diag is not None:
                         act = self.model.deadzone_activity(
-                            guard[0], guard[1], warmup_steps=self.warmup_steps
+                            diag[0], diag[1], warmup_steps=self.warmup_steps
                         )
                         for name, value in act.items():
                             mlflow.log_metric(f"deadzone/{name}", float(value), step=epoch)
-                if self.repair_enforce_coverage:
-                    mlflow.log_metric(
-                        "coverage_repair_fallbacks",
-                        float(self.epoch_coverage_repair_fallbacks),
-                        step=epoch,
-                    )
-
                 if isinstance(self.model, SimpleLure):
                     alpha = 1/(1+ np.exp(-self.model.tau.cpu().detach().numpy()))
                     mlflow.log_metric("s", self.model.s.item(), step=epoch)
@@ -1301,15 +1135,6 @@ class Trainer:
         # Save final model
         self.save_checkpoint("final_model.pt")
 
-        # Store ellipse parameters for SimpleLure models
-        if isinstance(self.model, SimpleLure):
-            X = np.linalg.inv(self.model.P.cpu().detach().numpy())
-            H = self.model.L.cpu().detach().numpy() @ X
-            s = self.model.s.cpu().detach().numpy()
-            max_norm_x0 = self.model.max_norm_x0
-            #     finally:
-            #         plt.close(fig)
-
         # Save training history
         history = {
             "train_losses": self.train_losses,
@@ -1388,23 +1213,3 @@ class Trainer:
 
         # Save to .mat file
         savemat(mat_path, params_dict)
-
-    def load_checkpoint(self, checkpoint_path: str):
-        """Load model checkpoint."""
-        checkpoint = torch.load(checkpoint_path)
-
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.current_epoch = checkpoint["epoch"]
-        self.best_val_loss = checkpoint["best_val_loss"]
-        self.best_epoch = checkpoint.get("best_epoch", 0)  # Use .get() for backward compatibility
-        self.train_losses = checkpoint.get("train_losses", [])
-        self.train_pred_losses = checkpoint.get("train_pred_losses", [])
-        self.train_reg_feasibility = checkpoint.get("train_reg_feasibility", [])
-        self.train_reg_inputs = checkpoint.get("train_reg_inputs", [])
-        self.val_losses = checkpoint.get("val_losses", [])
-
-        if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-
-        print(f"Loaded checkpoint from epoch {self.current_epoch}")

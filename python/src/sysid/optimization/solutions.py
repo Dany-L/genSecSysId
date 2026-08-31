@@ -42,31 +42,17 @@ class MaxSSolution(CertificateSolution):
 
 
 @dataclass
-class VolumePoint:
-    """One point of the MaxVol s-sweep."""
+class BootstrapSolution(CertificateSolution):
+    """**Bootstrap** — MaxS solved with ``D21`` (and optionally ``B``) free.
 
-    s: float
-    volume: float
-    logdet_P: float
-
-
-@dataclass
-class MaxVolSolution(CertificateSolution):
-    """**MaxVol** — the max-*volume* invariant-set certificate.
-
-    ``volume = sⁿˣ·√(det P)`` is the certified ellipsoid volume. ``s_feas`` is the
-    MaxS feasibility ceiling that brackets the sweep, and ``unbounded_volume`` is
-    ``True`` when the model is globally stable (the volume is unbounded and this
-    is the MaxS fallback). ``sweep`` records the per-grid-point volumes.
+    Used once, at initialization, when the identity draw lands outside the
+    feasible set: the SDP then repairs the *dynamics* alongside the certificate
+    rather than only the certificate. ``B`` / ``D21`` carry the solved values, or
+    ``None`` when that matrix was held fixed.
     """
 
-    volume: float = 0.0
-    logdet_P: float = 0.0
-    max_eig_F: float = 0.0
-    locality_min_eigs: List[float] = field(default_factory=list)
-    s_feas: Optional[float] = None
-    unbounded_volume: bool = False
-    sweep: List[VolumePoint] = field(default_factory=list)
+    B: Optional[np.ndarray] = None
+    D21: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -78,26 +64,6 @@ class CoverageSolution(CertificateSolution):
     """
 
     y_bar: Optional[float] = None
-
-
-@dataclass
-class TightCertSolution(CertificateSolution):
-    """**TightCert** — the ρ-pinned re-synthesis certificate.
-
-    The certificate found with the scale ``ŝ = 1/s²`` as a *decision variable* and
-    the coverage band as hard constraints, so ``ρ = (ȳ/y_max)ⁿˣ ∈ [1, βⁿˣ]`` holds
-    by construction (see the wiki note ``training/certificate-resynthesis``).
-
-    ``band_enforced`` is ``False`` when the band was dropped — no ``y_max``, in
-    which case this degenerates to MaxS and ``rho``/``y_bar`` are ``None``.
-    """
-
-    y_bar: Optional[float] = None
-    rho: Optional[float] = None
-    beta: Optional[float] = None
-    band_enforced: bool = True
-    max_eig_F: float = 0.0
-    norm_P: float = 0.0
 
 
 @dataclass
@@ -116,28 +82,6 @@ class CoverageSweepResult:
     s_f: Optional[float]
     sol: Optional[CoverageSolution]
     sweep: List[CoveragePoint] = field(default_factory=list)
-
-
-@dataclass
-class CoverageRatio:
-    """One evaluation of ``rho = (ȳ_MaxS/y_max)ⁿˣ = vol(𝒳_MaxS)/vol(𝒳c)`` at a
-    given ``C2`` scale factor ``f`` — the search state of the C2 calibration.
-    ``cert`` is the operative (MaxS) certificate, ``cert_volume`` its ellipsoid
-    volume, and ``cov_volume`` the minimal-covering-set volume (``cert_volume/rho``).
-
-    ``rho ≥ 1`` ⇔ the MaxS set covers ``y_max`` (grow ``f`` to tighten); ``rho < 1``
-    ⇔ even the max-s set cannot reach ``y_max`` (shrink ``f``). Monotone decreasing
-    in ``f``, so a sign test on ``rho - 1`` brackets the tightest covering ``C2``.
-    ``feasible=False`` (``rho=0``) only when MaxS itself is infeasible.
-    """
-
-    f: float
-    rho: float
-    feasible: bool
-    cert: Optional[CertificateSolution] = None
-    cert_volume: Optional[float] = None
-    cov_sol: Optional[CoverageSolution] = None
-    cov_volume: Optional[float] = None
 
 
 @dataclass
@@ -210,24 +154,3 @@ class InitializationReport:
             if np.isfinite(num):
                 metrics[name] = num
         return metrics
-
-
-@dataclass
-class CalibrationResult:
-    """Result of scaling ``C2`` so the operative (MaxS) set just covers the coverage set.
-
-    ``f`` is the winning multiplicative factor on the base ``C2``; ``rho`` is
-    ``vol(𝒳_MaxS)/vol(tightest coverage)`` at ``f`` (driven toward 1 from above);
-    ``in_band`` is ``0 ≤ rho - 1 < eps``. ``cert`` is the operative MaxS
-    certificate at the winning ``f`` (apply it after scaling C2), ``cert_volume``
-    its ellipsoid volume.
-    """
-
-    f: float
-    rho: float
-    in_band: bool
-    cert: CertificateSolution
-    cert_volume: float
-    cov_sol: Optional[CoverageSolution]
-    cov_volume: Optional[float]
-    iterations: int
