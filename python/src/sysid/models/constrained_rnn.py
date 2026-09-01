@@ -453,11 +453,22 @@ class SimpleLure(
             if mask is None:
                 continue  # No masking needed
             
-            # Register hook
+            # Register hook.
+            #
+            # The mask is a plain tensor captured in the closure, NOT a buffer, so
+            # nn.Module.to() does not move it — after model.to("cuda") the parameter
+            # and its gradient are on the GPU while the mask is still on the CPU.
+            # Re-cast on first use and cache, which also covers a later dtype change.
             def make_hook(mask_tensor):
                 def hook(grad):
                     if grad is None:
                         return None
+                    nonlocal mask_tensor
+                    if (mask_tensor.device != grad.device
+                            or mask_tensor.dtype != grad.dtype):
+                        mask_tensor = mask_tensor.to(
+                            device=grad.device, dtype=grad.dtype
+                        )
                     return grad * mask_tensor
                 return hook
             

@@ -539,9 +539,10 @@ class LureCertificateSynthesizer:
                 cp.bmat([[s_block, li], [li.T, P]]) >> eps * np.eye(self.nx + 1)
             )
 
-        t = cp.Variable((1, 1))
-        constraints += [cp.norm(P) <= t, cp.norm(M) <= t]
+        # t = cp.Variable((1, 1))
+        # constraints += [cp.norm(P) <= t, cp.norm(M) <= t]
         # problem = cp.Problem(cp.Minimize(t), constraints)
+        # feasibility is enough
         problem = cp.Problem(cp.Minimize([None]), constraints)
         try:
             problem.solve(solver=cp.MOSEK, verbose=False)

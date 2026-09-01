@@ -71,6 +71,31 @@ def torch_bmat(mat: List[List[torch.Tensor]]) -> torch.Tensor:
     return torch.vstack(mat_list)
 
 
+def as_model_tensor(model, array, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    """Convert ``array`` to a tensor on the MODEL's device and dtype.
+
+    Anything fed into a model has to live where the model's parameters live.
+    Building it with only ``dtype=model.P.dtype`` silently works on CPU and then
+    fails on GPU with "Expected all tensors to be on the same device", because
+    ``torch.as_tensor`` on a numpy array always lands on the CPU — numpy arrays are
+    host memory, so no factory call can infer the device from them.
+
+    Use this at every seam where numpy data enters a model. It deliberately does
+    NOT apply to the data loaders: those build CPU tensors on purpose and the
+    training loop moves each batch with ``.to(device)``.
+
+    Args:
+        model: anything exposing a ``P`` parameter (the Lure models do); its device
+            and dtype are the target.
+        array: numpy array, tensor, or anything ``torch.as_tensor`` accepts.
+        dtype: override for the model's dtype; defaults to ``model.P.dtype``.
+    """
+    ref = model.P
+    return torch.as_tensor(
+        array, dtype=ref.dtype if dtype is None else dtype, device=ref.device
+    )
+
+
 def max_abs_output(outputs: np.ndarray) -> float:
     """Safe output level ``y_max = max_{i,k} |y_k^(i)|`` from a dataset.
 

@@ -29,6 +29,8 @@ import numpy as np
 import pandas as pd
 import torch
 
+from sysid.utils import as_model_tensor
+
 from .regional_verification import _make_lp_noise, _sample_on_ellipsoid
 
 
@@ -63,11 +65,13 @@ def _rollout(model, u_n, x0=None, warmup_steps: int = 0):
     Returns ``(y_hat_n, xs, u_used, c)`` as numpy arrays, where ``c`` is the
     safe-set margin from ``get_regularization_input``.
     """
-    dtype = model.P.dtype
-    u_t = torch.as_tensor(np.asarray(u_n), dtype=dtype)
+    # Build on the MODEL's device/dtype: numpy arrays are host memory, so a bare
+    # torch.as_tensor always lands on the CPU and a GPU model would fail with
+    # "Expected all tensors to be on the same device".
+    u_t = as_model_tensor(model, np.asarray(u_n))
     if u_t.dim() == 2:
         u_t = u_t.unsqueeze(0)
-    x0_t = None if x0 is None else torch.as_tensor(np.asarray(x0), dtype=dtype)
+    x0_t = None if x0 is None else as_model_tensor(model, np.asarray(x0))
     with torch.no_grad():
         y_hat_n, (xs, _), u_used = _forward(model, u_t, x0_t, warmup_steps)
         _, c = model.get_regularization_input(
