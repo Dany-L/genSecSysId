@@ -6,12 +6,11 @@ holds the (fixed) prediction dynamics as numpy arrays and exposes one method per
 SDP, each returning a typed result from :mod:`sysid.optimization.solutions`:
 
 * :meth:`max_s`          — MaxS: the max-feasible-``s`` feasibility ceiling.
-* :meth:`max_vol_at_s`   — the convex fixed-``s`` slice (max-det) of MaxVol.
-* :meth:`max_vol`        — MaxVol: the max-*volume* invariant-set certificate.
+* :meth:`bootstrap`      — MaxS with ``D21`` (and optionally ``B``) free, for init.
+* :meth:`project_theta`  — nearest certifiable theta at a FIXED certificate.
 * :meth:`coverage_at_s`  — the fixed-``s`` binding-coverage SDP.
 * :meth:`coverage_sweep` — the tightest coverage over an s-grid.
-* :meth:`feasibility`    — fixed-``s`` certificate repair.
-* :meth:`calibrate_c2`   — scale ``C2`` so MaxVol just covers the coverage set.
+* :meth:`feasibility`    — certificate repair at fixed ``s``, or with ``s`` free.
 
 Every solve is **pure**: it reads the synthesizer's arrays and returns a solution;
 nothing here mutates a model. The model keeps thin wrappers that build a
@@ -21,24 +20,19 @@ synthesizer from its current parameters and write applied solutions back.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, Sequence
 
 import cvxpy as cp
 import numpy as np
 
-from sysid.utils import get_volume_of_ellipsoid
-
 from .solutions import (
-    CalibrationResult,
+    BootstrapSolution,
     CertificateSolution,
     CoveragePoint,
-    CoverageRatio,
     CoverageSolution,
     CoverageSweepResult,
     MaxSSolution,
-    MaxVolSolution,
-    VolumePoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,21 +94,36 @@ class LureCertificateSynthesizer:
             P_current=to_np(model.P),
         )
 
-    def with_c2(self, C2_new: np.ndarray) -> "LureCertificateSynthesizer":
-        """A copy of this synthesizer with ``C2`` replaced (pure — for the sweep)."""
-        return replace(self, C2=np.asarray(C2_new))
-
-    def _build_F(self, P, L, M):
+    def _build_F(self, P, L, M, A=None, B=None, B2=None, C2=None, D21=None):
         """The shared stability LMI matrix ``F`` (same for every certificate SDP).
 
-        Works with cvxpy variables or numpy arrays for ``P``, ``L``, ``M``.
+        Every argument may be a numpy array or a cvxpy expression; the theta
+        arguments default to this synthesizer's fixed dynamics.
+
+        ``F`` is **bilinear** in (certificate, theta) — it contains products
+        ``P·C2ᵀ``, ``P·Aᵀ`` and ``M·B2ᵀ`` — so exactly one side may vary at a time:
+
+        * :meth:`max_s` / :meth:`coverage_at_s` / :meth:`feasibility` vary the
+          certificate (P, L, M) at fixed theta;
+        * :meth:`bootstrap` additionally frees B and D21, which appear only in the
+          blocks that carry no P or M, so it stays affine;
+        * :meth:`project_theta` varies theta at a FIXED certificate, which makes
+          every block affine in (A, B, B2, C2, D21).
+
+        Passing cvxpy variables on both sides at once would make the constraint
+        non-convex; nothing here does that.
         """
+        A = self.A if A is None else A
+        B = self.B if B is None else B
+        B2 = self.B2 if B2 is None else B2
+        C2 = self.C2 if C2 is None else C2
+        D21 = self.D21 if D21 is None else D21
         return cp.bmat(
             [
-                [-(self.alpha ** 2) * P, np.zeros((self.nx, self.nd)), P @ self.C2.T + L.T, P @ self.A.T],
-                [np.zeros((self.nd, self.nx)), -np.eye(self.nd), self.D21.T, self.B.T],
-                [self.C2 @ P + L, self.D21, -2 * M, M @ self.B2.T],
-                [self.A @ P, self.B, self.B2 @ M, -P],
+                [-(self.alpha ** 2) * P, np.zeros((self.nx, self.nd)), P @ C2.T + L.T, P @ A.T],
+                [np.zeros((self.nd, self.nx)), -np.eye(self.nd), D21.T, B.T],
+                [C2 @ P + L, D21, -2 * M, M @ B2.T],
+                [A @ P, B, B2 @ M, -P],
             ]
         )
 
@@ -200,107 +209,220 @@ class LureCertificateSynthesizer:
             ],
         )
 
-    # ------------------------------------------------------------------ MaxVol
-    def max_vol_at_s(self, s: float) -> Optional[MaxVolSolution]:
-        """The convex fixed-``s`` slice of MaxVol: ``max log det P`` subject to the
-        stability + (constant-``1/s²``) locality LMIs. Returns ``None`` if
-        infeasible / unbounded (globally-stable regime) / the solver fails."""
+    # --------------------------------------------------------------- Bootstrap
+    def bootstrap(
+        self, learn_B: bool = False, learn_D21: bool = True
+    ) -> Optional[BootstrapSolution]:
+        """MaxS with ``D21`` (and optionally ``B``) as additional free variables.
+
+        The initialization-only sibling of :meth:`max_s`: same stability +
+        locality LMIs and the same ``min 1/s²`` objective, but the input maps are
+        solved for instead of held fixed. ``_init_identity`` draws ``D21`` from
+        ``N(0, std²)`` with no reference to the data, so the draw usually lands
+        outside the feasible set; letting the SDP choose ``D21`` shrinks it and
+        lifts the certifiable ``s`` to the scale the data needs, while A, B, C, D,
+        D12, B2 and C2 keep exactly the values the identity init gave them.
+
+        ``learn_B`` stays ``False`` by default on purpose: with ``B`` free too the
+        SDP drives both ``B`` and ``D21`` to zero — trivially certifiable, but a
+        dead model (``e_hat == 0``).
+
+        Returns ``None`` if the solver fails or the problem is infeasible.
+
+        Note this deliberately does NOT impose ``m >= 0`` the way :meth:`max_s`
+        does; the bootstrap has always run as a pure feasibility/scale solve over
+        ``(P, la, L, s)`` plus the free input maps, and the trained models were
+        established with that feasible set.
+        """
         eps = self.eps
-        s2 = float(s) ** 2
         P = cp.Variable((self.nx, self.nx), symmetric=True)
-        m = cp.Variable((self.nz, 1))
-        M = cp.diag(m)
-        L = cp.Variable((self.nz, self.nx)) if self.learn_L else self.L_fixed
+        la = cp.Variable((self.nz, 1))
+        M = cp.diag(la)
+        B = cp.Variable(self.B.shape) if learn_B else self.B
+        D21 = cp.Variable(self.D21.shape) if learn_D21 else self.D21
 
-        F = self._build_F(P, L, M)
+        if self.learn_L:
+            L = cp.Variable((self.nz, self.nx))
+            S_hat = cp.Variable((1, 1))
+        else:
+            L = self.L_fixed
+            S_hat = None
+
+        F = self._build_F(P, L, M, B=B, D21=D21)
         nF = F.shape[0]
-        constraints = [F << -eps * np.eye(nF), m >= 0]
+        constraints = [F << -eps * np.eye(nF)]
 
-        Gs = []
+        # Locality LMIs only in the regional (learn_L) regime — with L fixed at 0
+        # the scale is frozen and the constraint is vacuous, matching max_s.
         if self.learn_L:
             for i in range(self.nz):
                 li = L[i, :].reshape((1, -1), order="C")
-                locality_lmi = cp.bmat([[np.array([[1.0 / s2]]), li], [li.T, P]])
-                Gs.append(locality_lmi)
-                constraints.append(locality_lmi >> eps * np.eye(self.nx + 1))
+                constraints.append(
+                    cp.bmat([[S_hat, li], [li.T, P]]) >> eps * np.eye(self.nx + 1)
+                )
 
-        problem = cp.Problem(cp.Maximize(cp.log_det(P)), constraints)
+        problem = cp.Problem(cp.Minimize(S_hat if self.learn_L else 0), constraints)
         try:
             problem.solve(solver=cp.MOSEK, verbose=False)
         except Exception as e:
-            logger.debug(f"max-vol SDP failed at s={s:.4f}: {e}")
+            logger.error(f"bootstrap SDP solver failed: {e}")
+            return None
+        if problem.status != "optimal":
+            logger.error(f"bootstrap SDP failed with status: {problem.status}")
+            return None
+
+        if self.learn_L:
+            S_hat_opt = float(np.asarray(S_hat.value).reshape(-1)[0])
+            if S_hat_opt <= 0:
+                logger.error(f"bootstrap SDP returned non-positive S_hat ({S_hat_opt})")
+                return None
+            s_star = float(np.sqrt(1.0 / S_hat_opt))
+            L_val = L.value
+        else:
+            s_star = self.s_fixed
+            L_val = L
+
+        return BootstrapSolution(
+            P=P.value,
+            L=L_val,
+            M=M.value,
+            s=s_star,
+            B=B.value if learn_B else None,
+            D21=D21.value if learn_D21 else None,
+        )
+
+    # --------------------------------------------------------------- Projection
+    #: theta blocks that appear in the stability LMI, i.e. the ones a projection
+    #: can constrain. C, D and D12 are absent from F — they are output maps and the
+    #: certificate says nothing about them — so they are never projected.
+    THETA_IN_F = ("A", "B", "B2", "C2", "D21")
+
+    def max_eig_F(self, P, L, M, **theta) -> float:
+        """``max eig(F)`` for a given certificate and theta — the stability margin.
+
+        ``< 0`` means the pair satisfies the stability LMI. Keyword arguments
+        override individual theta blocks (see :meth:`_build_F`); anything omitted
+        comes from this synthesizer. Pure numpy, no solver.
+        """
+        F = self._build_F(P, L, M, **theta)
+        return float(np.max(np.real(np.linalg.eigvals(np.asarray(F.value)))))
+
+    def project_theta(
+        self,
+        target: dict,
+        P: np.ndarray,
+        L: np.ndarray,
+        M: np.ndarray,
+        free: Optional[Sequence[str]] = None,
+    ) -> Optional[dict]:
+        """Closest theta to ``target`` that the FIXED certificate ``(P, L, M)`` certifies.
+
+        Solves
+
+            min  sum_i ||X_i - target_i||_F^2 / ||target_i||_F^2    over ``free``
+            s.t. F(theta; P, L, M) << -eps I
+
+        The per-block normalization makes the objective RELATIVE, so blocks whose
+        entries differ by orders of magnitude are moved by comparable fractions
+        rather than the smallest-magnitude one absorbing the whole correction.
+
+        With the certificate held fixed every block of ``F`` is affine in
+        (A, B, B2, C2, D21) — see :meth:`_build_F` — so this is a convex QP over an
+        LMI, i.e. an SDP with a quadratic objective. It is a genuine Euclidean
+        projection onto the certified set, so a ``target`` that is already
+        certifiable comes back unchanged.
+
+        Why this and not "perturb, then re-solve the certificate": re-solving moves
+        the certificate to fit whatever theta the noise produced, and can simply
+        fail when the draw lands outside the certifiable set. Projecting instead
+        keeps the certificate — the one from the UNDISTURBED reference — and moves
+        theta the smallest distance that makes it valid. The result is feasible by
+        construction, deterministic, and still the nearest point to the draw.
+
+        Args:
+            target: ``{name: array}`` for every block in :attr:`THETA_IN_F`. Blocks
+                not in ``free`` are held at these values as constants, so a
+                structurally-fixed parameter must be passed at its fixed value.
+            P, L, M: the fixed certificate, e.g. from :meth:`max_s` at the
+                undisturbed theta. ``s`` is not needed: it enters only the locality
+                LMIs, which involve no theta and are therefore unaffected.
+            free: which blocks are optimization variables. Defaults to all of
+                :attr:`THETA_IN_F`.
+
+        Returns ``{name: array}`` for the free blocks, or ``None`` if the solver
+        fails (which here means the certificate admits no theta at all, not that
+        the draw was unlucky).
+        """
+        free = tuple(self.THETA_IN_F if free is None else free)
+        unknown = [n for n in free if n not in self.THETA_IN_F]
+        if unknown:
+            raise ValueError(
+                f"project_theta: {unknown} are not in the stability LMI; only "
+                f"{list(self.THETA_IN_F)} can be projected (C/D/D12 do not appear in F)."
+            )
+        missing = [n for n in self.THETA_IN_F if n not in target]
+        if missing:
+            raise ValueError(f"project_theta: target is missing {missing}.")
+
+        shapes = {
+            "A": (self.nx, self.nx), "B": (self.nx, self.nd),
+            "B2": (self.nx, self.nz), "C2": (self.nz, self.nx),
+            "D21": (self.nz, self.nd),
+        }
+        blocks, objective_terms = {}, []
+        for name in self.THETA_IN_F:
+            tgt = np.asarray(target[name], dtype=float)
+            if tgt.shape != shapes[name]:
+                raise ValueError(
+                    f"project_theta: target['{name}'] has shape {tgt.shape}, "
+                    f"expected {shapes[name]}."
+                )
+            if name in free:
+                X = cp.Variable(shapes[name])
+                blocks[name] = X
+                # Weight each block by its own scale so the objective is RELATIVE.
+                # Unweighted, ``sum ||X_i - target_i||_F^2`` is measured in absolute
+                # units, so the cheapest way to satisfy the LMI is to move whichever
+                # block has the smallest entries — on the Duffing reference that is
+                # B (entries ~5e-3, vs C2 ~13), which ends up displaced by ~12%
+                # while everything else moves ~0.1%. Dividing by ||target_i||_F
+                # makes the projection scale-invariant and puts it in the same
+                # relative units the perturbation itself uses.
+                scale = float(np.linalg.norm(tgt))
+                objective_terms.append(
+                    cp.sum_squares(X - tgt) / (scale ** 2) if scale > 0
+                    else cp.sum_squares(X - tgt)
+                )
+            else:
+                blocks[name] = tgt
+
+        F = self._build_F(P, L, M, **blocks)
+        nF = F.shape[0]
+        problem = cp.Problem(
+            cp.Minimize(cp.sum(objective_terms)),
+            [F << -self.eps * np.eye(nF)],
+        )
+        try:
+            problem.solve(solver=cp.MOSEK, verbose=False)
+        except Exception as e:
+            logger.error(f"theta projection SDP solver failed: {e}")
             return None
         if problem.status not in ("optimal", "optimal_inaccurate"):
+            logger.error(f"theta projection SDP failed with status: {problem.status}")
             return None
 
-        P_val = P.value
-        return MaxVolSolution(
-            P=P_val,
-            L=L.value if self.learn_L else L,
-            M=M.value,
-            s=float(s),
-            volume=float(get_volume_of_ellipsoid(P_val, float(s))),
-            logdet_P=float(np.linalg.slogdet(P_val)[1]),
-            max_eig_F=float(np.max(np.real(np.linalg.eigvals(F.value)))),
-            locality_min_eigs=[
-                float(np.min(np.real(np.linalg.eigvals(g.value)))) for g in Gs
-            ],
+        out = {n: np.asarray(blocks[n].value, dtype=float) for n in free}
+        moved = float(np.sqrt(sum(
+            np.linalg.norm(out[n] - np.asarray(target[n], dtype=float)) ** 2 for n in free
+        )))
+        scale = float(np.sqrt(sum(
+            np.linalg.norm(np.asarray(target[n], dtype=float)) ** 2 for n in free
+        )))
+        logger.debug(
+            f"theta projection: moved ||dtheta|| = {moved:.4g} "
+            f"({100 * moved / max(scale, 1e-12):.4f}% of ||theta||)"
         )
-
-    def max_vol(self, n_grid: int = 25) -> Optional[MaxVolSolution]:
-        """MaxVol — the largest-*volume* invariant-set certificate. Sweeps
-        ``s ∈ (0, s_feas]`` (``s_feas`` = the MaxS ceiling), keeps the largest
-        ``sⁿˣ·√(det P)``. Falls back to the MaxS certificate (``unbounded_volume``)
-        in the globally-stable regime where the volume is unbounded. ``None`` if θ
-        is infeasible."""
-        ceil_sol = self.max_s()
-        if ceil_sol is None:
-            return None
-        s_feas = float(ceil_sol.s)
-
-        s_grid = (
-            np.linspace(s_feas / n_grid, s_feas, int(n_grid))
-            if self.learn_L else np.array([s_feas])
-        )
-        sweep = []
-        best = None
-        for s in s_grid:
-            sol = self.max_vol_at_s(float(s))
-            if sol is None:
-                continue
-            sweep.append(VolumePoint(s=sol.s, volume=sol.volume, logdet_P=sol.logdet_P))
-            if best is None or sol.volume > best.volume:
-                best = sol
-
-        if best is not None:
-            best.s_feas = s_feas
-            best.unbounded_volume = False
-            best.sweep = sweep
-            logger.debug(
-                f"max-vol SDP solved: volume = {best.volume:.3e} at s = {best.s:.4f} "
-                f"(feasibility ceiling s_max = {s_feas:.4f})"
-            )
-            return best
-
-        # No finite-volume point: globally stable -> volume unbounded. Fall back to
-        # the MaxS feasibility-ceiling certificate (largest feasible s).
-        logger.warning(
-            "max-vol SDP: invariant-set volume is unbounded (globally-stable "
-            f"regime); falling back to the MaxS feasibility ceiling at s={s_feas:.4f}."
-        )
-        return MaxVolSolution(
-            P=ceil_sol.P,
-            L=ceil_sol.L,
-            M=ceil_sol.M,
-            s=ceil_sol.s,
-            volume=float(get_volume_of_ellipsoid(ceil_sol.P, s_feas)),
-            logdet_P=float(np.linalg.slogdet(ceil_sol.P)[1]),
-            max_eig_F=ceil_sol.max_eig_F,
-            locality_min_eigs=ceil_sol.locality_min_eigs,
-            s_feas=s_feas,
-            unbounded_volume=True,
-            sweep=[],
-        )
+        return out
 
     # ---------------------------------------------------------------- Coverage
     def coverage_at_s(self, s: float, y_max: float) -> Optional[CoverageSolution]:
@@ -360,7 +482,12 @@ class LureCertificateSynthesizer:
     ) -> Optional[CoverageSweepResult]:
         """Tightest output coverage ``ȳ_f`` over ``s ∈ [s_min, s_max]``: the
         feasible fixed-``s`` solution with the smallest physical certified
-        half-width. ``None`` when no grid point is feasible."""
+        half-width. ``None`` when no grid point is feasible.
+
+        ``s_min`` should be the **input floor** ``max_{k,i}‖u_k^{(i)}‖``: below it the
+        input condition ``‖u_k‖² ≤ s² − α²x_kᵀP⁻¹x_k`` cannot hold for any ``P``
+        (the quadratic form is ``≥ 0``), so a tighter ``ȳ`` found there belongs to a
+        certificate that does not admit its own training inputs."""
         s_grid = np.linspace(float(s_min), float(s_max), int(n_grid))
         sweep = [sol for sol in (self.coverage_at_s(float(s), y_max) for s in s_grid) if sol]
         if not sweep:
@@ -375,136 +502,66 @@ class LureCertificateSynthesizer:
         )
 
     # ------------------------------------------------------------- Feasibility
-    def feasibility(self, s: float) -> Optional[CertificateSolution]:
-        """Fixed-``s`` certificate repair: find P ≻ 0, M ⪰ 0, L satisfying the
-        stability + (constant-``1/s²``) locality LMIs, with a well-conditioning
-        ``min t`` (‖P‖ ≤ t, ‖M‖ ≤ t). ``None`` if infeasible / solver fails."""
+    def feasibility(self, s: Optional[float]) -> Optional[CertificateSolution]:
+        """Certificate repair with θ and α held fixed: find P ≻ 0, M ⪰ 0, L (and
+        optionally ``s``) satisfying the stability + locality LMIs, with a
+        well-conditioning ``min t`` (‖P‖ ≤ t, ‖M‖ ≤ t). ``None`` if infeasible /
+        the solver fails.
+
+        ``s`` given pins the scale, so the locality LMIs carry the constant
+        ``1/s²`` and only (P, L, M) move — the smallest repair, and the one that
+        leaves ``s`` where the gradient and the barrier put it.
+
+        ``s=None`` frees the scale. The substitution ``ŝ = 1/s²`` keeps both LMIs
+        *jointly linear* in (P, L, M, ŝ), so this is still one convex solve; the
+        recovered ``s = 1/√ŝ``. Use it only when the fixed-``s`` repair is
+        infeasible, since a free ``s`` discards what the barrier had learned."""
         eps = self.eps
-        s_hat = 1.0 / float(s) ** 2
+        free_s = s is None
         P = cp.Variable((self.nx, self.nx), symmetric=True)
         L = cp.Variable((self.nz, self.nx)) if self.learn_L else self.L_fixed
         m = cp.Variable((self.nz, 1))
         M = cp.diag(m)
+        if free_s:
+            S_hat = cp.Variable((1, 1))
+            s_block = S_hat
+        else:
+            s_block = np.array([[1.0 / float(s) ** 2]])
 
         F = self._build_F(P, L, M)
         nF = F.shape[0]
         constraints = [F << -eps * np.eye(nF), m >= 0]
+        if free_s:
+            constraints.append(S_hat >> eps)
         for i in range(self.nz):
             li = L[i, :].reshape((1, -1), order="C")
             constraints.append(
-                cp.bmat([[np.array([[s_hat]]), li], [li.T, P]]) >> eps * np.eye(self.nx + 1)
+                cp.bmat([[s_block, li], [li.T, P]]) >> eps * np.eye(self.nx + 1)
             )
 
-        t = cp.Variable((1, 1))
-        constraints += [cp.norm(P) <= t, cp.norm(M) <= t]
-        problem = cp.Problem(cp.Minimize(t), constraints)
+        # t = cp.Variable((1, 1))
+        # constraints += [cp.norm(P) <= t, cp.norm(M) <= t]
+        # problem = cp.Problem(cp.Minimize(t), constraints)
+        # feasibility is enough
+        problem = cp.Problem(cp.Minimize([None]), constraints)
         try:
             problem.solve(solver=cp.MOSEK, verbose=False)
         except Exception as e:
-            logger.debug(f"feasibility SDP failed at s={s:.4f}: {e}")
+            logger.debug(f"feasibility SDP failed at s={'free' if free_s else f'{s:.4f}'}: {e}")
             return None
         if problem.status not in ("optimal", "optimal_inaccurate"):
             return None
+        if free_s:
+            s_opt = float(S_hat.value[0, 0])
+            if s_opt <= 0:
+                return None
+            s_out = float(np.sqrt(1.0 / s_opt))
+        else:
+            s_out = float(s)
         return CertificateSolution(
             P=P.value,
             L=L.value if self.learn_L else L,
             M=M.value,
-            s=float(s),
+            s=s_out,
         )
 
-    # ------------------------------------------------------- C2 calibration
-    def coverage_ratio_at_c2(self, f: float, y_max: float) -> CoverageRatio:
-        """Evaluate ``rho = (ȳ_MaxS / y_max)ⁿˣ`` with ``C2`` scaled by ``f`` (pure —
-        via :meth:`with_c2`), where ``ȳ_MaxS = σ·s·√(λ_min(C P Cᵀ))`` is the MaxS
-        certificate's own certified output half-width (worst output direction).
-
-        This is exactly ``vol(𝒳_MaxS)/vol(𝒳c)``, with ``𝒳c`` the *minimal covering
-        set of the MaxS shape* — the MaxS ellipsoid scaled down (``s' = s·y_max/ȳ``)
-        until it just reaches ``y_max`` — since same-shape scaling gives
-        ``vol ∝ sⁿˣ``. It needs only :meth:`max_s` (no coverage sweep), is smooth
-        and monotone decreasing in ``f``, and ``rho ≥ 1 ⇔ the operative MaxS set
-        covers y_max`` (``rho < 1`` ⇔ even the max-s set cannot reach it). So a sign
-        test on ``rho - 1`` brackets the tightest covering ``C2``."""
-        synth = self.with_c2(self.C2 * float(f))
-        cert = synth.max_s()
-        if cert is None:
-            return CoverageRatio(f=f, rho=0.0, feasible=False)
-        cert_vol = float(get_volume_of_ellipsoid(cert.P, cert.s))
-        CPCt = synth.C @ cert.P @ synth.C.T
-        lam_min = max(float(np.min(np.linalg.eigvalsh(CPCt))), 0.0)
-        y_bar = float(synth.output_std * cert.s * np.sqrt(lam_min))  # worst direction
-        rho = float((y_bar / y_max) ** synth.nx) if y_max > 0 else float("inf")
-        cov_vol = float(cert_vol / rho) if rho > 0 else None
-        return CoverageRatio(
-            f=f, rho=rho, feasible=True, cert=cert, cert_volume=cert_vol,
-            cov_sol=None, cov_volume=cov_vol,
-        )
-
-    def calibrate_c2(
-        self,
-        y_max: float,
-        eps: float = 0.05,
-        max_iter: int = 30,
-        f_min: float = 1e-3,
-        f_max: float = 1e3,
-    ) -> Optional[CalibrationResult]:
-        """Find a scalar factor on ``C2`` with ``0 ≤ rho - 1 < eps`` by geometric
-        bisection of the root of ``rho - 1``, where ``rho = (ȳ_MaxS/y_max)ⁿˣ``
-        (:meth:`coverage_ratio_at_c2`) is smooth and monotone decreasing in the
-        factor. Returns the largest factor that still covers (``rho ≥ 1``),
-        converged so ``rho - 1 < eps`` when reachable — the tightest coupling for
-        which the operative MaxS set still covers ``y_max``. Pure — the caller
-        applies the winning ``C2`` factor and certificate. ``None`` if even the
-        base C2 admits no certificate."""
-        memo = {}
-
-        def state(f: float) -> CoverageRatio:
-            key = float(f)
-            if key not in memo:
-                memo[key] = self.coverage_ratio_at_c2(key, y_max)
-            return memo[key]
-
-        base = state(1.0)
-        if base.cert is None and not base.feasible:
-            logger.warning("C2 calibration: base C2 admits no certificate; skipping.")
-            return None
-
-        # Bracket the root of rho - 1: lo keeps rho >= 1 (covers), hi has rho < 1.
-        lo, hi = 1.0, 1.0
-        while state(hi).rho >= 1.0 and hi < f_max:
-            hi = min(hi * 2.0, f_max)
-        while state(lo).rho < 1.0 and lo > f_min:
-            lo = max(lo / 2.0, f_min)
-
-        def in_band(st: CoverageRatio) -> bool:
-            return np.isfinite(st.rho) and 0.0 <= st.rho - 1.0 < eps
-
-        iterations = 0
-        for iterations in range(1, int(max_iter) + 1):
-            if in_band(state(lo)):
-                break
-            if hi / lo < 1.0 + 1e-6:  # bracket collapsed
-                break
-            mid = float(np.sqrt(lo * hi))  # geometric midpoint (f spans decades)
-            if state(mid).rho >= 1.0:
-                lo = mid
-            else:
-                hi = mid
-
-        best = state(lo)
-        best_in_band = in_band(best)
-        if not best_in_band:
-            logger.warning(
-                f"C2 calibration: could not land rho in [1, 1+{eps}); "
-                f"kept closest covering factor f={best.f:.4g} (rho={best.rho})."
-            )
-        return CalibrationResult(
-            f=best.f,
-            rho=best.rho,
-            in_band=best_in_band,
-            cert=best.cert,
-            cert_volume=best.cert_volume,
-            cov_sol=best.cov_sol,
-            cov_volume=best.cov_volume,
-            iterations=iterations,
-        )

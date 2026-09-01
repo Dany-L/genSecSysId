@@ -3,8 +3,6 @@
 The certificate SDPs live on ``LureCertificateSynthesizer``:
   * MaxS  (``synthesizer.max_s``) — max feasible s; the OPERATIVE certificate
     (largest regional invariant set, well conditioned).
-  * MaxVol (``synthesizer.max_vol`` / ``max_vol_at_s``) — max invariant-ellipsoid
-    *volume* sⁿˣ·√(det P) over the s-sweep; available but no longer operative.
   * Feasibility (``feasibility_problem`` / ``synthesizer.feasibility``) — repair
     P,M,L at a FIXED s (the within-epoch step 3.1); s is never changed here.
   * MinTrProb (``solve_output_coverage_certificate``) — tested in
@@ -20,7 +18,6 @@ import cvxpy as cp
 
 from sysid.models.constrained_rnn import SimpleLure
 from sysid.optimization import LureCertificateSynthesizer
-from sysid.utils import get_volume_of_ellipsoid
 
 
 def _synth(model) -> LureCertificateSynthesizer:
@@ -165,176 +162,14 @@ class TestMaxS:
         assert all(s.max_eig_F < 0 for s in sols)
 
 
-@requires_mosek
-class TestMaxVol:
-    """MaxVol (``synthesizer.max_vol`` / ``max_vol_at_s``): the operative
-    certificate — maximizes the ellipsoid volume sⁿˣ·√(det P) over the s-sweep."""
-
-    def test_max_vol_is_feasible(self):
-        m = _make_moderate_model()
-        sol = _synth(m).max_vol()
-        assert sol is not None
-        assert sol.s > 0 and sol.volume > 0
-        m._apply_certificate_solution(sol)
-        assert m.check_constraints()
-
-    def test_operative_s_within_feasibility_bracket(self):
-        """The volume-optimal s lives in (0, s_feas]; s_feas is the MaxS ceiling."""
-        m = _make_moderate_model()
-        synth = _synth(m)
-        sol = synth.max_vol()
-        assert sol is not None
-        assert sol.s_feas == pytest.approx(synth.max_s().s, rel=1e-4)
-        assert 0.0 < sol.s <= sol.s_feas * (1.0 + 1e-6)
-
-    def test_selected_point_maximizes_volume_over_sweep(self):
-        """The returned (s, P) is the argmax of the recorded per-grid volumes."""
-        sol = _synth(_make_moderate_model()).max_vol(n_grid=15)
-        assert sol is not None
-        assert sol.volume == pytest.approx(
-            max(pt.volume for pt in sol.sweep), rel=1e-9
-        )
-        assert len(sol.sweep) >= 1
-
-    def test_max_vol_beats_max_s_volume(self):
-        """MaxVol must certify a volume at least as large as the MaxS solution's
-        (it optimizes exactly that objective, so it can never be smaller)."""
-        synth = _synth(_make_moderate_model())
-        max_s = synth.max_s()
-        vol_max_s = get_volume_of_ellipsoid(max_s.P, max_s.s)
-        max_vol = synth.max_vol()
-        assert max_vol is not None
-        assert max_vol.volume >= vol_max_s * (1.0 - 1e-6)
-
-    def test_max_vol_at_s_is_convex_and_feasible(self):
-        """The fixed-s slice (a convex max-det SDP) is feasible below the ceiling
-        and returns a strictly positive-volume certificate."""
-        m = _make_moderate_model()
-        synth = _synth(m)
-        s_feas = synth.max_s().s
-        sol = synth.max_vol_at_s(0.5 * s_feas)
-        assert sol is not None
-        assert sol.volume > 0 and np.isfinite(sol.logdet_P)
-        m._apply_certificate_solution(sol)
-        assert m.check_constraints()
-
-    def test_max_vol_runs_for_global_model(self):
-        """learn_L=False (L=0): no sweep (s fixed); returns the fixed s, L=0 and a
-        positive-volume largest ellipsoid at that s."""
-        m = _make_global_model(s_value=1.0)
-        sol = _synth(m).max_vol()
-        assert sol is not None
-        assert sol.s == pytest.approx(1.0, rel=1e-9)
-        assert sol.s_feas == pytest.approx(1.0, rel=1e-9)
-        assert np.allclose(sol.L, 0.0)
-        assert sol.locality_min_eigs == []  # no locality LMIs
-        assert sol.volume > 0
-        m._apply_certificate_solution(sol)
-        assert m.check_constraints()
-
-    def test_max_vol_is_pure(self):
-        """max_vol operates on a synthesizer snapshot and must not mutate the model."""
-        m = _make_moderate_model()
-        before = (m.P.detach().clone(), m.s.detach().clone(), m.L.detach().clone())
-        sol = _synth(m).max_vol(n_grid=8)
-        assert sol is not None
-        assert torch.equal(m.P, before[0])
-        assert torch.equal(m.s, before[1])
-        assert torch.equal(m.L, before[2])
-
-
-def _make_coverage_model(y_max: float = 1.0) -> SimpleLure:
-    """Regional model with a non-trivial output map C = [1, 0] and a physical
-    output level set, so the coverage sweep (hence rho) is well defined."""
-    m = _make_moderate_model()
-    with torch.no_grad():
-        m.C.data = torch.tensor([[1.0, 0.0]], dtype=m.C.dtype)
-    m.set_output_coverage_level(y_max, 1.0)  # physical y_max, output_std = 1
-    return m
-
-
-@requires_mosek
-class TestC2Calibration:
-    """C2 calibration: scale C2 so the operative (MaxS) set *just* covers the
-    coverage set (rho = vol(𝒳_MaxS)/vol(tightest coverage) driven toward 1)."""
-
-    def test_rho_is_monotone_decreasing_in_c2(self):
-        """More C2 coupling -> smaller MaxS set -> lower volume and lower rho.
-        This is the premise the search relies on."""
-        synth = _synth(_make_coverage_model(y_max=1.0))
-        lo = synth.coverage_ratio_at_c2(0.5, 1.0)
-        hi = synth.coverage_ratio_at_c2(4.0, 1.0)
-        assert lo.cert_volume > hi.cert_volume  # MaxS volume drops
-        assert lo.rho > hi.rho                  # rho drops
-
-    def test_calibration_returns_covering_regional_factor(self):
-        """Calibration returns the smallest covering set: a finite rho >= 1
-        (regional, still covers y_max), reached by growing C2. The synthesizer is
-        pure, so the caller scales C2 by the winning factor to apply it."""
-        m = _make_coverage_model(y_max=1.0)
-        cal = _synth(m).calibrate_c2(1.0, eps=0.05, max_iter=15)
-        assert cal is not None
-        assert 1e-3 <= cal.f <= 1e3
-        # Smallest covering set: rho finite and >= 1 (MaxS set still contains the
-        # coverage requirement); the base was above the band, so C2 grew.
-        assert np.isfinite(cal.rho) and cal.rho >= 1.0 - 1e-6
-        assert cal.f > 1.0
-        # Apply the winning factor + certificate (what initialize_parameters does)
-        # and verify the model is feasible.
-        m.C2.data = m.C2.data * cal.f
-        m._apply_certificate_solution(cal.cert)
-        assert m.check_constraints()
-
-    def test_calibration_in_band_flag_matches_rho(self):
-        """in_band is exactly the 0 <= rho-1 < eps test on the returned rho."""
-        eps = 0.05
-        cal = _synth(_make_coverage_model(y_max=2.0)).calibrate_c2(
-            2.0, eps=eps, max_iter=15
-        )
-        assert cal is not None
-        expected = bool(np.isfinite(cal.rho) and 0.0 <= cal.rho - 1.0 < eps)
-        assert cal.in_band == expected
-
-    def test_c2_only_calibration_is_stable_and_covering(self):
-        """Single-knob (C2) calibration: largest C2 with zero input-condition
-        violations AND coverage. Admissible (small) inputs -> feasible, stable."""
-        m = _make_coverage_model(y_max=1.0)
-        base = m.C2.detach().cpu().numpy().copy()
-        inputs = 0.02 * torch.ones(3, 40, 1, dtype=torch.float64)  # small -> admissible
-        res = m._calibrate_nonlinearity(inputs, 1.0, knobs=["C2"], eps=0.1, max_iter=12)
-        assert res is not None
-        assert {"factors", "feasible", "cert", "rho", "cov_ok", "n_input_violations"} <= set(res)
-        assert res["knobs"] == ["C2"]
-        # leaves C2 at the winning factor, with the certificate applied + feasible
-        assert np.allclose(m.C2.detach().cpu().numpy(), base * res["factors"]["C2"])
-        assert res["feasible"] and res["n_input_violations"] == 0 and res["cov_ok"]
-        assert m.check_constraints()
-        x0 = torch.zeros(inputs.shape[0], m.nx, dtype=torch.float64)
-        assert m._count_input_violations(inputs, x0, 0) == 0
-
-    def test_multiknob_calibration_no_looser_than_c2_only(self):
-        """Adding B2/D21 as knobs can only find a rho <= the C2-only optimum (same
-        objective, larger feasible set), and leaves all three knobs scaled + feasible."""
-        inp = 0.02 * torch.ones(3, 40, 1, dtype=torch.float64)
-        c2only = _make_coverage_model(y_max=1.0)._calibrate_nonlinearity(
-            inp, 1.0, knobs=["C2"], eps=0.1, max_iter=12
-        )
-        m = _make_coverage_model(y_max=1.0)
-        b2, d21 = m.B2.detach().numpy().copy(), m.D21.detach().numpy().copy()
-        multi = m._calibrate_nonlinearity(inp, 1.0, knobs=["C2", "B2", "D21"], eps=0.1, max_iter=12)
-        assert multi is not None and multi["feasible"] and multi["n_input_violations"] == 0
-        assert set(multi["factors"]) == {"C2", "B2", "D21"}
-        # B2/D21 left at their winning factors; model feasible.
-        assert np.allclose(m.B2.detach().numpy(), b2 * multi["factors"]["B2"])
-        assert np.allclose(m.D21.detach().numpy(), d21 * multi["factors"]["D21"])
-        assert m.check_constraints()
-        # more knobs -> at least as tight (rho no larger, within solver tolerance)
-        assert multi["rho"] <= c2only["rho"] * (1.0 + 1e-3)
-
 
 @requires_mosek
 class TestFeasibilityProblem:
-    """Feasibility: repair P, M, L at a FIXED s; s is never modified."""
+    """Repair after a step that broke the LMIs: theta and alpha are held, the
+    certificate is re-solved. Fixed ``s`` first (smallest repair, and it leaves the
+    scale where the gradient/barrier put it); ``s`` freed only if that is
+    infeasible; ``False`` — meaning the trainer rolls back — only if neither works.
+    """
 
     def test_repairs_at_fixed_s_without_changing_s(self):
         """Corrupt P so the certificate breaks, then repair at the current s.
@@ -351,53 +186,43 @@ class TestFeasibilityProblem:
         assert m.check_constraints()
         assert float(m.s) == pytest.approx(s_target, rel=1e-9)  # s untouched
 
-    def test_returns_false_when_s_above_s_max(self):
-        """No feasible P, M, L exists above the regionality ceiling -> False
-        (the trainer then rolls the update back). s is not clamped."""
+    def test_theta_and_alpha_are_never_touched_by_a_repair(self):
+        """The repair owns the certificate only; the prediction dynamics are the
+        optimizer's. If it moved theta it would silently undo a gradient step."""
+        m = _make_moderate_model()
+        before = {n: p.detach().clone()
+                  for n, p in m.named_parameters()
+                  if n in ("A", "B", "B2", "C", "C2", "D", "D12", "D21", "tau")}
+        with torch.no_grad():
+            m.P.data = torch.diag(torch.tensor([1.0, -1.0], dtype=m.P.dtype))
+        assert m.feasibility_problem() is True
+        for name, value in before.items():
+            assert torch.equal(getattr(m, name).detach(), value), name
+
+    def test_frees_s_when_the_fixed_s_repair_is_infeasible(self):
+        """Above the regionality ceiling no certificate exists at that s, but one
+        does at a smaller s — so the repair succeeds and pulls s down instead of
+        forcing the trainer to throw the whole step away."""
         m = _make_moderate_model()
         s_max = _synth(m).max_s().s
         with torch.no_grad():
             m.s.data = torch.tensor(10.0 * s_max, dtype=m.s.dtype)
-        assert m.feasibility_problem() is False
+        assert _synth(m).feasibility(10.0 * s_max) is None    # fixed-s tier fails
+
+        assert m.feasibility_problem() is True
+        assert m.check_constraints()
+        assert float(m.s) < 10.0 * s_max                      # the scale was pulled back
 
     def test_returns_false_on_genuine_infeasibility(self):
-        """Uncertifiable dynamics (unstable A) -> False at any s."""
+        """Uncertifiable dynamics (unstable A): no certificate exists at ANY s, so
+        neither tier can help and the trainer must roll back."""
         m = _make_moderate_model()
         with torch.no_grad():
             m.A.data = torch.tensor([[1.5, 0.0], [0.0, 1.5]], dtype=m.A.dtype)  # unstable
+        assert _synth(m).feasibility(None) is None
         assert m.feasibility_problem() is False
 
 
-class _MockNormalizer:
-    """Minimal normalizer stand-in for ``initialize_parameters``/``_init_identity``."""
-
-    def __init__(self, input_std=1.0, output_std=1.0):
-        self.input_std = np.array([[input_std]])
-        self.output_std = np.array([[output_std]])
-
-    def transform_inputs(self, u):
-        return u  # identity: the mock data is already "normalized"
-
-
-class TestInitializationInfeasible:
-    """During initialization a failing certificate SDP means no feasible parameter
-    set exists, so it must raise (not crash on a None solution)."""
-
-    def test_initialize_parameters_raises_when_max_s_fails(self, monkeypatch):
-        m = _make_model()
-        # Simulate an infeasible/failed certificate SDP at its root (MaxS): the
-        # the calibration, MaxS operative and the ceiling all bottom out here.
-        monkeypatch.setattr(LureCertificateSynthesizer, "max_s", lambda self: None)
-
-        u = np.zeros((2, 4, 1))
-        y = np.zeros((2, 4, 1))
-        with pytest.raises(RuntimeError, match="no feasible parameter set"):
-            m.initialize_parameters(
-                train_inputs=u,
-                train_states=None,
-                train_outputs=y,
-                normalizer=_MockNormalizer(),
-            )
 
 
 if __name__ == "__main__":

@@ -18,7 +18,11 @@ import numpy as np
 import torch
 
 from ..models import SimpleLureSafe
-from ..utils import plot_ellipse_and_parallelogram, plot_safe_set_trajectories
+from ..utils import (
+    as_model_tensor,
+    plot_ellipse_and_parallelogram,
+    plot_safe_set_trajectories,
+)
 from .true_dynamics import get_true_dynamics
 
 logger = logging.getLogger(__name__)
@@ -84,8 +88,9 @@ def _fidelity_check(
         [_make_lp_noise(rng, horizon, amp_max=amp, Ts=Ts) for _ in range(n_traj)]
     )
 
-    u_t = torch.tensor(u_n[..., None], dtype=torch.float64)
-    x0_t = torch.tensor(x0, dtype=torch.float64)
+    # Model device/dtype, not the CPU/float64 defaults — see utils.as_model_tensor.
+    u_t = as_model_tensor(model, u_n[..., None])
+    x0_t = as_model_tensor(model, x0)
     with torch.no_grad():
         _, (xs_model_t, _), _ = simulate_model(model, u_t, x0_t, warmup_steps=0)
     xs_model = xs_model_t.cpu().detach().numpy()
@@ -286,10 +291,10 @@ def regional_verification(
 
     def _run(model, u_n, x0):
         """Simulate model on (u_n, x0) and return (xs, c, diverged_flag) per traj."""
-        u_t = torch.tensor(u_n, dtype=torch.float64)
+        u_t = as_model_tensor(model, u_n)
         if u_t.dim() == 2:
             u_t = u_t.unsqueeze(-1)  # (B, T, 1)
-        x0_t = torch.tensor(x0, dtype=torch.float64)
+        x0_t = as_model_tensor(model, x0)
         with torch.no_grad():
             _, (xs, _), u_used = simulate_model(model, u_t, x0_t, warmup_steps=0)
             _, c = model.get_regularization_input(u_used, xs, return_c=True)

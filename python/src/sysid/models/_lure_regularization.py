@@ -6,7 +6,7 @@ model/dynamics. Every method uses ``self`` and relies on SimpleLure's attributes
 (``get_lmis``, ``get_scalar_inequalities``) — provided at runtime via the MRO.
 """
 
-from typing import Dict, Literal, Optional, Tuple, Union, overload
+from typing import Dict, Literal, Tuple, Union, overload
 
 import torch
 
@@ -23,15 +23,20 @@ class LureRegularizationMixin:
         parameters (all eigenvalues > 0); the barrier grows to ``+∞`` as any
         constraint approaches its boundary.
 
+        Together with the prediction loss this is the *whole* training objective:
+        θ and the certificate (P, L, Λ, s, τ) all move by gradient, the barrier
+        keeps them inside the LMIs, and a step that escapes anyway is caught by
+        the feasibility repair / rollback in the trainer.
+
         Returns:
             Regularization loss (sum of negative log-determinants).
         """
         feasibility_loss = torch.tensor(0.0, device=self.P.device)
         for f_i in self.get_lmis():
-            # feasibility_loss += torch.relu(-torch.logdet(f_i()))
+            # feasibility_loss += torch.relu(-torch.logdet(F))
             feasibility_loss += -torch.logdet(f_i())
         for s_i in self.get_scalar_inequalities():
-            # feasibility_loss += torch.relu(-torch.log(s_i()).squeeze())
+            # feasibility_loss += torch.relu(-torch.log(val).squeeze())
             feasibility_loss += -torch.log(s_i()).squeeze()
 
         return feasibility_loss
@@ -169,73 +174,6 @@ class LureRegularizationMixin:
         )
         if output_std is not None:
             self.output_std = torch.tensor(float(output_std), device=device, dtype=dtype)
-
-    def get_regularization_output(self, return_margin: bool = False):
-        """Output-coverage penalty — bind Corollary 1 (see the wiki
-        ``binding-output-certificate``).
-
-        Enforces the coverage-on-image floor ``(σ·s)² C P Cᵀ ⪰ y_max² I`` in
-        PHYSICAL output units (``σ = output_std``): the model's *own* certified
-        output set must reach the physical safe level ``y_max``. The penalty is
-        ``relu(λ_max(y_max² I − (σ·s)² C P Cᵀ))`` — zero once the physical image
-        covers the data envelope in every direction, else the largest remaining
-        per-direction deficit (for ``ne = 1`` just
-        ``relu(y_max² − (σ·s)²·CPCᵀ)``).
-
-        No-op (returns 0) when ``y_max`` is unset. This is the differentiable
-        training surrogate for the exact binding SDP in
-        :meth:`solve_output_coverage_certificate`.
-        """
-        zero = torch.zeros((), device=self.P.device, dtype=self.P.dtype)
-        if self.y_max is None or bool(torch.isnan(self.y_max)):
-            return (zero, zero) if return_margin else zero
-
-        CPCt = self.C @ self.P @ self.C.T  # (ne, ne), symmetric
-        deficit = self.y_max**2 * torch.eye(
-            self.ne, device=self.P.device, dtype=self.P.dtype
-        ) - (self.output_std * self.s)**2 * CPCt
-        # Coverage <=> deficit ⪯ 0 <=> lambda_max(deficit) <= 0.
-        lam_max = torch.linalg.eigvalsh(deficit)[-1]
-        reg_loss = torch.relu(lam_max)
-
-        if return_margin:
-            return reg_loss, lam_max
-        return reg_loss
-
-    def get_regularization_tightness(self, return_margin: bool = False):
-        """Output-*tightness* penalty — pull the certified output image DOWN onto
-        ``y_max`` (the complement of :meth:`get_regularization_output`).
-
-        Coverage (that method) is the one-sided *floor* ``(σs)²CPCᵀ ⪰ y_max²I``;
-        tightness is the one-sided *ceiling*: it penalizes OVER-coverage
-        ``relu(λ_max((σs)²CPCᵀ − y_max²I))`` so the certified half-width
-        ``ȳ = σ·s·√(CPCᵀ)`` sits *just* at ``y_max`` instead of far above it. The
-        two one-sided terms sandwich ``ȳ`` at ``y_max``; because this one is zero
-        the moment ``ȳ ≤ y_max`` it can never *under*-cover on its own.
-
-        ``C P Cᵀ`` is **detached**, so the gradient flows only to the certificate
-        scale ``s`` — the free, gradient-owned knob. That keeps tightness from
-        distorting the learned output map ``C`` (which is on the prediction path)
-        or fighting the fixed-``s`` SDP repair on ``P``: the operative lever is
-        simply "shrink ``s`` toward the coverage floor", which needs no per-epoch
-        bisection and does not depend on ``C2`` (learned during training).
-
-        No-op (returns 0) when ``y_max`` is unset.
-        """
-        zero = torch.zeros((), device=self.P.device, dtype=self.P.dtype)
-        if self.y_max is None or bool(torch.isnan(self.y_max)):
-            return (zero, zero) if return_margin else zero
-
-        # Detach C P Cᵀ so only s carries gradient (largest output gain for ne>1).
-        CPCt = (self.C @ self.P @ self.C.T).detach()  # (ne, ne), symmetric
-        lam_max_CPCt = torch.linalg.eigvalsh(CPCt)[-1]
-        # excess > 0 <=> the certified image over-shoots y_max in some direction.
-        excess = (self.output_std * self.s) ** 2 * lam_max_CPCt - self.y_max ** 2
-        reg_loss = torch.relu(excess)
-
-        if return_margin:
-            return reg_loss, excess
-        return reg_loss
 
     def get_regularization_activity(
         self,

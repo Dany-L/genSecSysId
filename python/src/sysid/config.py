@@ -2,9 +2,9 @@
 
 import json
 import logging
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import yaml
 
@@ -78,37 +78,80 @@ class DataConfig:
 class InitializationConfig:
     """Configuration for model parameter initialization."""
 
-    method: str = "identity"  # only "identity" is supported (esn/n4sid removed)
+    method: str = "identity"  # "identity" or "warm_start"
     # Identity initialization uses α=0.99, A=0.9I, C2=Rand(-1,1), C=[I,0], B2=D=D12=0
 
-    # Initialize s (and P, L) with the output+input condition sweep (MinTrProb)
-    # instead of plain max-s: pick an s that meets the output-coverage floor AND
-    # leaves zero input violations; else the s with the fewest violations;
-    # falling back to max-s only when the output level is not yet reachable.
-    # Set False for the legacy max-s initialization.
-    init_s_from_conditions: bool = True
-    # Number of s grid points for the initialization sweep (kept small; init runs once).
-    init_s_grid_size: int = 15
-    # Upper end of the s sweep band (simple preset; see solve_output_coverage_certificate).
-    init_s_max: float = 20.0
+    # Bootstrap D21 through the analysis SDP when the identity init lands
+    # infeasible (check_constraints() False). D21 is the input->nonlinearity map,
+    # and _init_identity draws it from N(0, std^2) with no reference to the data.
+    # Under scale_only normalization the Duffing inputs reach |d_n| ~ 9.7, so a
+    # random D21 pushes z = C2 x + D21 d far outside the dead band: the untrained
+    # nonlinearity fires on ~22% of (step, unit) pairs and injects enough energy
+    # that the initial rollout overshoots the targets several-fold. It also
+    # collapses the MaxS ceiling (s = 0.42 here), so the input floor is then not
+    # certifiable and the certified image no longer covers y_max.
+    #
+    # analysis_problem_init(learn_B=False, learn_D21=True) solves D21 jointly with
+    # (P, la, L, s) instead, which shrinks it ~9x and lifts s to the MaxS scale the
+    # data needs. This ran unconditionally before b97fe65 and is what the good
+    # duffing-soft-7 runs used; dropping it cost ~10x on the initial val loss.
+    #
+    # learn_B stays False on purpose: with B free too the SDP drives both B and
+    # D21 to zero — a trivially certifiable but dead model (e_hat == 0).
+    bootstrap_d21_on_infeasible: bool = True
 
-    # Calibrate the C2 std at init so BOTH conditions hold under the operative
-    # MaxS certificate: (input) the training rollout has zero input-condition
-    # violations (||u_k||^2 <= s^2 - alpha^2 x_k^T P^-1 x_k) -> the trajectory
-    # stays in the invariant set so predictions do not diverge; and (output) the
-    # certified image covers y_max. Searches a scalar factor on the initialized C2
-    # (bisection, relative tol calibrate_c2_eps): both hold for small C2 (large s)
-    # and fail as C2 grows, so it keeps the LARGEST C2 (tightest region) that is
-    # still stable and covering. Disable to keep the config C2 std unchanged.
-    calibrate_c2_for_coverage: bool = True
-    calibrate_c2_eps: float = 0.05
-    calibrate_c2_max_iter: int = 30
-    # Which nonlinearity-shaping maps the calibration may scale. C2 (state->NL) is
-    # the primary tightness knob (bisected); D21 (input->NL) and B2 (NL->state) are
-    # grid-searched — smaller D21 relaxes the input condition and lets C2 grow, so
-    # jointly they reach a much tighter input-admissible certificate. ["C2"] falls
-    # back to the single-knob C2 calibration.
-    calibrate_knobs: List[str] = field(default_factory=lambda: ["C2", "B2", "D21"])
+    # ---------------------------------------------------------------- warm start
+    # method: "warm_start" — SANITY CHECK. Load a known-good theta from a saved
+    # Lure model and perturb it, instead of drawing a fresh one. On data generated
+    # by that same model, training then starts near the optimum and must converge
+    # back to it within a few epochs. If it does not, the fault is in the training
+    # loop (objective, repair/rollback, loaders) rather than in the initialization
+    # or the model class — which is the whole point of running it.
+    #
+    # The file is an .npz with keys A, B, B2, C, C2, D, D12, D21 (the format
+    # notebooks/duffing writes). nx / nz / nu / ny are cross-checked against the
+    # model when present.
+    warm_start_path: Optional[str] = None
+
+    # Units the stored theta is in.
+    #   "physical"   — as identified on raw data; the run's own normalizer is
+    #                  applied (B *= input_std, D21 *= input_std, C /= output_std,
+    #                  D12 /= output_std, D *= input_std/output_std; A, B2, C2 are
+    #                  invariant). This is the portable choice: the same file stays
+    #                  correct for any dataset, because the scaling comes from the
+    #                  loader.
+    #   "normalized" — already in the model's units; loaded verbatim. Only correct
+    #                  if the file was scaled with THIS dataset's normalizer, so a
+    #                  "*_scaled.npz" from another split will silently start off by
+    #                  the ratio of the two stds.
+    warm_start_units: str = "physical"
+
+    # Perturbation size, relative to each matrix's own RMS:
+    #   theta <- theta + noise * rms(theta) * N(0, 1),  elementwise.
+    # Scaling by the per-matrix RMS keeps the offset meaningful across parameters
+    # whose entries differ by orders of magnitude (B ~ 1e-2 vs C2 ~ 1e1). An
+    # all-zero matrix has rms 0 and is therefore left at zero — for the reference
+    # Duffing model that is D, D12 and D21, which are all exactly zero and are
+    # usually structurally fixed anyway.
+    #
+    # Keep this SMALL. The offset is amplified over the rollout, so on the Duffing
+    # reference model (lightly damped, rho(A) = 0.9937, 700-step training windows)
+    # the converging prediction loss climbs steeply with it:
+    #
+    #     noise    ||dtheta||/||theta||    pred_loss
+    #     0                    0            0.0016     <- the true theta
+    #     0.001                0.0012       0.0065
+    #     0.002                0.0024       0.023
+    #     0.005                0.0059       diverges on some draws
+    #
+    # Above ~0.002 the perturbed rollout can leave the certified region and blow
+    # up numerically, which defeats the point — the check needs to START near the
+    # optimum. 0.001 keeps the loss within ~4x of the true theta's.
+    warm_start_noise: float = 0.001
+
+    # Seed for the perturbation only, so a sanity run is reproducible independently
+    # of the global seed. None -> use the ambient torch RNG.
+    warm_start_seed: Optional[int] = None
 
 
 @dataclass
@@ -210,20 +253,16 @@ class TrainingConfig:
     # Input constraint regularization weight
     input_regularization_weight: float = 0.01  # Weight for input constraint loss
 
-    # Output-coverage regularization weight. Penalizes s^2 C P C^T below the
-    # (normalized) safe level (bind Corollary 1): pushes the certified output
-    # image to reach the physical data level y_max. 0.0 disables it (default).
-    output_regularization_weight: float = 0.0
-
-    # Output-TIGHTNESS regularization weight. The complement of the coverage term:
-    # penalizes relu(lambda_max((output_std*s)^2 C P C^T - y_max^2 I)) (C P C^T
-    # detached, so only the scale s carries gradient), pulling the certified
-    # output half-width y_bar = output_std*s*sqrt(CPC^T) DOWN onto y_max so the
-    # certificate stays tight (y_bar ~ y_max) instead of over-conservative. Use
-    # alongside output_regularization_weight to sandwich y_bar at y_max. Like the
-    # activity/H terms it is NOT decayed (tightness must hold all through
-    # training). 0.0 disables it (default).
-    tightness_regularization_weight: float = 0.0
+    # After each epoch, if the training data breaches the input condition
+    # (any c_k = ||u_k||^2 - s^2 + alpha^2 V(x_k) > 0), re-solve MaxS once so the
+    # certified set grows back over the data. Without it ``s`` only ever moves
+    # where the barrier pushes it — down — and once it falls below the input
+    # floor sqrt(u_max) every optimizer step lands infeasible, so the per-batch
+    # repair SDP fires on every batch and mostly fails into a rollback.
+    # The duffing-soft-7 runs had this on: run 936f56b9 (task 20) re-solved on
+    # 820 of 1500 epochs, s wandered 6.4..36.6 and settled at ~9.9 (the input
+    # floor is 9.7), with 0 rollbacks over the whole run.
+    solve_max_s_on_violation: bool = False
 
     # Dead-zone activity regularization. Penalizes relu(activity_target - mean||w||)
     # on the rollout so the dead-zone nonlinearity fires, preventing the degenerate
@@ -441,12 +480,6 @@ class Config:
             yaml.safe_dump(
                 _to_safe_yaml(self.to_dict()), f, default_flow_style=False, sort_keys=False
             )
-
-    def save_json(self, path: str):
-        """Save configuration to JSON file."""
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
 
 
 def _to_safe_yaml(obj):

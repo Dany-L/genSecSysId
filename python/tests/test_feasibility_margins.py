@@ -12,14 +12,14 @@ import torch
 
 from sysid.models.constrained_rnn import SimpleLure
 
-# The ``s > 0`` scalar inequality is currently commented out in
-# ``SimpleLure.get_scalar_inequalities`` (see constrained_rnn.py): its ``-log s``
-# barrier drove s -> 0 on its own (nothing in the prediction loss pulls back).
-# The agreed replacement is a hard coverage-floor LMI whose barrier counter-
-# pushes s up, but that is not implemented yet. Until then no scalar inequality
-# is registered, so ``get_feasibility_margins`` emits no ``scalar_0`` key and the
-# tests that assert on it fail. These are expected-fail markers, not bugs —
-# revisit (and rewrite against the coverage-floor LMI margin) once it lands.
+# ``SimpleLure.get_scalar_inequalities`` registers nothing (see its docstring in
+# constrained_rnn.py): the ``s > 0`` candidate's ``-log s`` barrier drove s -> 0 on
+# its own (nothing in the prediction loss pulls back). The agreed replacement is a
+# hard coverage-floor LMI whose barrier counter-pushes s up, but that is not
+# implemented yet. Until then no scalar inequality is registered, so
+# ``get_feasibility_margins`` emits no ``scalar_0`` key and the tests that assert on
+# it fail. These are expected-fail markers, not bugs — revisit (and rewrite against
+# the coverage-floor LMI margin) once it lands.
 _SCALAR_INEQ_DISABLED = (
     "s>0 scalar inequality disabled pending hard coverage-floor LMI; "
     "no scalar_0 margin is produced (see get_scalar_inequalities)"

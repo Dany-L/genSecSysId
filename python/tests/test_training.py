@@ -2,7 +2,6 @@
 
 import pytest
 import torch
-import numpy as np
 
 from sysid.training import get_loss_function, get_optimizer, get_scheduler
 from sysid.training.trainer import Trainer

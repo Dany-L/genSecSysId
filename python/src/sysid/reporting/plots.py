@@ -8,7 +8,7 @@ inputs as arguments instead of globals.
 """
 
 import os
-from typing import Callable, Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 

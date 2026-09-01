@@ -109,7 +109,10 @@ class TestConfigurableStd:
 # ---------------------------------------------------------------------------
 
 class TestAScale:
-    """A's last row of A_ct is -A_scale * U(0,1) -> A_dt[1,:] = -A_scale*ts*U(0,1)."""
+    """A's last row of A_ct is -A_scale * U(0,1).
+
+    A_dt = I + A_ct*ts (forward Euler), so A_ct = (A - I)/ts inverts it exactly.
+    """
 
     @pytest.mark.parametrize("scale", [0.5, 1.0, 4.0])
     def test_a_random_row_mean_matches_scale(self, scale):

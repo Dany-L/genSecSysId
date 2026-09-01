@@ -28,13 +28,29 @@ def test_stale_initialization_key_loads_with_warning(caplog):
 
 
 def test_stale_training_key_loads_with_warning(caplog):
-    cfg_dict = _min_dict(training={"solve_max_s_on_violation": True, "max_epochs": 3})
+    # NOTE: this used to use ``solve_max_s_on_violation`` as the stale example.
+    # That key is a real TrainingConfig field again (the after-epoch MaxS repair
+    # was restored), so it would no longer be dropped — hence a key that is
+    # genuinely gone.
+    cfg_dict = _min_dict(training={"use_dual_certificate": True, "max_epochs": 3})
     with caplog.at_level(logging.WARNING):
         cfg = Config.from_dict(cfg_dict)
 
     assert cfg.training.max_epochs == 3
-    assert not hasattr(cfg.training, "solve_max_s_on_violation")
-    assert "solve_max_s_on_violation" in caplog.text
+    assert not hasattr(cfg.training, "use_dual_certificate")
+    assert "use_dual_certificate" in caplog.text
+
+
+def test_solve_max_s_on_violation_is_not_dropped(caplog):
+    """Regression: the key was silently ignored while the feature was missing,
+    so configs asking for the after-epoch MaxS repair got no repair and no
+    warning. It must round-trip now."""
+    cfg_dict = _min_dict(training={"solve_max_s_on_violation": True})
+    with caplog.at_level(logging.WARNING):
+        cfg = Config.from_dict(cfg_dict)
+
+    assert cfg.training.solve_max_s_on_violation is True
+    assert "solve_max_s_on_violation" not in caplog.text
 
 
 def test_clean_config_produces_no_unknown_field_warning(caplog):

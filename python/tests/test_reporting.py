@@ -42,7 +42,8 @@ def test_format_cell_other_styles_and_std_decimals():
 
 
 def test_build_table_per_column_emphasis():
-    means = {r"\MLtiRnn{}": 0.3, r"\MGenSec{}": 0.1, r"\MStdSec{}": 0.2}
+    means = {r"\MLtiRnn{}": 0.3, r"\MGenSec{}": 0.1, r"\MStdSec{}": 0.2,
+             r"\MGenSec{}_s": 0.4, r"\MStdSec{}_s": 0.5}
     cells = {m: {c: (means[m], 0.01, 3) for c in tables.COLUMNS} for m in tables.MODEL_ORDER}
     tex = tables.build_table(cells)
     lines = {m: next(l for l in tex.splitlines() if l.startswith(m)) for m in tables.MODEL_ORDER}
@@ -57,7 +58,8 @@ def test_build_table_per_column_emphasis():
 
 
 def test_build_table_train_six_columns():
-    means = {r"\MLtiRnn{}": 0.3, r"\MGenSec{}": 0.1, r"\MStdSec{}": 0.2}
+    means = {r"\MLtiRnn{}": 0.3, r"\MGenSec{}": 0.1, r"\MStdSec{}": 0.2,
+             r"\MGenSec{}_s": 0.4, r"\MStdSec{}_s": 0.5}
     cells = {
         m: {("yes", d, t): (means[m], 0.01, 3) for d in tables.DISTS for t in tables.TRAJS}
         for m in tables.MODEL_ORDER
@@ -96,12 +98,72 @@ def test_get_best_individual_and_mean_group():
         "metrics.m": [0.5, 0.7, 0.2, 0.4],
     })
     assert runs.get_best_individual(df, "metrics.m") == ("r3", 0.2)
-    run_id, best, vals, ids, mean, std = runs.get_best_mean_group(df, "metrics.m")
+    run_id, best, vals, ids, mean, std, group_key = runs.get_best_mean_group(
+        df, "metrics.m"
+    )
     # group B has lower mean (0.3) than A (0.6).
     assert sorted(ids) == ["r3", "r4"]
     assert run_id == "r3" and best == 0.2
+    assert group_key == "B"
     assert abs(mean - 0.3) < 1e-9
     assert abs(std - np.std([0.2, 0.4], ddof=1)) < 1e-9
+
+
+def test_get_best_mean_group_aggregate_all():
+    # Same runs, but treat the whole set as one class (leftover tags = nuisance).
+    df = pd.DataFrame({
+        "run_id": ["r1", "r2", "r3", "r4"],
+        "tags.mlflow.parentRunId": ["A", "A", "B", "B"],
+        "metrics.m": [0.5, 0.7, 0.2, 0.4],
+    })
+    run_id, best, vals, ids, mean, std, group_key = runs.get_best_mean_group(
+        df, "metrics.m", aggregate="all"
+    )
+    # No sub-grouping: every run is aggregated, mean/std span all four.
+    assert sorted(ids) == ["r1", "r2", "r3", "r4"]
+    assert group_key == "all"
+    assert run_id == "r3" and best == 0.2                 # best single run overall
+    assert abs(mean - np.mean([0.5, 0.7, 0.2, 0.4])) < 1e-9
+    assert abs(std - np.std([0.5, 0.7, 0.2, 0.4], ddof=1)) < 1e-9
+
+
+def test_get_best_mean_group_rejects_bad_aggregate():
+    df = pd.DataFrame({"run_id": ["r1"], "metrics.m": [0.1]})
+    try:
+        runs.get_best_mean_group(df, "metrics.m", aggregate="everything")
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "aggregate" in str(e)
+
+
+def test_collect_best_runs_aggregate_all_uses_whole_class():
+    # Two parent groups; aggregate='all' must report all four runs, not the best 2.
+    df = pd.DataFrame({
+        "run_id": ["r1", "r2", "r3", "r4"],
+        "tags.mlflow.parentRunId": ["A", "A", "B", "B"],
+        "metrics.eval_nrmse": [0.5, 0.7, 0.2, 0.4],
+    })
+    search = lambda experiment_names, filter_string: df.copy()
+    out = runs.collect_best_runs(
+        "exp",
+        stab_type_dict={"cls": {}},
+        use_div_traj={"all": {}},
+        eval_metric="eval_nrmse",
+        search_fn=search, verbose=False, aggregate="all",
+    )
+    entry = out["stab=cls_div=all"]
+    assert entry["group_key"] == "all"
+    assert sorted(entry["all_run_ids"]) == ["r1", "r2", "r3", "r4"]
+    assert abs(entry["mean"] - np.mean([0.5, 0.7, 0.2, 0.4])) < 1e-9
+    # Default best-group mode on the same data collapses to the lower-mean pair.
+    out_bg = runs.collect_best_runs(
+        "exp",
+        stab_type_dict={"cls": {}},
+        use_div_traj={"all": {}},
+        eval_metric="eval_nrmse",
+        search_fn=search, verbose=False,
+    )
+    assert sorted(out_bg["stab=cls_div=all"]["all_run_ids"]) == ["r3", "r4"]
 
 
 def test_fetch_runs_filters_absent_tags_and_missing_metric():
@@ -151,6 +213,42 @@ def test_select_best_group_by_params_fallback():
     grp = runs.select_best_group(df, "metrics.rank")
     # group lr=0.9 has the single lowest value (0.05) and lowest mean.
     assert list(grp["run_id"]) == ["r3"]
+
+
+def test_select_best_group_aggregate_all_returns_every_run():
+    df = pd.DataFrame({
+        "run_id": ["r1", "r2", "r3"],
+        "params.lr": ["0.1", "0.1", "0.9"],
+        "metrics.rank": [0.30, 0.10, 0.05],
+    })
+    grp = runs.select_best_group(df, "metrics.rank", aggregate="all")
+    assert list(grp["run_id"]) == ["r1", "r2", "r3"]      # no sub-grouping
+
+
+def test_collect_nrmse_cells_aggregate_all_uses_whole_class():
+    # Two HP groups (by lr); 'all' must average over all four runs, not the best.
+    cols = {f"metrics.{tables.metric_key(d, t)}": [0.1, 0.2, 0.3, 0.4]
+            for d in tables.DISTS for t in tables.TRAJS}
+    df = pd.DataFrame({
+        "run_id": ["r1", "r2", "r3", "r4"],
+        "params.lr": ["0.1", "0.1", "0.9", "0.9"],
+        **cols,
+    })
+    search = lambda experiment_names, filter_string: df.copy()
+    common = dict(
+        stab_type_dict={"regional": {"training.use_custom_regularization": True,
+                                     "model.custom_params.learn_L": True}},
+        use_div_traj={"no": {"data.use_diverging_trajectories": False}},
+        stab_to_model={"regional": r"\MGenSec{}"},
+        search_fn=search, verbose=False,
+    )
+    cells_all = tables.collect_nrmse_cells("exp", aggregate="all", **common)
+    cell = cells_all[r"\MGenSec{}"][("no", "id", "conv")]
+    assert cell[2] == 4                                    # n = all runs
+    assert abs(cell[0] - 0.25) < 1e-9                      # mean over all four
+    # Default best-group mode collapses to the lower-mean pair (lr=0.1).
+    cells_bg = tables.collect_nrmse_cells("exp", **common)
+    assert cells_bg[r"\MGenSec{}"][("no", "id", "conv")][2] == 2
 
 
 def test_collect_nrmse_cells_aggregates_group():

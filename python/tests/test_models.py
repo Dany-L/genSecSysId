@@ -2,7 +2,6 @@
 
 import pytest
 import torch
-import numpy as np
 
 from sysid.models import SimpleRNN, LSTM, GRU
 from sysid.models.regularization import (

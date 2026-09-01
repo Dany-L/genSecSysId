@@ -29,7 +29,6 @@ from sysid.data.direct_loader import load_csv_folder
 from sysid.evaluation import (
     check_input_condition,
     list_true_dynamics,
-    plot_post_process_trajectories,
     regional_verification,
     simulate_model,
 )
@@ -427,7 +426,7 @@ def main():
             plt.close(fig)
             logger.info(f"Prediction plot saved to {pred_plot_path}")
         except Exception as e:
-            logger.warning(f"Failed to generate prediction plot for trajectory")
+            logger.warning(f"Failed to generate prediction plot for trajectory: {e}")
 
         # ------------------------------------------------------------------
         # Regional verification

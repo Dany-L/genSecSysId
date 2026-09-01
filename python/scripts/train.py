@@ -5,11 +5,9 @@ import json
 import logging
 import os
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import torch
@@ -471,13 +469,24 @@ def main():
                 "max_epochs": config.training.max_epochs,
                 "warmup_steps": config.training.warmup_steps,
                 "input_regularization_weight": config.training.input_regularization_weight,
-                "output_regularization_weight": getattr(config.training, "output_regularization_weight", 0.0),
-                "tightness_regularization_weight": getattr(config.training, "tightness_regularization_weight", 0.0),
+                "solve_max_s_on_violation": getattr(
+                    config.training, "solve_max_s_on_violation", False
+                ),
                 "activity_regularization_weight": getattr(config.training, "activity_regularization_weight", 0.0),
                 "activity_target": getattr(config.training, "activity_target", 0.0),
                 "h_regularization_weight": getattr(config.training, "h_regularization_weight", 0.0),
                 "h_target": getattr(config.training, "h_target", 0.0),
                 "custom_parameters": str(getattr(config.model, "custom_params", None)),
+                # Certificate ownership / re-synthesis — logged so ownership runs
+                # are distinguishable from baseline runs in mlflow.
+                "use_diverging_trajectories": getattr(
+                    config.data, "use_diverging_trajectories", False
+                ),
+                "gradient_clip_value": config.training.gradient_clip_value,
+                "regularization_weight": (
+                    config.training.regularization_weight
+                    if config.training.use_custom_regularization else 0.0
+                ),
             }
         )
 
@@ -557,15 +566,8 @@ def main():
             log_gradients=getattr(config.training, "log_gradients", True),
             warmup_steps=config.training.warmup_steps,
             input_regularization_weight=getattr(config.training, "input_regularization_weight", 0.01),
-            output_regularization_weight=(
-                getattr(config.training, "output_regularization_weight", 0.0)
-                if config.training.use_custom_regularization
-                else 0.0
-            ),
-            tightness_regularization_weight=(
-                getattr(config.training, "tightness_regularization_weight", 0.0)
-                if config.training.use_custom_regularization
-                else 0.0
+            solve_max_s_on_violation=getattr(
+                config.training, "solve_max_s_on_violation", False
             ),
             activity_regularization_weight=(
                 getattr(config.training, "activity_regularization_weight", 0.0)

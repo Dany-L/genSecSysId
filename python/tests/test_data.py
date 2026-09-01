@@ -3,7 +3,6 @@
 import pytest
 import numpy as np
 import torch
-from pathlib import Path
 
 from sysid.data import DataLoader, DataNormalizer, TimeSeriesDataset, create_dataloaders
 
