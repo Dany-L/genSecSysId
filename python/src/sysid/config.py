@@ -78,7 +78,7 @@ class DataConfig:
 class InitializationConfig:
     """Configuration for model parameter initialization."""
 
-    method: str = "identity"  # only "identity" is supported (esn/n4sid removed)
+    method: str = "identity"  # "identity" or "warm_start"
     # Identity initialization uses α=0.99, A=0.9I, C2=Rand(-1,1), C=[I,0], B2=D=D12=0
 
     # Bootstrap D21 through the analysis SDP when the identity init lands
@@ -99,6 +99,59 @@ class InitializationConfig:
     # learn_B stays False on purpose: with B free too the SDP drives both B and
     # D21 to zero — a trivially certifiable but dead model (e_hat == 0).
     bootstrap_d21_on_infeasible: bool = True
+
+    # ---------------------------------------------------------------- warm start
+    # method: "warm_start" — SANITY CHECK. Load a known-good theta from a saved
+    # Lure model and perturb it, instead of drawing a fresh one. On data generated
+    # by that same model, training then starts near the optimum and must converge
+    # back to it within a few epochs. If it does not, the fault is in the training
+    # loop (objective, repair/rollback, loaders) rather than in the initialization
+    # or the model class — which is the whole point of running it.
+    #
+    # The file is an .npz with keys A, B, B2, C, C2, D, D12, D21 (the format
+    # notebooks/duffing writes). nx / nz / nu / ny are cross-checked against the
+    # model when present.
+    warm_start_path: Optional[str] = None
+
+    # Units the stored theta is in.
+    #   "physical"   — as identified on raw data; the run's own normalizer is
+    #                  applied (B *= input_std, D21 *= input_std, C /= output_std,
+    #                  D12 /= output_std, D *= input_std/output_std; A, B2, C2 are
+    #                  invariant). This is the portable choice: the same file stays
+    #                  correct for any dataset, because the scaling comes from the
+    #                  loader.
+    #   "normalized" — already in the model's units; loaded verbatim. Only correct
+    #                  if the file was scaled with THIS dataset's normalizer, so a
+    #                  "*_scaled.npz" from another split will silently start off by
+    #                  the ratio of the two stds.
+    warm_start_units: str = "physical"
+
+    # Perturbation size, relative to each matrix's own RMS:
+    #   theta <- theta + noise * rms(theta) * N(0, 1),  elementwise.
+    # Scaling by the per-matrix RMS keeps the offset meaningful across parameters
+    # whose entries differ by orders of magnitude (B ~ 1e-2 vs C2 ~ 1e1). An
+    # all-zero matrix has rms 0 and is therefore left at zero — for the reference
+    # Duffing model that is D, D12 and D21, which are all exactly zero and are
+    # usually structurally fixed anyway.
+    #
+    # Keep this SMALL. The offset is amplified over the rollout, so on the Duffing
+    # reference model (lightly damped, rho(A) = 0.9937, 700-step training windows)
+    # the converging prediction loss climbs steeply with it:
+    #
+    #     noise    ||dtheta||/||theta||    pred_loss
+    #     0                    0            0.0016     <- the true theta
+    #     0.001                0.0012       0.0065
+    #     0.002                0.0024       0.023
+    #     0.005                0.0059       diverges on some draws
+    #
+    # Above ~0.002 the perturbed rollout can leave the certified region and blow
+    # up numerically, which defeats the point — the check needs to START near the
+    # optimum. 0.001 keeps the loss within ~4x of the true theta's.
+    warm_start_noise: float = 0.001
+
+    # Seed for the perturbation only, so a sanity run is reproducible independently
+    # of the global seed. None -> use the ambient torch RNG.
+    warm_start_seed: Optional[int] = None
 
 
 @dataclass

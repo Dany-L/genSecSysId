@@ -7,6 +7,7 @@ SDP, each returning a typed result from :mod:`sysid.optimization.solutions`:
 
 * :meth:`max_s`          — MaxS: the max-feasible-``s`` feasibility ceiling.
 * :meth:`bootstrap`      — MaxS with ``D21`` (and optionally ``B``) free, for init.
+* :meth:`project_theta`  — nearest certifiable theta at a FIXED certificate.
 * :meth:`coverage_at_s`  — the fixed-``s`` binding-coverage SDP.
 * :meth:`coverage_sweep` — the tightest coverage over an s-grid.
 * :meth:`feasibility`    — certificate repair at fixed ``s``, or with ``s`` free.
@@ -20,7 +21,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import cvxpy as cp
 import numpy as np
@@ -93,22 +94,36 @@ class LureCertificateSynthesizer:
             P_current=to_np(model.P),
         )
 
-    def _build_F(self, P, L, M, B=None, D21=None):
+    def _build_F(self, P, L, M, A=None, B=None, B2=None, C2=None, D21=None):
         """The shared stability LMI matrix ``F`` (same for every certificate SDP).
 
-        Works with cvxpy variables or numpy arrays for ``P``, ``L``, ``M``. ``B``
-        and ``D21`` default to the fixed dynamics; :meth:`bootstrap` passes cvxpy
-        variables instead. Both enter ``F`` affinely (they are never multiplied by
-        ``P`` or ``M``), so the LMI stays convex either way.
+        Every argument may be a numpy array or a cvxpy expression; the theta
+        arguments default to this synthesizer's fixed dynamics.
+
+        ``F`` is **bilinear** in (certificate, theta) — it contains products
+        ``P·C2ᵀ``, ``P·Aᵀ`` and ``M·B2ᵀ`` — so exactly one side may vary at a time:
+
+        * :meth:`max_s` / :meth:`coverage_at_s` / :meth:`feasibility` vary the
+          certificate (P, L, M) at fixed theta;
+        * :meth:`bootstrap` additionally frees B and D21, which appear only in the
+          blocks that carry no P or M, so it stays affine;
+        * :meth:`project_theta` varies theta at a FIXED certificate, which makes
+          every block affine in (A, B, B2, C2, D21).
+
+        Passing cvxpy variables on both sides at once would make the constraint
+        non-convex; nothing here does that.
         """
+        A = self.A if A is None else A
         B = self.B if B is None else B
+        B2 = self.B2 if B2 is None else B2
+        C2 = self.C2 if C2 is None else C2
         D21 = self.D21 if D21 is None else D21
         return cp.bmat(
             [
-                [-(self.alpha ** 2) * P, np.zeros((self.nx, self.nd)), P @ self.C2.T + L.T, P @ self.A.T],
+                [-(self.alpha ** 2) * P, np.zeros((self.nx, self.nd)), P @ C2.T + L.T, P @ A.T],
                 [np.zeros((self.nd, self.nx)), -np.eye(self.nd), D21.T, B.T],
-                [self.C2 @ P + L, D21, -2 * M, M @ self.B2.T],
-                [self.A @ P, B, self.B2 @ M, -P],
+                [C2 @ P + L, D21, -2 * M, M @ B2.T],
+                [A @ P, B, B2 @ M, -P],
             ]
         )
 
@@ -275,6 +290,139 @@ class LureCertificateSynthesizer:
             B=B.value if learn_B else None,
             D21=D21.value if learn_D21 else None,
         )
+
+    # --------------------------------------------------------------- Projection
+    #: theta blocks that appear in the stability LMI, i.e. the ones a projection
+    #: can constrain. C, D and D12 are absent from F — they are output maps and the
+    #: certificate says nothing about them — so they are never projected.
+    THETA_IN_F = ("A", "B", "B2", "C2", "D21")
+
+    def max_eig_F(self, P, L, M, **theta) -> float:
+        """``max eig(F)`` for a given certificate and theta — the stability margin.
+
+        ``< 0`` means the pair satisfies the stability LMI. Keyword arguments
+        override individual theta blocks (see :meth:`_build_F`); anything omitted
+        comes from this synthesizer. Pure numpy, no solver.
+        """
+        F = self._build_F(P, L, M, **theta)
+        return float(np.max(np.real(np.linalg.eigvals(np.asarray(F.value)))))
+
+    def project_theta(
+        self,
+        target: dict,
+        P: np.ndarray,
+        L: np.ndarray,
+        M: np.ndarray,
+        free: Optional[Sequence[str]] = None,
+    ) -> Optional[dict]:
+        """Closest theta to ``target`` that the FIXED certificate ``(P, L, M)`` certifies.
+
+        Solves
+
+            min  sum_i ||X_i - target_i||_F^2 / ||target_i||_F^2    over ``free``
+            s.t. F(theta; P, L, M) << -eps I
+
+        The per-block normalization makes the objective RELATIVE, so blocks whose
+        entries differ by orders of magnitude are moved by comparable fractions
+        rather than the smallest-magnitude one absorbing the whole correction.
+
+        With the certificate held fixed every block of ``F`` is affine in
+        (A, B, B2, C2, D21) — see :meth:`_build_F` — so this is a convex QP over an
+        LMI, i.e. an SDP with a quadratic objective. It is a genuine Euclidean
+        projection onto the certified set, so a ``target`` that is already
+        certifiable comes back unchanged.
+
+        Why this and not "perturb, then re-solve the certificate": re-solving moves
+        the certificate to fit whatever theta the noise produced, and can simply
+        fail when the draw lands outside the certifiable set. Projecting instead
+        keeps the certificate — the one from the UNDISTURBED reference — and moves
+        theta the smallest distance that makes it valid. The result is feasible by
+        construction, deterministic, and still the nearest point to the draw.
+
+        Args:
+            target: ``{name: array}`` for every block in :attr:`THETA_IN_F`. Blocks
+                not in ``free`` are held at these values as constants, so a
+                structurally-fixed parameter must be passed at its fixed value.
+            P, L, M: the fixed certificate, e.g. from :meth:`max_s` at the
+                undisturbed theta. ``s`` is not needed: it enters only the locality
+                LMIs, which involve no theta and are therefore unaffected.
+            free: which blocks are optimization variables. Defaults to all of
+                :attr:`THETA_IN_F`.
+
+        Returns ``{name: array}`` for the free blocks, or ``None`` if the solver
+        fails (which here means the certificate admits no theta at all, not that
+        the draw was unlucky).
+        """
+        free = tuple(self.THETA_IN_F if free is None else free)
+        unknown = [n for n in free if n not in self.THETA_IN_F]
+        if unknown:
+            raise ValueError(
+                f"project_theta: {unknown} are not in the stability LMI; only "
+                f"{list(self.THETA_IN_F)} can be projected (C/D/D12 do not appear in F)."
+            )
+        missing = [n for n in self.THETA_IN_F if n not in target]
+        if missing:
+            raise ValueError(f"project_theta: target is missing {missing}.")
+
+        shapes = {
+            "A": (self.nx, self.nx), "B": (self.nx, self.nd),
+            "B2": (self.nx, self.nz), "C2": (self.nz, self.nx),
+            "D21": (self.nz, self.nd),
+        }
+        blocks, objective_terms = {}, []
+        for name in self.THETA_IN_F:
+            tgt = np.asarray(target[name], dtype=float)
+            if tgt.shape != shapes[name]:
+                raise ValueError(
+                    f"project_theta: target['{name}'] has shape {tgt.shape}, "
+                    f"expected {shapes[name]}."
+                )
+            if name in free:
+                X = cp.Variable(shapes[name])
+                blocks[name] = X
+                # Weight each block by its own scale so the objective is RELATIVE.
+                # Unweighted, ``sum ||X_i - target_i||_F^2`` is measured in absolute
+                # units, so the cheapest way to satisfy the LMI is to move whichever
+                # block has the smallest entries — on the Duffing reference that is
+                # B (entries ~5e-3, vs C2 ~13), which ends up displaced by ~12%
+                # while everything else moves ~0.1%. Dividing by ||target_i||_F
+                # makes the projection scale-invariant and puts it in the same
+                # relative units the perturbation itself uses.
+                scale = float(np.linalg.norm(tgt))
+                objective_terms.append(
+                    cp.sum_squares(X - tgt) / (scale ** 2) if scale > 0
+                    else cp.sum_squares(X - tgt)
+                )
+            else:
+                blocks[name] = tgt
+
+        F = self._build_F(P, L, M, **blocks)
+        nF = F.shape[0]
+        problem = cp.Problem(
+            cp.Minimize(cp.sum(objective_terms)),
+            [F << -self.eps * np.eye(nF)],
+        )
+        try:
+            problem.solve(solver=cp.MOSEK, verbose=False)
+        except Exception as e:
+            logger.error(f"theta projection SDP solver failed: {e}")
+            return None
+        if problem.status not in ("optimal", "optimal_inaccurate"):
+            logger.error(f"theta projection SDP failed with status: {problem.status}")
+            return None
+
+        out = {n: np.asarray(blocks[n].value, dtype=float) for n in free}
+        moved = float(np.sqrt(sum(
+            np.linalg.norm(out[n] - np.asarray(target[n], dtype=float)) ** 2 for n in free
+        )))
+        scale = float(np.sqrt(sum(
+            np.linalg.norm(np.asarray(target[n], dtype=float)) ** 2 for n in free
+        )))
+        logger.debug(
+            f"theta projection: moved ||dtheta|| = {moved:.4g} "
+            f"({100 * moved / max(scale, 1e-12):.4f}% of ||theta||)"
+        )
+        return out
 
     # ---------------------------------------------------------------- Coverage
     def coverage_at_s(self, s: float, y_max: float) -> Optional[CoverageSolution]:

@@ -620,7 +620,19 @@ class Trainer:
         epoch_grad_stats: dict[str, list[float]] = {}
 
         for batch_idx, batch in enumerate(self.train_loader):
-            # Unpack batch (states may be None)
+            # WASHOUT INITIALIZATION — x0 is discarded on purpose.
+            #
+            # The loader carries the recorded initial state, but at deployment
+            # there is no access to it, so the model must be trained the way it
+            # will be used: rolled out from x0 = 0 and allowed to synchronize to
+            # the input. ``warmup_steps`` then excludes the washout transient from
+            # the loss, which is why it has to be long enough for the transient to
+            # decay (for the Duffing reference rho(A) = 0.9937, so 500 steps leaves
+            # ~4% of it). Feeding the true x0 here would train against information
+            # the deployed model does not have.
+            #
+            # Diverging trajectories are recorded from x0 = 0 anyway, so the same
+            # line in _train_diverging_epoch is a no-op rather than a washout.
             if len(batch) == 3:
                 d, e, x0 = batch  # d: input, e: output, x: states (optional)
                 x0 = None

@@ -88,10 +88,8 @@ class CoverageSweepResult:
 class InitializationReport:
     """Flat, log/mlflow-friendly summary of the certificate established at init.
 
-    Aggregates the operative MaxS certificate diagnostics (``volume`` is the MaxS
-    ellipsoid volume) and (when it ran) the C2 calibration. :meth:`to_metrics`
-    yields the finite scalar metrics for mlflow under the ``initialization/``
-    namespace.
+    :meth:`to_metrics` yields the finite scalar metrics for mlflow under the
+    ``initialization/`` namespace.
     """
 
     volume: float
@@ -99,27 +97,20 @@ class InitializationReport:
     norm_H: float
     max_eig_F: float
     constraints_satisfied: bool
-    y_bar: Optional[float] = None
     y_max: Optional[float] = None
-    coverage_ok: Optional[bool] = None
-    calibrated: bool = False
-    c2_factor: Optional[float] = None
-    b2_factor: Optional[float] = None
-    d21_factor: Optional[float] = None
-    rho: Optional[float] = None
-    calibration_feasible: Optional[bool] = None
-    calibration_iterations: Optional[int] = None
-    n_input_violations: Optional[int] = None
     # Dead-zone activity on the training rollout at init. ``firing_rate`` is the
     # fraction of (step, unit) pairs outside the dead band, ``units_firing`` the
     # fraction of units that ever fire and ``max_abs_z`` the largest |z| reached.
     # firing_rate == 0 means the nonlinearity is inert on the training data: the
     # model is LTI *in that regime*, and — because Δ'(z) = 0 inside the dead band —
     # no gradient reaches B2/C2/D21 through the prediction loss, so training can
-    # never escape it. Watch this whenever the calibration runs.
+    # never escape it.
     firing_rate: Optional[float] = None
     units_firing: Optional[float] = None
     max_abs_z: Optional[float] = None
+    # Warm start only: ‖Δθ_i‖/‖θ_i‖ actually applied per parameter, so a sanity
+    # run records how far from the reference it started.
+    warm_start_offsets: Optional[dict] = None
 
     def to_metrics(self) -> dict:
         """The report as ``{metric_name: float}`` — finite scalars only (bools
@@ -131,21 +122,13 @@ class InitializationReport:
             "norm_H": self.norm_H,
             "max_eig_F": self.max_eig_F,
             "constraints_satisfied": self.constraints_satisfied,
-            "y_bar": self.y_bar,
             "y_max": self.y_max,
-            "coverage_ok": self.coverage_ok,
-            "calibrated": self.calibrated,
-            "c2_factor": self.c2_factor,
-            "b2_factor": self.b2_factor,
-            "d21_factor": self.d21_factor,
-            "rho": self.rho,
-            "calibration_feasible": self.calibration_feasible,
-            "calibration_iterations": self.calibration_iterations,
-            "n_input_violations": self.n_input_violations,
             "firing_rate": self.firing_rate,
             "units_firing": self.units_firing,
             "max_abs_z": self.max_abs_z,
         }
+        for name, value in (self.warm_start_offsets or {}).items():
+            raw[f"warm_start_offset/{name}"] = value
         metrics = {}
         for name, value in raw.items():
             if value is None:
