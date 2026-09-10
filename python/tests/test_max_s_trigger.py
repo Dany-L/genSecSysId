@@ -35,6 +35,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from sysid.config import Config, TrainingConfig
+from sysid.optimization.solutions import MaxSSolution
 from sysid.models.constrained_rnn import SimpleLure
 from sysid.training import get_loss_function, get_optimizer
 from sysid.training.trainer import Trainer
@@ -241,8 +242,9 @@ class TestTriggerBehaviour:
         calls = []
 
         class _FakeSynth:
-            def max_s(self_inner):
-                calls.append(1)
+            # **kw absorbs the input floor s_min the trainer now passes.
+            def max_s(self_inner, **kw):
+                calls.append(kw)
                 return None  # "solver failed" -> leaves s alone, still counted
 
         monkeypatch.setattr(m, "_synth", lambda: _FakeSynth())
@@ -283,7 +285,7 @@ class TestTriggerBehaviour:
         tr.regularization_weight = 0.0
         calls = []
         monkeypatch.setattr(
-            m, "_synth", lambda: type("F", (), {"max_s": lambda s: calls.append(1)})()
+            m, "_synth", lambda: type("F", (), {"max_s": lambda s, **kw: calls.append(1)})()
         )
         tr._maybe_maximize_s(epoch=0, c_max=10.0)
         assert calls == []
@@ -296,7 +298,9 @@ class TestTriggerBehaviour:
         sol = tr.model._synth().max_s()
         if sol is None:
             pytest.skip("MaxS unavailable in this environment")
-        monkeypatch.setattr(m, "_synth", lambda: type("F", (), {"max_s": lambda s: sol})())
+        monkeypatch.setattr(
+            m, "_synth", lambda: type("F", (), {"max_s": lambda s, **kw: sol})()
+        )
         assert tr.max_s_solve_count == 0
         tr._maybe_maximize_s(epoch=0, c_max=-1.0)
         assert tr.max_s_solve_count == 1
@@ -331,7 +335,13 @@ class TestInputMargin:
 
 class TestMarginScanCost:
     """The scan is a full extra no-grad rollout over the training set, so it must
-    not appear on a path that previously did nothing."""
+    not appear on a path that previously did nothing.
+
+    Budget per epoch: one scan to DECIDE (where the arm needs the margin), plus
+    one to VERIFY each solve that actually fired. Asserting ``scans == decides +
+    solves`` rather than a literal count keeps these solver-independent — without
+    MOSEK the SDP returns None, no repair is claimed and no verification is paid
+    for."""
 
     def _epoch_with_counting_margin(self, tmp_path, trigger, mlflow_tracking):
         m = _make_model()
@@ -342,18 +352,20 @@ class TestMarginScanCost:
         tr.input_margin = lambda: (calls.append(1), real())[1]
         # train() does the epoch bookkeeping; one epoch is enough to see the call.
         tr.train(max_epochs=1)
-        return len(calls)
+        return len(calls), tr.max_s_solve_count
 
     def test_untracked_never_arm_pays_nothing(self, tmp_path):
         """Matches the old solve_max_s_on_violation=False path exactly: no solve
         and no scan."""
-        assert self._epoch_with_counting_margin(
-            tmp_path, "never", mlflow_tracking=False) == 0
+        scans, solves = self._epoch_with_counting_margin(
+            tmp_path, "never", mlflow_tracking=False)
+        assert (scans, solves) == (0, 0)
 
     def test_on_violation_always_scans(self, tmp_path):
         """It needs the margin to decide, tracked or not."""
-        assert self._epoch_with_counting_margin(
-            tmp_path, "on_violation", mlflow_tracking=False) == 1
+        scans, solves = self._epoch_with_counting_margin(
+            tmp_path, "on_violation", mlflow_tracking=False)
+        assert scans == 1 + solves
 
     @pytest.mark.parametrize("trigger", ["never", "on_violation", "every_epoch"])
     def test_tracked_runs_scan_in_every_arm(self, tmp_path, trigger):
@@ -367,4 +379,85 @@ class TestMarginScanCost:
         import unittest.mock as mock
         with mock.patch("sysid.training.trainer.mlflow"):
             tr.train(max_epochs=1)
-        assert len(calls) == 1
+        assert len(calls) == 1 + tr.max_s_solve_count
+
+
+class TestRepairVerification:
+    """A triggered solve must *repair* the input condition, not merely re-solve it.
+
+    ``c_max`` decides whether to solve but cannot enter the SDP, which never sees
+    the data. So the necessary part is enforced inside the solve (the input floor
+    ``s >= sqrt(u_max)``) and the sufficient part is measured after it (re-scan
+    the margin). Solver-free: the SDP is replaced by a hand-built solution, since
+    what is under test is the enforce/verify contract, not MaxS."""
+
+    def _sol(self, s: float = 7.0, nx: int = 2, nz: int = 2) -> MaxSSolution:
+        return MaxSSolution(
+            P=np.eye(nx), L=np.zeros((nz, nx)), M=np.eye(nz), s=float(s)
+        )
+
+    def _fake_solve(self, tmp_path, monkeypatch, sol, margin_after, **kw):
+        """Trainer whose MaxS returns ``sol`` and whose post-solve scan reads
+        ``margin_after``. Returns (trainer, model, kwargs the solve was given)."""
+        m = _make_model()
+        tr = _trainer(tmp_path, m, max_s_trigger="on_violation", **kw)
+        seen = {}
+
+        def _max_s(_self, **kwargs):
+            seen.update(kwargs)
+            return sol
+
+        monkeypatch.setattr(m, "_synth", lambda: type("F", (), {"max_s": _max_s})())
+        scans = []
+        tr.input_margin = lambda: (scans.append(1), margin_after)[1]
+        return tr, m, seen, scans
+
+    # ── the floor the solve is given ──────────────────────────────────────────
+    def test_input_floor_is_sqrt_of_u_max(self, tmp_path):
+        """u_max = sup ||u_k||^2 over the loader (d = 0.1) -> floor 0.1."""
+        m = _make_model()
+        tr = _trainer(tmp_path, m)
+        assert float(m.u_max) == pytest.approx(0.01)
+        assert tr.input_floor() == pytest.approx(0.1)
+
+    def test_no_floor_when_u_max_is_unset(self, tmp_path):
+        """An unrecorded floor leaves the solve unconstrained in s, as before."""
+        m = _make_model()
+        tr = _trainer(tmp_path, m)
+        m.set_input_bound(None)
+        assert tr.input_floor() is None
+
+    def test_the_floor_reaches_the_solve(self, tmp_path, monkeypatch):
+        tr, _m, seen, _ = self._fake_solve(
+            tmp_path, monkeypatch, self._sol(), margin_after=-1.0)
+        tr._maybe_maximize_s(epoch=0, c_max=+1.0)
+        assert seen["s_min"] == pytest.approx(0.1)
+
+    # ── the verification after it ─────────────────────────────────────────────
+    def test_repaired_solve_is_not_counted_as_unrepaired(self, tmp_path, monkeypatch):
+        tr, m, _, scans = self._fake_solve(
+            tmp_path, monkeypatch, self._sol(), margin_after=-1.0)
+        assert tr._maybe_maximize_s(epoch=0, c_max=+1.0) == pytest.approx(7.0)
+        assert float(m.s) == pytest.approx(7.0)
+        assert (tr.max_s_solve_count, tr.max_s_unrepaired_count) == (1, 0)
+        assert len(scans) == 1, "the solve is verified exactly once"
+
+    def test_unrepaired_solve_warns_and_is_counted(self, tmp_path, monkeypatch, caplog):
+        """The whole point: a solve that leaves the data inadmissible must not be
+        reported as a repair."""
+        tr, m, _, _ = self._fake_solve(
+            tmp_path, monkeypatch, self._sol(), margin_after=+5.0)
+        with caplog.at_level(logging.WARNING):
+            new_s = tr._maybe_maximize_s(epoch=0, c_max=+1.0)
+        assert new_s == pytest.approx(7.0), "the feasible certificate is still kept"
+        assert tr.max_s_unrepaired_count == 1
+        assert "STILL" in caplog.text and "max c=5.000000" in caplog.text
+
+    def test_failed_solve_pays_for_no_verification(self, tmp_path, monkeypatch):
+        """Nothing was applied, so there is nothing to verify — and no extra pass."""
+        tr, m, _, scans = self._fake_solve(
+            tmp_path, monkeypatch, None, margin_after=+5.0)
+        s_before = float(m.s)
+        assert tr._maybe_maximize_s(epoch=0, c_max=+1.0) is None
+        assert float(m.s) == s_before
+        assert (scans, tr.max_s_solve_count, tr.max_s_unrepaired_count) == ([], 0, 0)

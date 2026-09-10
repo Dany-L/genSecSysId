@@ -158,7 +158,9 @@ class TestRepair:
 
         trainer, model = _make_trainer(tmp_path, max_s_trigger="on_violation")
         c_max = trainer.input_margin()
-        monkeypatch.setattr(LureCertificateSynthesizer, "max_s", lambda self: None)
+        monkeypatch.setattr(
+            LureCertificateSynthesizer, "max_s", lambda self, **kw: None
+        )
         s_before = float(model.s)
 
         with caplog.at_level(logging.WARNING):

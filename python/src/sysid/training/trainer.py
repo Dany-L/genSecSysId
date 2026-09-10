@@ -119,6 +119,10 @@ class Trainer:
         # SDP there, so without it "never" is not the clean control it looks like.
         self.max_s_solve_count = 0
         self.free_s_repair_count = 0
+        # Solves that fired and left the training data still inadmissible. A
+        # nonzero count means the trigger is spending SDPs without buying the
+        # thing it is triggered on, so it is reported, not swallowed.
+        self.max_s_unrepaired_count = 0
         # Dead-zone activity regularization: pushes mean ||w|| up to activity_target
         # so the nonlinearity fires, preventing the degenerate linear collapse
         # (w == 0 -> pure LTI rollout). NOTE: it does not by itself force a
@@ -485,7 +489,8 @@ class Trainer:
         ``on_violation``: it is the response variable that says whether a
         certificate is vacuous, and running it in all arms equalises per-epoch cost
         so a wall-clock comparison is not confounded. See the call site in
-        :meth:`train` for when it is skipped.
+        :meth:`train` for when it is skipped. :meth:`_maybe_maximize_s` calls it a
+        second time after a solve, to check the repair actually landed.
         """
         c_max = float("-inf")
         self.model.eval()
@@ -500,6 +505,25 @@ class Trainer:
         finally:
             self.model.train()
         return c_max
+
+    def input_floor(self) -> Optional[float]:
+        """``sqrt(u_max)`` — the smallest ``s`` the training inputs admit, or None.
+
+        ``u_max = sup_k ||u_k||^2`` is recorded on the model by
+        :meth:`_init_input_bound`. Passed to every solve that is free to choose
+        ``s`` (see :meth:`SimpleLure.set_input_bound`): the input condition forces
+        ``s^2 >= ||u_k||^2`` for every sample whatever ``P`` and ``alpha`` are, so
+        a solve that lands below this floor has not repaired anything. ``None``
+        when no floor was recorded — the solve then runs unconstrained in ``s``,
+        exactly as before.
+        """
+        u = getattr(self.model, "u_max", None)
+        if u is None:
+            return None
+        u = float(u)
+        if not np.isfinite(u) or u <= 0.0:
+            return None
+        return float(np.sqrt(u))
 
     def _maybe_maximize_s(self, epoch: int, c_max: float) -> Optional[float]:
         """Re-solve MaxS at an epoch boundary, per ``max_s_trigger``. Returns the new
@@ -523,6 +547,22 @@ class Trainer:
           ``||h^i||_P <= 1/s`` this drives ``H = L P^-1`` toward the global sector
           condition.
 
+        The margin only decides *whether* to solve; it cannot enter the SDP, which
+        is data-blind. So a triggered solve is not assumed to have repaired
+        anything — it is made to, and then checked:
+
+        * **enforced** — the solve carries the input floor ``s >= sqrt(u_max)``
+          (:meth:`input_floor`), necessary for the input condition whatever ``P``
+          and ``alpha`` are. A theta whose LMIs cannot reach the floor now returns
+          no solution instead of a certificate that cannot admit its own data.
+        * **verified** — the floor is not sufficient (the condition also needs
+          ``alpha^2 V(x_k) <= s^2 - ||u_k||^2`` along the rollout, and MaxS moves
+          ``P`` as well as ``s``), so the margin is re-scanned on the data after
+          the solution is applied. A solve that leaves ``c_max > 0`` warns and is
+          counted in ``max_s_unrepaired_count``; the enlarged certificate is still
+          kept, since it is feasible and no worse in ``s``, but it is not reported
+          as a repair.
+
         No-op for non-SimpleLure models, and while the barrier is off
         (``regularization_weight == 0``) or ``L`` is fixed — there is no regional
         certificate to enlarge in either case.
@@ -544,13 +584,20 @@ class Trainer:
         else:  # unreachable: TrainingConfig validates the value
             raise ValueError(f"unknown max_s_trigger {self.max_s_trigger!r}")
 
+        s_floor = self.input_floor()
         self.model.eval()
         try:
-            sol = self.model._synth().max_s()
+            # s >= sqrt(u_max) is necessary for the input condition, so the solve
+            # enforces it instead of returning a certificate that provably cannot
+            # admit the training inputs. Infeasible under the floor is reported by
+            # max_s as such and arrives here as sol is None.
+            sol = self.model._synth().max_s(s_min=s_floor)
             if sol is None:
                 logging.warning(
                     f"Epoch {epoch}: MaxS triggered ({self.max_s_trigger}, "
-                    f"max c={c_max:.6f}) but the SDP failed; leaving s unchanged."
+                    f"max c={c_max:.6f}) but the SDP failed"
+                    + (f" (input floor s >= {s_floor:.6f})" if s_floor is not None else "")
+                    + "; leaving s unchanged."
                 )
                 return None
 
@@ -558,16 +605,39 @@ class Trainer:
             self.model._apply_certificate_solution(sol)
             new_s = float(self.model.s)
             self.max_s_solve_count += 1
-            logging.info(
-                f"Epoch {epoch}: MaxS ({self.max_s_trigger}, max c={c_max:.6f}), "
-                f"s {s_before:.6f} -> {new_s:.6f}, sigma -> {self.sigma_u():.6f}"
-            )
-            if self.mlflow_tracking:
-                mlflow.log_metric("max_s_solved", 1, step=epoch)
-                mlflow.log_metric("max_s_value", new_s, step=epoch)
-            return new_s
         finally:
             self.model.train()
+
+        # Verify, do not assume. The floor the SDP enforces is necessary but not
+        # sufficient: the input condition also needs alpha^2 x_k^T P^-1 x_k <=
+        # s^2 - ||u_k||^2 along the rollout, and MaxS moves P as well as s, so
+        # whether the data is admissible under the NEW certificate is a question
+        # only the data can answer. One extra no-grad pass, paid on the epochs
+        # that actually solved (an SDP costs far more than a rollout), so no arm
+        # pays for a repair it did not attempt.
+        c_after = self.input_margin()
+        repaired = c_after <= 0
+        if not repaired:
+            self.max_s_unrepaired_count += 1
+
+        logging.info(
+            f"Epoch {epoch}: MaxS ({self.max_s_trigger}, max c={c_max:.6f}), "
+            f"s {s_before:.6f} -> {new_s:.6f}, sigma -> {self.sigma_u():.6f}, "
+            f"max c -> {c_after:.6f}"
+        )
+        if not repaired:
+            logging.warning(
+                f"Epoch {epoch}: MaxS solved but the training inputs are STILL "
+                f"inadmissible (max c={c_after:.6f} > 0): the enlarged certificate "
+                "does not cover the training rollout, so the certificate remains "
+                "vacuous on this data."
+            )
+        if self.mlflow_tracking:
+            mlflow.log_metric("max_s_solved", 1, step=epoch)
+            mlflow.log_metric("max_s_value", new_s, step=epoch)
+            mlflow.log_metric("input_margin_after_max_s", c_after, step=epoch)
+            mlflow.log_metric("max_s_repaired", int(repaired), step=epoch)
+        return new_s
 
     def reduce_lr_on_rollback(self, factor: float = 0.5):
         """
@@ -1139,6 +1209,9 @@ class Trainer:
                         mlflow.log_metric("input_margin_max", c_max, step=epoch)
                     mlflow.log_metric("max_s_solve_count", self.max_s_solve_count, step=epoch)
                     mlflow.log_metric("free_s_repair_count", self.free_s_repair_count, step=epoch)
+                    mlflow.log_metric(
+                        "max_s_unrepaired_count", self.max_s_unrepaired_count, step=epoch
+                    )
                     s = float(self.model.s.cpu().detach().numpy())
                     P = self.model.P.cpu().detach().numpy()
                     vol_X = get_volume_of_ellipsoid(P, s)

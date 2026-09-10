@@ -477,7 +477,7 @@ def main():
                     config.training, "max_s_trigger", "never"
                 ),
                 "max_s_every": getattr(config.training, "max_s_every", 1),
-                "]": bool(
+                "freeze_alpha": bool(
                     (config.model.custom_params or {}).get("freeze_alpha", False)
                 ),
                 "alpha_0": float(

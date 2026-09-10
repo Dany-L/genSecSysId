@@ -184,18 +184,18 @@ class LureInitializationMixin:
         )
         if init_method == "warm_start":
             pass  # already certified by _warm_start_certified
-        # elif not use_custom_regularization:
-        #     # No LMI barrier in the loss and no repair/rollback in the trainer
-        #     # (both gated on regularization_weight > 0), so feasibility is never
-        #     # maintained during training and a feasible start buys nothing. The
-        #     # identity draw above is the whole parameter initialization.
-        #     logger.info(
-        #         "  Skipping the MaxS/D21 repair solve: "
-        #         "training.use_custom_regularization is false, so the initial "
-        #         "parameters do not have to be feasible."
-        #     )
+        elif not use_custom_regularization:
+            # No LMI barrier in the loss and no repair/rollback in the trainer
+            # (both gated on regularization_weight > 0), so feasibility is never
+            # maintained during training and a feasible start buys nothing. The
+            # identity draw above is the whole parameter initialization.
+            logger.info(
+                "  Skipping the MaxS/D21 repair solve: "
+                "training.use_custom_regularization is false, so the initial "
+                "parameters do not have to be feasible."
+            )
         elif bootstrap_d21 and not constraints_ok:
-            if not self.analysis_problem_init(learn_B=False, learn_D21=False):
+            if not self.analysis_problem_init(learn_B=False, learn_D21=True):
                 # Nothing downstream repairs this — the bootstrap is the whole
                 # initialization — so an infeasible solve here means training
                 # would start outside the feasible set.
