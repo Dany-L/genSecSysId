@@ -15,7 +15,7 @@ and ``multirow`` (cell emphasis uses plain ``\\textbf``/``\\textit``).
 """
 
 import math
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -409,3 +409,84 @@ def summary_tables_latex(
             fmt_m, hdr_m, _grouped_body(df_mean, "Mean", _rows_mean, use_div_traj)
         ),
     }
+
+
+# ── Divergence / admissibility table ──────────────────────────────────────────
+# Drive a model with the test inputs, then zero the input and let the state
+# settle. Per (model x input group) two counts are reported:
+#   c^k > 0                the driven input is NOT admissible, i.e. the state /
+#                          input pair left the safe set
+#                          ||u^k||^2 <= s^2 - alpha^2 (x^k)^T P^-1 x^k. Only the
+#                          regional certificate is restricted to that set, so
+#                          for the global / unconstrained models the count is
+#                          passed as None and rendered "--".
+#   ||x^N|| > eps          the final state has not returned to the origin.
+DIVERGENCE_GROUPS: List[Tuple[str, str]] = [
+    ("diverging", "Diverging outputs"),
+    ("converging", "Converging outputs"),
+]
+
+# counts[model][group] = (n_inadmissible | None, n_diverged | None, n_total)
+DivCell = Optional[Tuple[Optional[int], Optional[int], int]]
+
+
+def _count_cell(k: Optional[int], n: int) -> str:
+    """``k/n``, or ``--`` when the count does not apply to this model."""
+    return "--" if k is None else f"{k}/{n}"
+
+
+def build_divergence_table(
+    counts: Dict[str, Dict[str, DivCell]],
+    model_order: Sequence[str],
+    groups: Optional[Sequence[Tuple[str, str]]] = None,
+    comment: Optional[str] = None,
+) -> str:
+    """Two columns per input group: input admissibility and final-state divergence.
+
+    ``counts[model_label][group_key] = (n_inadmissible, n_diverged, n_total)``;
+    a ``None`` count (or an absent model/group) renders ``--``. Rows follow
+    ``model_order``, columns follow ``groups`` (default
+    :data:`DIVERGENCE_GROUPS`). ``comment`` is written as a leading LaTeX
+    comment line — use it to record eps and the zero-input padding.
+    (LaTeX needs booktabs, multirow.)
+    """
+    groups = list(DIVERGENCE_GROUPS if groups is None else groups)
+
+    header_groups = " & ".join(
+        rf"\multicolumn{{2}}{{c}}{{{label}}}" for _key, label in groups
+    )
+    cmidrules = " ".join(
+        rf"\cmidrule(lr){{{2 + 2 * i}-{3 + 2 * i}}}" for i in range(len(groups))
+    )
+    subheader = " & ".join(
+        [r"$c^k > 0$", r"$\|\xk{N}\| > \epsilon$"] * len(groups)
+    )
+
+    body = []
+    for model in model_order:
+        cells: List[str] = []
+        for key, _label in groups:
+            cell = (counts.get(model) or {}).get(key)
+            if cell is None:
+                cells += ["--", "--"]
+            else:
+                n_inadmissible, n_diverged, n_total = cell
+                cells += [
+                    _count_cell(n_inadmissible, n_total),
+                    _count_cell(n_diverged, n_total),
+                ]
+        body.append(f"{model} & " + " & ".join(cells) + r" \\")
+
+    lines = [f"% {comment}"] if comment else []
+    lines += [
+        rf"\begin{{tabular}}{{l{' '.join(['cc'] * len(groups))}}}",
+        r"\toprule",
+        rf"\multirow{{2}}{{*}}{{Model}} & {header_groups}\\",
+        cmidrules,
+        rf"& {subheader} \\",
+        r"\midrule",
+        *body,
+        r"\bottomrule",
+        r"\end{tabular}",
+    ]
+    return "\n".join(lines)

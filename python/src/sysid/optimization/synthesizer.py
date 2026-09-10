@@ -198,6 +198,20 @@ class LureCertificateSynthesizer:
             f"max-s SDP solved: s = {s_star:.2f}, "
             f"min eig(P_current - P_opt) = {min_eig_diff:.2e}"
         )
+
+        # check set inclusion alpha^2 x^T (P_star^{-1} - P^{-1}) x \geq s_star^2 - s^2 for all x in \Xc
+        # P_star_inv = np.linalg.inv(P.value)
+        # P_inv = np.linalg.inv(self.P_current)
+        # s = self.s_fixed
+        # alpha = self.alpha
+
+        # tau = cp.Variable((1, 1), nonneg=True)
+        # constraints = [alpha**2 * (P_star_inv - P_inv) << tau*P_inv]
+        # constraints.append(s_star**2 - s**2 >= tau*s**2)
+        # problem = cp.Problem(cp.Minimize(0), constraints)
+        # problem.solve(solver=cp.MOSEK, verbose=False)
+
+
         return MaxSSolution(
             P=P.value,
             L=L_val,

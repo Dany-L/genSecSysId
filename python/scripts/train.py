@@ -344,6 +344,10 @@ def main():
             train_outputs,
             init_config=config.model.initialization,
             normalizer=normalizer,
+            # With the barrier off the initial theta does not have to be
+            # feasible (nothing keeps it feasible later either), so the
+            # initialization skips its repair solve.
+            use_custom_regularization=config.training.use_custom_regularization,
         )
     print_model_summary(model)
 
@@ -469,8 +473,15 @@ def main():
                 "max_epochs": config.training.max_epochs,
                 "warmup_steps": config.training.warmup_steps,
                 "input_regularization_weight": config.training.input_regularization_weight,
-                "solve_max_s_on_violation": getattr(
-                    config.training, "solve_max_s_on_violation", False
+                "max_s_trigger": getattr(
+                    config.training, "max_s_trigger", "never"
+                ),
+                "max_s_every": getattr(config.training, "max_s_every", 1),
+                "]": bool(
+                    (config.model.custom_params or {}).get("freeze_alpha", False)
+                ),
+                "alpha_0": float(
+                    (config.model.custom_params or {}).get("alpha_0", 0.9999)
                 ),
                 "activity_regularization_weight": getattr(config.training, "activity_regularization_weight", 0.0),
                 "activity_target": getattr(config.training, "activity_target", 0.0),
@@ -566,9 +577,8 @@ def main():
             log_gradients=getattr(config.training, "log_gradients", True),
             warmup_steps=config.training.warmup_steps,
             input_regularization_weight=getattr(config.training, "input_regularization_weight", 0.01),
-            solve_max_s_on_violation=getattr(
-                config.training, "solve_max_s_on_violation", False
-            ),
+            max_s_trigger=getattr(config.training, "max_s_trigger", "never"),
+            max_s_every=getattr(config.training, "max_s_every", 1),
             activity_regularization_weight=(
                 getattr(config.training, "activity_regularization_weight", 0.0)
                 if config.training.use_custom_regularization

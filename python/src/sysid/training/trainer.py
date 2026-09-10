@@ -46,7 +46,8 @@ class Trainer:
         log_gradients: bool = True,
         warmup_steps: int = 0,
         input_regularization_weight: float = 0.01,
-        solve_max_s_on_violation: bool = False,
+        max_s_trigger: str = "never",
+        max_s_every: int = 1,
         activity_regularization_weight: float = 0.0,
         activity_target: float = 0.0,
         h_regularization_weight: float = 0.0,
@@ -110,7 +111,14 @@ class Trainer:
         self.initial_input_regularization_weight = input_regularization_weight  # Store initial value
         # Re-solve MaxS after an epoch whose training data breached the input
         # condition — see _maybe_maximize_s and TrainingConfig.
-        self.solve_max_s_on_violation = solve_max_s_on_violation
+        self.max_s_trigger = max_s_trigger
+        self.max_s_every = max_s_every
+        # How often the epoch-boundary MaxS actually fired, and how often the
+        # per-batch repair had to free ``s`` (tier 2). The second one matters for
+        # the "never" arm: it is the only remaining way ``s`` can be moved by an
+        # SDP there, so without it "never" is not the clean control it looks like.
+        self.max_s_solve_count = 0
+        self.free_s_repair_count = 0
         # Dead-zone activity regularization: pushes mean ||w|| up to activity_target
         # so the nonlinearity fires, preventing the degenerate linear collapse
         # (w == 0 -> pure LTI rollout). NOTE: it does not by itself force a
@@ -440,36 +448,48 @@ class Trainer:
         :meth:`SimpleLure.feasibility_problem`. This is the whole constraint
         machinery: barrier during the step, repair-or-rollback after it.
         """
-        return self.model.feasibility_problem()
+        ok = self.model.feasibility_problem()
+        if ok and getattr(self.model, "last_repair_freed_s", False):
+            self.free_s_repair_count += 1
+        return ok
 
-    def _maybe_maximize_s(self, epoch: int) -> Optional[float]:
-        """Re-solve MaxS (once per epoch) if the training data breaches the input
-        condition. Returns the new ``s``, or ``None`` if nothing was solved.
+    def sigma_u(self) -> Optional[float]:
+        """Size of the admissible input set, ``sigma(U) = |s| sqrt(1 - alpha^2)``.
 
-        Two steps, so the SDP is decoupled from the mini-batching:
+        On the invariant set ``X`` we have ``V(x) <= s^2``, so the input condition
+        ``||u||^2 <= s^2 - alpha^2 V(x)`` worst-cases to ``||u||^2 <= s^2(1-alpha^2)``:
+        ``sigma`` is the radius of the input ball admissible from ANYWHERE in ``X``.
 
-        1. Scan *all* training batches (no grad) for the peak input-constraint
-           margin ``c_k = ||u_k||^2 - s^2 + alpha^2 V(x_k)``. That says whether
-           the currently certified set still covers the whole training set.
-        2. Only if it is breached somewhere (``max_k c_k > 0``) solve MaxS once.
-           The SDP fixes theta and optimizes (P, L, Lambda, s), so a single solve
-           re-certifies an enlarged ``s`` for the entire dataset.
+        ``|s|`` on purpose. Nothing constrains the sign of ``s`` (the ``-log s``
+        barrier term was deliberately removed) and logged runs do reach ``s < 0``,
+        but every consumer — both LMIs, the input margin, the ellipsoid — uses only
+        ``s**2``, so a negative ``s`` is a sign artifact of the parameterization and
+        ``|s|`` is the quantity with the geometric meaning.
 
-        Why it matters: ``s`` is learnable and the log-barrier only ever pushes it
-        DOWN. Nothing pushes back, so without this step ``s`` decays below the
-        input floor ``sqrt(u_max)``, every optimizer step then lands outside the
-        feasible set, and the per-batch repair SDP fires on every batch and mostly
-        fails into a rollback. Restored from cf9cb54, where it ran on 820 of 1500
-        epochs and held ``s`` near the floor with zero rollbacks.
-
-        No-op for non-SimpleLure models.
+        ``None`` for models without the regional certificate.
         """
         if not isinstance(self.model, SimpleLure):
             return None
+        with torch.no_grad():
+            alpha = torch.sigmoid(self.model.tau)
+            return float(self.model.s.abs() * torch.sqrt(torch.clamp(1 - alpha ** 2, min=0.0)))
 
+    def input_margin(self) -> float:
+        """Peak input-constraint margin ``c_max = max_{i,k} c_k`` over the training set.
+
+        ``c_k = ||u_k||^2 - s^2 + alpha^2 V(x_k)``, so ``c_max > 0`` means the
+        currently certified set no longer admits the training inputs. One no-grad
+        pass over the whole loader, so it is decoupled from the mini-batching.
+
+        Called in *every* trigger arm on a tracked run, not only in
+        ``on_violation``: it is the response variable that says whether a
+        certificate is vacuous, and running it in all arms equalises per-epoch cost
+        so a wall-clock comparison is not confounded. See the call site in
+        :meth:`train` for when it is skipped.
+        """
+        c_max = float("-inf")
         self.model.eval()
         try:
-            c_max = float("-inf")
             with torch.no_grad():
                 for batch in self.train_loader:
                     d = batch[0].to(self.device)
@@ -477,24 +497,70 @@ class Trainer:
                     _, c = self.model.get_regularization_input(d, x, return_c=True)
                     # NaN positions come from padded trajectories; ignore them.
                     c_max = max(c_max, float(torch.nan_to_num(c, nan=float("-inf")).max()))
+        finally:
+            self.model.train()
+        return c_max
 
+    def _maybe_maximize_s(self, epoch: int, c_max: float) -> Optional[float]:
+        """Re-solve MaxS at an epoch boundary, per ``max_s_trigger``. Returns the new
+        ``s``, or ``None`` if nothing was solved.
+
+        This is the knob that sets the size of the admissible input set
+        ``sigma(U) = |s| sqrt(1 - alpha^2)``, because nothing else pushes ``s`` up:
+        ``s`` is learnable and the log-det barrier only ever pushes it DOWN.
+
+        * ``"never"``        — return immediately. ``s`` decays for the whole run.
+          The per-batch repair keeps the LMIs satisfied, so the certificate stays
+          mathematically valid, but ``sigma -> 0`` and Theorem 1's input hypothesis
+          fails on the training data itself: a valid, vacuous certificate.
+        * ``"on_violation"`` — solve only when ``c_max > 0``. ``s`` then tracks the
+          data and settles near the input floor ``sqrt(u_max)``. Measured on
+          cf9cb54: 820 of 1500 epochs, ``s`` settled at ~9.9 against a floor of
+          9.7, zero rollbacks.
+        * ``"every_epoch"``  — solve every ``max_s_every`` epochs regardless.
+          ``s`` is driven to the MaxS ceiling, which is set by the solver epsilon
+          (``EPS=1e-6`` => ``s <= 1e3``), not by the data. Since
+          ``||h^i||_P <= 1/s`` this drives ``H = L P^-1`` toward the global sector
+          condition.
+
+        No-op for non-SimpleLure models, and while the barrier is off
+        (``regularization_weight == 0``) or ``L`` is fixed — there is no regional
+        certificate to enlarge in either case.
+        """
+        if not isinstance(self.model, SimpleLure):
+            return None
+
+        if not self.model.learn_L or self.regularization_weight == 0.0:
+            return None
+
+        if self.max_s_trigger == "never":
+            return None
+        if self.max_s_trigger == "on_violation":
             if c_max <= 0:
                 return None
+        elif self.max_s_trigger == "every_epoch":
+            if epoch % self.max_s_every != 0:
+                return None
+        else:  # unreachable: TrainingConfig validates the value
+            raise ValueError(f"unknown max_s_trigger {self.max_s_trigger!r}")
 
+        self.model.eval()
+        try:
             sol = self.model._synth().max_s()
             if sol is None:
                 logging.warning(
-                    f"Epoch {epoch}: input condition violated (max c={c_max:.6f}) "
-                    "but the MaxS SDP failed; leaving s unchanged."
+                    f"Epoch {epoch}: MaxS triggered ({self.max_s_trigger}, "
+                    f"max c={c_max:.6f}) but the SDP failed; leaving s unchanged."
                 )
                 return None
 
             s_before = float(self.model.s)
             self.model._apply_certificate_solution(sol)
             new_s = float(self.model.s)
+            self.max_s_solve_count += 1
             logging.info(
-                f"Epoch {epoch}: input condition violated (max c={c_max:.6f}), "
-                f"solved MaxS, s {s_before:.6f} -> {new_s:.6f}"
+                f"Epoch {epoch}: MaxS ({self.max_s_trigger}, max c={c_max:.6f}), "
+                f"s {s_before:.6f} -> {new_s:.6f}, sigma -> {self.sigma_u():.6f}"
             )
             if self.mlflow_tracking:
                 mlflow.log_metric("max_s_solved", 1, step=epoch)
@@ -917,11 +983,24 @@ class Trainer:
             if train_pred_loss_div is not None:
                 self.train_div_losses.append(train_pred_loss_div)
 
-            # Repair s: if the training inputs breached the input condition this
-            # epoch, re-solve MaxS so the certified set covers them again. Runs
-            # before validation so val reflects the updated certificate.
-            if self.solve_max_s_on_violation:
-                self._maybe_maximize_s(epoch)
+            # Repair s per the MaxS trigger policy. Runs before validation so val
+            # reflects the updated certificate.
+            #
+            # The margin scan is a full extra no-grad rollout over the training
+            # set, so it runs only where it earns its cost: "on_violation" needs
+            # it to decide, and any tracked run needs it in EVERY arm both as a
+            # response variable (a positive margin is what makes a certificate
+            # vacuous) and to keep per-epoch cost equal across arms so a
+            # wall-clock comparison is not confounded. An untracked run on the
+            # default "never" trigger skips it and pays nothing, matching the
+            # old solve_max_s_on_violation=False path exactly.
+            needs_margin = (
+                isinstance(self.model, SimpleLure)
+                and self.model.learn_L
+                and (self.max_s_trigger == "on_violation" or self.mlflow_tracking)
+            )
+            c_max = self.input_margin() if needs_margin else float("nan")
+            self._maybe_maximize_s(epoch, c_max)
 
             # Validate
             val_results = self.validate()
@@ -1051,6 +1130,15 @@ class Trainer:
                     alpha = 1/(1+ np.exp(-self.model.tau.cpu().detach().numpy()))
                     mlflow.log_metric("s", self.model.s.item(), step=epoch)
                     mlflow.log_metric("alpha", alpha, step=epoch)
+                    # sigma(U) = |s| sqrt(1-alpha^2): the admissible-input radius,
+                    # the quantity the MaxS trigger actually controls.
+                    sigma = self.sigma_u()
+                    if sigma is not None:
+                        mlflow.log_metric("sigma_u", sigma, step=epoch)
+                    if np.isfinite(c_max):
+                        mlflow.log_metric("input_margin_max", c_max, step=epoch)
+                    mlflow.log_metric("max_s_solve_count", self.max_s_solve_count, step=epoch)
+                    mlflow.log_metric("free_s_repair_count", self.free_s_repair_count, step=epoch)
                     s = float(self.model.s.cpu().detach().numpy())
                     P = self.model.P.cpu().detach().numpy()
                     vol_X = get_volume_of_ellipsoid(P, s)

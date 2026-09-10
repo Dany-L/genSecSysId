@@ -44,13 +44,19 @@ def test_stale_training_key_loads_with_warning(caplog):
 def test_solve_max_s_on_violation_is_not_dropped(caplog):
     """Regression: the key was silently ignored while the feature was missing,
     so configs asking for the after-epoch MaxS repair got no repair and no
-    warning. It must round-trip now."""
+    warning. It must round-trip now.
+
+    It is now the deprecated spelling of ``max_s_trigger``, so it DOES draw a
+    deprecation warning — that is the opposite of being dropped. What must never
+    come back is the *unknown field* path, which discards the key entirely.
+    """
     cfg_dict = _min_dict(training={"solve_max_s_on_violation": True})
     with caplog.at_level(logging.WARNING):
         cfg = Config.from_dict(cfg_dict)
 
     assert cfg.training.solve_max_s_on_violation is True
-    assert "solve_max_s_on_violation" not in caplog.text
+    assert cfg.training.max_s_trigger == "on_violation", "must reach the trigger"
+    assert "Ignoring unknown config field" not in caplog.text
 
 
 def test_clean_config_produces_no_unknown_field_warning(caplog):
