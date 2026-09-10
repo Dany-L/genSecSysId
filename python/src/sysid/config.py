@@ -4,7 +4,7 @@ import json
 import logging
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 import yaml
 
@@ -98,6 +98,12 @@ class InitializationConfig:
     #
     # learn_B stays False on purpose: with B free too the SDP drives both B and
     # D21 to zero — a trivially certifiable but dead model (e_hat == 0).
+    #
+    # Only consulted when training.use_custom_regularization is true. Without the
+    # barrier nothing holds theta feasible during training (the trainer's
+    # repair/rollback is gated on regularization_weight > 0), so the initial
+    # parameters do not have to be feasible and the solve is skipped regardless
+    # of this flag.
     bootstrap_d21_on_infeasible: bool = True
 
     # ---------------------------------------------------------------- warm start
@@ -262,7 +268,50 @@ class TrainingConfig:
     # The duffing-soft-7 runs had this on: run 936f56b9 (task 20) re-solved on
     # 820 of 1500 epochs, s wandered 6.4..36.6 and settled at ~9.9 (the input
     # floor is 9.7), with 0 rollbacks over the whole run.
-    solve_max_s_on_violation: bool = False
+    solve_max_s_on_violation: Optional[bool] = None
+
+    # When MaxS is re-solved during training. This is the knob that decides the
+    # size of the admissible input set sigma(U) = |s| * sqrt(1 - alpha^2), because
+    # nothing else ever pushes ``s`` up: the log-det barrier only pushes it down.
+    #
+    #   "never"        -- MaxS runs only in the initialization. ``s`` then decays
+    #                     under the barrier for the whole run. The LMIs stay
+    #                     satisfied (the per-batch repair enforces them), so the
+    #                     certificate remains mathematically VALID, but sigma -> 0
+    #                     and the certified region collapses: Theorem 1's input
+    #                     hypothesis fails on the very data the model was fit to,
+    #                     so the guarantee is vacuous. The negative control that
+    #                     shows the epoch-boundary solve is load-bearing.
+    #   "on_violation" -- solve at an epoch boundary only when the training data
+    #                     breaches c_k <= 0. ``s`` then tracks the data: it settles
+    #                     near the input floor max_k||u_k||, giving a genuinely
+    #                     regional certificate matched to the training set. Note
+    #                     this targets CENTRE-admissibility (s >= max||u||), which
+    #                     is weaker than sigma >= max||u|| (admissible everywhere
+    #                     on X).
+    #   "every_epoch"  -- solve unconditionally every ``max_s_every`` epochs. ``s``
+    #                     is driven to the MaxS ceiling, which is set by the solver
+    #                     epsilon (locality LMI >= eps*I forces 1/s^2 >= eps, so
+    #                     s <= 1/sqrt(eps) = 1e3 at EPS=1e-6), NOT by the data or
+    #                     the model. Since ||h^i||_P <= 1/s, this drives H = L P^-1
+    #                     to zero: the global sector condition. All inputs
+    #                     admissible, at the price of a near-linear model.
+    #
+    # ``solve_max_s_on_violation`` is the deprecated boolean spelling: True maps to
+    # "on_violation", False to "never". Kept because unknown YAML keys are dropped
+    # SILENTLY, so removing it would turn every existing config into a no-op that
+    # looks like a null result.
+    #
+    # The default is "never" only to preserve the old ``solve_max_s_on_violation:
+    # False`` default exactly: a config that omits the key must behave as it always
+    # did, rather than silently gaining an SDP solve that moves ``s``. For new work
+    # "on_violation" is the recommended setting -- set it explicitly.
+    max_s_trigger: str = "never"
+
+    # Cadence for max_s_trigger="every_epoch": solve every k-th epoch. k=1 is every
+    # epoch; larger k interpolates toward "never" and gives a near-continuous axis
+    # for the sigma(U) trade-off. Ignored by the other triggers.
+    max_s_every: int = 1
 
     # Dead-zone activity regularization. Penalizes relu(activity_target - mean||w||)
     # on the rollout so the dead-zone nonlinearity fires, preventing the degenerate
@@ -295,6 +344,45 @@ class TrainingConfig:
 
     # Device
     device: str = "cuda"  # "cuda", "cpu", "mps"
+
+    MAX_S_TRIGGERS: ClassVar[Tuple[str, ...]] = ("never", "on_violation", "every_epoch")
+
+    def __post_init__(self):
+        """Resolve the deprecated ``solve_max_s_on_violation`` alias and validate.
+
+        The alias is only honoured when ``max_s_trigger`` was left at its default,
+        so a config that sets both explicitly gets the new key (and a warning).
+        """
+        if self.solve_max_s_on_violation is not None:
+            implied = "on_violation" if self.solve_max_s_on_violation else "never"
+            # A dataclass cannot tell "left at the default" from "explicitly set to
+            # the default value", so the alias is applied only when max_s_trigger
+            # still holds the default "never". The single ambiguous case --- an
+            # explicit max_s_trigger: never together with
+            # solve_max_s_on_violation: true --- is a self-contradictory config,
+            # and resolving it in favour of the new key is the safe choice.
+            if self.max_s_trigger != "never":
+                logger.warning(
+                    "Both 'solve_max_s_on_violation' (%s -> %r) and 'max_s_trigger' "
+                    "(%r) are set; using max_s_trigger and ignoring the deprecated "
+                    "alias.", self.solve_max_s_on_violation, implied, self.max_s_trigger,
+                )
+            elif implied != self.max_s_trigger:
+                logger.warning(
+                    "'solve_max_s_on_violation' is deprecated; use "
+                    "max_s_trigger: %r instead.", implied,
+                )
+                self.max_s_trigger = implied
+
+        if self.max_s_trigger not in self.MAX_S_TRIGGERS:
+            raise ValueError(
+                f"training.max_s_trigger must be one of {self.MAX_S_TRIGGERS}, "
+                f"got {self.max_s_trigger!r}."
+            )
+        if self.max_s_every < 1:
+            raise ValueError(
+                f"training.max_s_every must be >= 1, got {self.max_s_every}."
+            )
 
 
 @dataclass

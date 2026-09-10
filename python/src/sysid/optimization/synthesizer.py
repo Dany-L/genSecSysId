@@ -128,10 +128,27 @@ class LureCertificateSynthesizer:
         )
 
     # -------------------------------------------------------------------- MaxS
-    def max_s(self, gamma: float = 0.0) -> Optional[MaxSSolution]:
+    def max_s(
+        self, gamma: float = 0.0, s_min: Optional[float] = None
+    ) -> Optional[MaxSSolution]:
         """MaxS — maximize ``s`` (minimize ``S_hat = 1/s²``) subject to stability +
         locality LMIs. With fixed ``L = 0`` (not ``learn_L``) ``s`` is frozen and
         the locality LMIs are dropped.
+
+        ``s_min`` (e.g. ``sqrt(u_max)``, see ``SimpleLure.set_input_bound``) adds
+        the input floor ``s >= s_min``, i.e. ``S_hat <= 1/s_min²``. That is the
+        only way the DATA enters this otherwise data-blind SDP, and it is what
+        makes a triggered solve a *repair* rather than just a re-solve: the input
+        condition ``||u_k||² <= s² - alpha² x_kᵀP⁻¹x_k`` forces ``s² >= ||u_k||²``
+        for every sample whatever ``P`` and ``alpha`` are, so a solution below the
+        floor provably cannot admit its own training inputs. Since MaxS maximizes
+        ``s``, the bound is inactive whenever the LMIs can reach the floor at all
+        and the solve turns infeasible exactly when they cannot — which is the
+        answer the caller wants, rather than a certificate that cannot cover the
+        data. Necessary, not sufficient: covering the actual rollout also needs
+        ``alpha² x_kᵀP⁻¹x_k <= s² - ||u_k||²``, which depends on states this SDP
+        never sees, so the caller must still verify the margin on the data
+        afterwards. Ignored when ``s`` is frozen (not ``learn_L``).
 
         ``gamma > 0`` adds a ``-γ·log det P`` pull to the objective, keeping ``P``
         (and its inverse ``P⁻¹`` in ``H = LP⁻¹`` / ``V = xᵀP⁻¹x``) off zero and
@@ -164,17 +181,36 @@ class LureCertificateSynthesizer:
                 Gs.append(locality_lmi)
                 constraints.append(locality_lmi >> eps * np.eye(self.nx + 1))
 
+        if s_min is not None and self.learn_L:
+            if not np.isfinite(s_min) or s_min <= 0:
+                raise ValueError(f"s_min must be finite and positive, got {s_min}.")
+            constraints.append(S_hat <= 1.0 / float(s_min) ** 2)
+
         base_obj = S_hat if self.learn_L else 0
         obj_expr = base_obj - gamma * cp.log_det(P) if gamma > 0 else base_obj
         objective = cp.Minimize(obj_expr)
         problem = cp.Problem(objective, constraints)
+        # A floored solve fails exactly when the LMIs cannot reach the floor, so
+        # say so: MOSEK reports that either as a status or as an exception, and
+        # "solver failed" alone would send the caller looking for the wrong bug.
+        floor_note = (
+            ""
+            if s_min is None or not self.learn_L
+            else (
+                f" (under the input floor s >= {float(s_min):.4g}; if that is the "
+                "binding constraint, no certificate for this theta admits the "
+                "training inputs)"
+            )
+        )
         try:
             problem.solve(solver=cp.MOSEK, verbose=False)
         except Exception as e:
-            logger.error(f"max-s SDP solver failed: {e}")
+            logger.error(f"max-s SDP solver failed: {e}{floor_note}")
             return None
         if problem.status != "optimal":
-            logger.error(f"max-s SDP failed with status: {problem.status}")
+            logger.error(
+                f"max-s SDP failed with status: {problem.status}{floor_note}"
+            )
             return None
 
         if self.learn_L:
@@ -198,6 +234,7 @@ class LureCertificateSynthesizer:
             f"max-s SDP solved: s = {s_star:.2f}, "
             f"min eig(P_current - P_opt) = {min_eig_diff:.2e}"
         )
+
         return MaxSSolution(
             P=P.value,
             L=L_val,

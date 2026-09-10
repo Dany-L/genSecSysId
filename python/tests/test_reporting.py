@@ -86,6 +86,45 @@ def test_build_split_tables_keys_and_labels():
 
 
 # ── runs: pure selection logic ────────────────────────────────────────────────
+# ── tables: divergence / admissibility table ───────────────────────────────
+def test_build_divergence_table_counts_and_structure():
+    counts = {
+        r"\MGenSec{}": {"diverging": (13, 10, 15), "converging": (0, 0, 30)},
+        r"\MStdSec{}": {"diverging": (None, 0, 15), "converging": (None, 0, 30)},
+    }
+    order = [r"\MGenSec{}", r"\MStdSec{}", r"\MLtiRnn{}"]
+    tex = tables.build_divergence_table(counts, order, comment="eps = 0.1")
+
+    lines = {m: next(l for l in tex.splitlines() if l.startswith(m)) for m in order}
+    assert lines[r"\MGenSec{}"] == r"\MGenSec{} & 13/15 & 10/15 & 0/30 & 0/30 \\"
+    # No regional safe set -> admissibility column is "--", divergence still counted.
+    assert lines[r"\MStdSec{}"] == r"\MStdSec{} & -- & 0/15 & -- & 0/30 \\"
+    # A model absent from `counts` renders as all "--" rather than being dropped.
+    assert lines[r"\MLtiRnn{}"] == r"\MLtiRnn{} & -- & -- & -- & -- \\"
+    for m in order:
+        assert lines[m].count("&") == 4
+
+    assert tex.startswith("% eps = 0.1\n")
+    assert r"\begin{tabular}{lcc cc}" in tex
+    assert r"\multicolumn{2}{c}{Diverging outputs}" in tex
+    assert r"\multicolumn{2}{c}{Converging outputs}" in tex
+    assert r"\cmidrule(lr){2-3} \cmidrule(lr){4-5}" in tex
+    assert tex.count(r"$\|\xk{N}\| > \epsilon$") == 2
+    assert tex.count(r"$c^k > 0$") == 2
+    assert tex.rstrip().endswith(r"\end{tabular}")
+
+
+def test_build_divergence_table_custom_groups_and_no_comment():
+    counts = {r"\MGenSec{}": {"ood": (1, 2, 3)}}
+    tex = tables.build_divergence_table(
+        counts, [r"\MGenSec{}"], groups=[("ood", "OOD")]
+    )
+    assert not tex.startswith("%")
+    assert r"\begin{tabular}{lcc}" in tex
+    assert r"\cmidrule(lr){2-3}" in tex
+    assert r"\MGenSec{} & 1/3 & 2/3 \\" in tex
+
+
 def test_build_filter_string():
     s = runs.build_filter_string({"tags.a": True, "tags.b": False})
     assert s == 'tags.`tags.a` = "True" and tags.`tags.b` = "False"'

@@ -116,18 +116,29 @@ class SimpleLure(
         # Parse structural constraints
         self.structural_constraints = self._parse_structural_constraints(custom_params)
 
-        alpha_0 = 0.9999
+        # alpha = sigmoid(tau) is the contraction rate. It is NOT in the rollout, so
+        # the prediction loss gives it no gradient; only the barrier does, and the
+        # barrier prefers alpha -> 1 (the -alpha^2 P block of F relaxes as alpha
+        # grows). Since sigma(U) = |s| sqrt(1 - alpha^2), a drifting alpha collapses
+        # the admissible input set on its own, independently of s, and confounds any
+        # comparison of the MaxS triggers. ``freeze_alpha`` holds it at ``alpha_0``.
+        if custom_params is not None:
+            alpha_0 = float(custom_params.get("alpha_0", 0.9999))
+            freeze_alpha = bool(custom_params.get("freeze_alpha", False))
+        else:
+            alpha_0, freeze_alpha = 0.9999, False
+        if not 0.0 < alpha_0 < 1.0:
+            raise ValueError(f"alpha_0 must lie in (0, 1), got {alpha_0}.")
+        self.freeze_alpha = freeze_alpha
+        tau_0 = float(np.log(alpha_0 / (1.0 - alpha_0)))
         if learn_L:
             self.L = nn.Parameter(torch.zeros((nz, nx)))  # Coupling matrix
-            # self.alpha = nn.Parameter(torch.tensor(0.9999), requires_grad=True)
-            self.tau = nn.Parameter(torch.tensor(np.log(alpha_0/(1-alpha_0))), requires_grad=True)  # unconstrained parameter for alpha
+            self.tau = nn.Parameter(torch.tensor(tau_0), requires_grad=not freeze_alpha)
             self.s = nn.Parameter(torch.tensor(1.0), requires_grad=True)
-            # self.s = nn.Parameter(torch.tensor(1.0), requires_grad=False)
         else:
             # Register as buffer so .to(device) moves it with the module
             self.register_buffer("L", torch.zeros((nz, nx)))
-            # self.alpha = nn.Parameter(torch.tensor(0.9999), requires_grad=False)
-            self.tau = nn.Parameter(torch.tensor(np.log(alpha_0/(1-alpha_0))), requires_grad=False)  # 
+            self.tau = nn.Parameter(torch.tensor(tau_0), requires_grad=False)
             self.s = nn.Parameter(torch.tensor(1.0), requires_grad=False)
 
         self.la = nn.Parameter(torch.ones(nz))
@@ -220,16 +231,36 @@ class SimpleLure(
     # carry it.
     _LEGACY_STATE_KEYS: Tuple[str, ...] = ("dual_penalty",)
 
+    # The mirror image: persistent buffers added *after* some checkpoints were
+    # written, so those checkpoints have no entry for them. Each one is a
+    # data-derived level that ``nan`` already denotes as unset (``u_max`` is set
+    # per run by ``set_input_bound()``), and every consumer tests for nan before
+    # using it. So a checkpoint that predates the buffer loads with the
+    # freshly-constructed nan and reads as "no input floor recorded", rather than
+    # failing outright on a missing key.
+    _OPTIONAL_STATE_KEYS: Tuple[str, ...] = ("u_max",)
+
     def load_state_dict(self, state_dict, *args, **kwargs):
-        """Load a state dict, silently dropping retired keys (see
-        ``_LEGACY_STATE_KEYS``) so pre-existing checkpoints keep loading.
+        """Load a state dict, bridging both directions of buffer churn so
+        pre-existing checkpoints keep loading: retired keys they still carry are
+        dropped (``_LEGACY_STATE_KEYS``) and buffers they predate keep the
+        constructed default (``_OPTIONAL_STATE_KEYS``).
 
         Everything else is still loaded strictly — unknown or missing keys
-        other than the retired ones raise as usual.
+        other than those raise as usual.
         """
         filtered = {
             k: v for k, v in state_dict.items() if k not in self._LEGACY_STATE_KEYS
         }
+        current = self.state_dict()
+        for key in self._OPTIONAL_STATE_KEYS:
+            if key not in filtered and key in current:
+                filtered[key] = current[key]
+                logger.info(
+                    "Checkpoint predates the '%s' buffer; keeping the default "
+                    "(%s). Recompute it from the data if you need it.",
+                    key, current[key],
+                )
         return super().load_state_dict(filtered, *args, **kwargs)
 
     def _parse_structural_constraints(self, custom_params: Optional[dict]) -> dict:
@@ -549,10 +580,15 @@ class SimpleLure(
         """
         s = float(self.s.cpu().detach().numpy())
         sol = self._synth().feasibility(s)
+        self.last_repair_freed_s = False
         if sol is None:
             sol = self._synth().feasibility(None)
             if sol is None:
                 return False
+            # Tier 2 moved ``s`` without any MaxS solve. This is the only path by
+            # which ``s`` changes under max_s_trigger="never", so it has to be
+            # counted or that arm is not the clean control it appears to be.
+            self.last_repair_freed_s = True
             logger.debug(
                 f"Fixed-s repair infeasible at s={s:.4g}; repaired with s free -> {sol.s:.4g}"
             )
@@ -837,18 +873,6 @@ class SimpleLureSafe(SimpleLure):
     the learned safe set ``{x : (1/s²) xᵀ P⁻¹ x ≤ 1}``. The safe-set parameters
     are derived on-the-fly from the model's own learnable ``P``, ``s``, ``tau``.
     """
-
-    def load_state_dict(self, state_dict, *args, **kwargs):
-        """Load a state dict, silently dropping retired keys (see
-        ``_LEGACY_STATE_KEYS``) so pre-existing checkpoints keep loading.
-
-        Everything else is still loaded strictly — unknown or missing keys
-        other than the retired ones raise as usual.
-        """
-        filtered = {
-            k: v for k, v in state_dict.items() if k not in self._LEGACY_STATE_KEYS
-        }
-        return super().load_state_dict(filtered, *args, **kwargs)
 
     def _build_lure(self, sys: LureSystemClass) -> LureSystem:
         return LureSystemSafe(sys)

@@ -6,10 +6,11 @@ breaches the input condition ``||u_k||^2 <= s^2 - alpha^2 V(x_k)``, every
 optimizer step lands outside the feasible set, and the per-batch repair SDP fires
 on every batch and mostly fails into a rollback.
 
-The fix (restored from cf9cb54, gated on
-``TrainingConfig.solve_max_s_on_violation``) is to scan the epoch for the peak
-margin and, only when it is breached, re-solve MaxS once to grow the certified
-set back over the data.
+The fix (restored from cf9cb54) is to scan the epoch for the peak margin and,
+only when it is breached, re-solve MaxS once to grow the certified set back over
+the data. That is now the ``max_s_trigger="on_violation"`` arm of the trigger
+policy; the scan itself lives in ``Trainer.input_margin`` so it can run in every
+arm. See test_max_s_trigger.py for the other two arms and the policy wiring.
 """
 
 import logging
@@ -40,7 +41,7 @@ requires_mosek = pytest.mark.skipif(
 )
 
 
-def _make_trainer(tmp_path, solve_max_s_on_violation, peak=6.0, n=3, T=25):
+def _make_trainer(tmp_path, max_s_trigger, peak=6.0, n=3, T=25):
     torch.manual_seed(0)
     model = SimpleLure(nd=1, ne=1, nx=2, nw=4, activation="dzn", ts=0.05,
                        custom_params={"learn_L": True})
@@ -74,39 +75,60 @@ def _make_trainer(tmp_path, solve_max_s_on_violation, peak=6.0, n=3, T=25):
         optimizer=torch.optim.Adam(model.parameters(), lr=1e-3),
         device="cpu", output_dir=str(tmp_path), model_dir=str(tmp_path),
         log_dir=str(tmp_path), mlflow_tracking=False, warmup_steps=0,
-        solve_max_s_on_violation=solve_max_s_on_violation,
+        max_s_trigger=max_s_trigger,
+        # Non-zero on purpose: with no barrier in the loss the trainer's repair and
+        # rollback are both off, so there is no regional certificate to enlarge and
+        # _maybe_maximize_s short-circuits in every arm (see
+        # test_max_s_trigger.py::test_no_solve_without_the_barrier).
+        regularization_weight=1e-3,
     )
     return trainer, model
 
 
 class TestWiring:
     def test_defaults_off(self, tmp_path):
-        trainer, _ = _make_trainer(tmp_path, solve_max_s_on_violation=False)
-        assert trainer.solve_max_s_on_violation is False
+        """The default must stay "never", i.e. exactly the old
+        ``solve_max_s_on_violation: False`` behaviour: a config that omits the key
+        must not silently gain an SDP solve that moves ``s``."""
+        assert TrainingConfig().max_s_trigger == "never"
+        trainer, _ = _make_trainer(tmp_path, max_s_trigger="never")
+        assert trainer.max_s_trigger == "never"
 
     def test_flag_is_stored(self, tmp_path):
-        trainer, _ = _make_trainer(tmp_path, solve_max_s_on_violation=True)
-        assert trainer.solve_max_s_on_violation is True
+        trainer, _ = _make_trainer(tmp_path, max_s_trigger="on_violation")
+        assert trainer.max_s_trigger == "on_violation"
 
     def test_config_field_survives_yaml_roundtrip(self, tmp_path):
         """It was silently dropped before — a stale YAML key is a no-op."""
-        assert TrainingConfig().solve_max_s_on_violation is False
         p = tmp_path / "c.yaml"
+        p.write_text(
+            "data:\n  train_path: /nonexistent\n"
+            "model:\n  model_type: crnn\n"
+            "training:\n  max_s_trigger: on_violation\n"
+        )
+        assert Config.from_yaml(str(p)).training.max_s_trigger == "on_violation"
+
+    def test_deprecated_bool_still_reaches_the_trigger(self, tmp_path):
+        """Archived YAMLs spell it the old way; unknown keys are dropped silently,
+        so the alias has to keep working or those configs become no-ops."""
+        p = tmp_path / "old.yaml"
         p.write_text(
             "data:\n  train_path: /nonexistent\n"
             "model:\n  model_type: crnn\n"
             "training:\n  solve_max_s_on_violation: true\n"
         )
-        assert Config.from_yaml(str(p)).training.solve_max_s_on_violation is True
+        assert Config.from_yaml(str(p)).training.max_s_trigger == "on_violation"
 
 
 @requires_mosek
 class TestRepair:
     def test_grows_s_when_input_condition_breached(self, tmp_path):
-        trainer, model = _make_trainer(tmp_path, solve_max_s_on_violation=True)
+        trainer, model = _make_trainer(tmp_path, max_s_trigger="on_violation")
         s_before = float(model.s)
 
-        new_s = trainer._maybe_maximize_s(epoch=0)
+        c_max = trainer.input_margin()
+        assert c_max > 0, "fixture must start with the input condition breached"
+        new_s = trainer._maybe_maximize_s(epoch=0, c_max=c_max)
 
         assert new_s is not None, "breached input condition must trigger a solve"
         assert float(model.s) > s_before
@@ -114,29 +136,34 @@ class TestRepair:
 
     def test_noop_when_condition_already_holds(self, tmp_path):
         """No breach -> no SDP, and s is left exactly alone."""
-        trainer, model = _make_trainer(tmp_path, solve_max_s_on_violation=True, peak=0.0)
+        trainer, model = _make_trainer(tmp_path, max_s_trigger="on_violation", peak=0.0)
         with torch.no_grad():
             model.s.data = torch.tensor(50.0)
         s_before = float(model.s)
 
-        assert trainer._maybe_maximize_s(epoch=0) is None
+        c_max = trainer.input_margin()
+        assert c_max <= 0, "fixture must start with the input condition satisfied"
+        assert trainer._maybe_maximize_s(epoch=0, c_max=c_max) is None
         assert float(model.s) == s_before
 
     def test_returns_model_to_train_mode(self, tmp_path):
-        trainer, model = _make_trainer(tmp_path, solve_max_s_on_violation=True)
+        trainer, model = _make_trainer(tmp_path, max_s_trigger="on_violation")
         model.train()
-        trainer._maybe_maximize_s(epoch=0)
+        trainer._maybe_maximize_s(epoch=0, c_max=trainer.input_margin())
         assert model.training
 
     def test_survives_a_failing_sdp(self, tmp_path, monkeypatch, caplog):
         """A failed solve must warn and leave s alone, not crash the epoch."""
         from sysid.optimization.synthesizer import LureCertificateSynthesizer
 
-        trainer, model = _make_trainer(tmp_path, solve_max_s_on_violation=True)
-        monkeypatch.setattr(LureCertificateSynthesizer, "max_s", lambda self: None)
+        trainer, model = _make_trainer(tmp_path, max_s_trigger="on_violation")
+        c_max = trainer.input_margin()
+        monkeypatch.setattr(
+            LureCertificateSynthesizer, "max_s", lambda self, **kw: None
+        )
         s_before = float(model.s)
 
         with caplog.at_level(logging.WARNING):
-            assert trainer._maybe_maximize_s(epoch=3) is None
+            assert trainer._maybe_maximize_s(epoch=3, c_max=c_max) is None
         assert float(model.s) == s_before
-        assert "MaxS SDP failed" in caplog.text
+        assert "the SDP failed" in caplog.text

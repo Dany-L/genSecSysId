@@ -11,6 +11,8 @@ The certificate SDPs live on ``LureCertificateSynthesizer``:
 These need MOSEK and are skipped otherwise.
 """
 
+import logging
+
 import numpy as np
 import pytest
 import torch
@@ -133,6 +135,39 @@ class TestMaxS:
         assert out["success"]
         assert out["s_opt"] == pytest.approx(1.0, rel=1e-9)
         assert out["constraints_satisfied"]
+
+    def test_s_min_is_inactive_when_the_ceiling_clears_it(self):
+        """MaxS maximizes s, so a floor below the ceiling changes nothing."""
+        synth = _synth(_make_model())
+        free = synth.max_s()
+        assert free is not None
+        floored = synth.max_s(s_min=free.s / 2)
+        assert floored is not None
+        # rel 1e-4: both sit on the EPS ceiling s <= 1e3, where the solver's own
+        # noise is ~1e-5 relative. What is under test is that the floor is inactive.
+        assert floored.s == pytest.approx(free.s, rel=1e-4)
+
+    def test_s_min_above_the_ceiling_is_infeasible(self, caplog):
+        """The point of the floor: a theta whose certificate cannot reach
+        ``sqrt(u_max)`` provably cannot admit its own training inputs, so the
+        solve must fail loudly instead of returning that certificate."""
+        synth = _synth(_make_model())
+        free = synth.max_s()
+        assert free is not None
+        with caplog.at_level(logging.ERROR):
+            assert synth.max_s(s_min=1e3 * free.s) is None
+        assert "input floor" in caplog.text
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+    def test_s_min_must_be_finite_and_positive(self, bad):
+        with pytest.raises(ValueError):
+            _synth(_make_model()).max_s(s_min=bad)
+
+    def test_s_min_is_ignored_when_s_is_frozen(self):
+        """learn_L=False has no S_hat variable — s is fixed, nothing to floor."""
+        m = _make_global_model(s_value=1.0)
+        sol = _synth(m).max_s(s_min=1e6)
+        assert sol is not None and sol.s == pytest.approx(1.0, rel=1e-9)
 
     def test_gamma_zero_is_pure_max_s(self):
         """gamma=0 (default) must reproduce the pure MaxS certificate exactly —

@@ -60,6 +60,7 @@ class LureInitializationMixin:
         train_outputs,
         init_config=None,
         normalizer: Optional[DataNormalizer] = None,
+        use_custom_regularization: bool = True,
     ):
         """Initialize model parameters. Two methods, selected by ``init_config.method``.
 
@@ -84,6 +85,13 @@ class LureInitializationMixin:
            :meth:`LureCertificateSynthesizer.max_s`, with D21 additionally free.
            A, B, C, D, D12, B2 and C2 are left exactly as step 1 set them.
 
+           Skipped when ``use_custom_regularization`` is False: no LMI barrier
+           then enters the loss and the trainer's repair/rollback is off
+           (``regularization_weight == 0``), so nothing keeps theta inside the
+           feasible set during training and there is nothing for a feasible
+           start to preserve. Step 1 *is* the parameter initialization in that
+           case; what follows only fills buffers and reports diagnostics.
+
         That is the whole initialization. Beyond the two steps only
         ``set_output_coverage_level`` runs, to load the ``output_std`` / ``y_max``
         buffers the output-coverage regularizer reads, plus the dead-zone activity
@@ -95,7 +103,10 @@ class LureInitializationMixin:
         is typically well below the input floor ``sqrt(u_max)``; the input
         condition is then violated at the input peaks and the regional
         certificate does not cover the training rollout. Whether the initial
-        rollout stays bounded depends on the draw — check it per seed.
+        rollout stays bounded depends on the draw — check it per seed. With
+        ``use_custom_regularization=False`` no solve runs at all, so ``s``, ``P``
+        and ``L`` stay at their constructor values (s=1, P=I, L=0) and the
+        reported certificate is a readout of those, not an established one.
 
         Args:
             train_inputs: Training input data (B, N, nd).
@@ -105,6 +116,10 @@ class LureInitializationMixin:
             init_config: InitializationConfig; ``method`` is ``'identity'`` or
                 ``'warm_start'``.
             normalizer: Data normalizer used to scale C/B and derive y_max.
+            use_custom_regularization: mirror of ``training.use_custom_regularization``.
+                False means the loss carries no LMI barrier, so the initial
+                parameters do not have to be feasible and the D21 repair solve
+                (step 2) is skipped.
 
         Returns:
             :class:`~sysid.optimization.solutions.InitializationReport` — the
@@ -169,6 +184,16 @@ class LureInitializationMixin:
         )
         if init_method == "warm_start":
             pass  # already certified by _warm_start_certified
+        elif not use_custom_regularization:
+            # No LMI barrier in the loss and no repair/rollback in the trainer
+            # (both gated on regularization_weight > 0), so feasibility is never
+            # maintained during training and a feasible start buys nothing. The
+            # identity draw above is the whole parameter initialization.
+            logger.info(
+                "  Skipping the MaxS/D21 repair solve: "
+                "training.use_custom_regularization is false, so the initial "
+                "parameters do not have to be feasible."
+            )
         elif bootstrap_d21 and not constraints_ok:
             if not self.analysis_problem_init(learn_B=False, learn_D21=True):
                 # Nothing downstream repairs this — the bootstrap is the whole
