@@ -89,7 +89,12 @@ training:
   input_regularization_weight: 0.0
   activity_regularization_weight: 0.0
   h_regularization_weight: 0.0
-  solve_max_s_on_violation: true
+  # Holds s up against the barrier. Replaces the retired
+  # solve_max_s_on_violation trigger: sigma(U) >= c under a Lagrange
+  # multiplier rather than an epoch-boundary MaxS solve.
+  sigma_constraint: true
+  sigma_target: auto
+  sigma_dual_lr: 0.01
 
 mlflow:
   tracking_uri: null

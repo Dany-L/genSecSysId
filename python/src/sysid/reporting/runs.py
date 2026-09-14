@@ -24,6 +24,10 @@ def build_filter_string(tags_dict: Dict[str, object]) -> str:
 def _default_search_fn() -> Callable:
     import mlflow
 
+    from sysid.config import allow_file_store
+
+    allow_file_store()
+
     return mlflow.search_runs
 
 

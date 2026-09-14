@@ -1,4 +1,4 @@
-.PHONY: help install install-dev format lint test clean
+.PHONY: help install install-dev format lint test clean ui
 
 help:
 	@echo "Available commands:"
@@ -7,7 +7,15 @@ help:
 	@echo "  make format       - Format code with black and isort"
 	@echo "  make lint         - Run flake8 linter"
 	@echo "  make test         - Run pytest test suite"
+	@echo "  make ui           - Start the MLflow UI on ./mlruns (http://127.0.0.1:5000)"
 	@echo "  make clean        - Remove build artifacts and caches"
+
+# MLflow >= 3.16 refuses a file-backed store (./mlruns) unless this is set:
+# the file store is in maintenance mode. Every run this project has produced
+# lives there, so opt out rather than migrate. Must run from this directory --
+# there is a second, stale ./mlruns at the repo root with only a handful of runs.
+ui:
+	MLFLOW_ALLOW_FILE_STORE=true mlflow ui
 
 install:
 	pip install -e .
