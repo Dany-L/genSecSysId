@@ -249,3 +249,77 @@ class TestInteractionWithStructuralConstraints:
         })
         model._init_identity(normalizer=_MockNormalizer())
         assert np.allclose(model.B2.detach().numpy(), fixed_value)
+
+
+class TestAScaleAtOtherStateDimensions:
+    """``A`` under ``{scale: ...}`` must be sized by the model's own ``nx``.
+
+    Regression: the continuous-time template was hard-coded as the 2x2
+    ``[[0, 1], [0, 0]]``, so any ``nx != 2`` built a 2x2 ``A`` while ``P`` and
+    the rest of the certificate stayed at ``nx``. Nothing complained at
+    initialization -- the mismatch surfaced much later as a bare
+    ``mat1 and mat2 shapes cannot be multiplied`` from inside the stability LMI,
+    which points nowhere near the cause.
+    """
+
+    @pytest.mark.parametrize("nx", [1, 2, 3, 4])
+    def test_a_is_square_at_nx(self, nx):
+        model = _make_model(nx=nx, nw=3, ts=0.1, custom_params={
+            "identity_init": {"A": {"scale": 0.9}},
+        })
+        model._init_identity(normalizer=_MockNormalizer())
+        assert model.A.shape == (nx, nx)
+
+    @pytest.mark.parametrize("nx", [1, 2, 3])
+    def test_the_certificate_lmis_are_conformable(self, nx):
+        """The check that actually failed before: A must match P."""
+        model = _make_model(nx=nx, nw=3, ts=0.1, custom_params={
+            "identity_init": {"A": {"scale": 0.9}}, "learn_L": True,
+        })
+        model._init_identity(normalizer=_MockNormalizer())
+        for lmi in model.get_lmis():
+            lmi()  # must not raise a shape error
+
+    def test_nx_2_is_unchanged(self):
+        """The generalization must not move the case every existing config uses:
+        integrator chain above, random row below."""
+        torch.manual_seed(0)
+        model = _make_model(nx=2, ts=0.1, custom_params={
+            "identity_init": {"A": {"scale": 1.0}},
+        })
+        model._init_identity(normalizer=_MockNormalizer())
+        A_ct = (model.A.detach().numpy() - np.eye(2)) / 0.1
+        assert A_ct[0, 0] == pytest.approx(0.0)
+        assert A_ct[0, 1] == pytest.approx(1.0)
+        assert (A_ct[1, :] <= 0).all()
+
+    def test_scalar_a_is_stable_for_a_sane_scale(self):
+        """nx=1: A_ct = -scale*U(0,1), so A = 1 - scale*ts*U(0,1) in (0, 1)."""
+        for trial in range(20):
+            torch.manual_seed(trial)
+            model = _make_model(nx=1, nw=3, ts=0.1, custom_params={
+                "identity_init": {"A": {"scale": 0.9}},
+            })
+            model._init_identity(normalizer=_MockNormalizer())
+            assert 0.0 < float(model.A) < 1.0
+
+    def test_b_is_shaped_by_nx_and_nd(self):
+        """``B`` carried the same hard-coded 2x1 shape as ``A``'s template."""
+        model = _make_model(nd=2, nx=3, nw=3, ts=0.1, custom_params={
+            "identity_init": {"A": {"scale": 0.9}},
+        })
+        model._init_identity(normalizer=_MockNormalizer())
+        assert model.B.shape == (3, 2)
+        B = model.B.detach().numpy()
+        # input still enters the last state only
+        assert (B[:-1, :] == 0).all()
+        assert (B[-1, :] != 0).all()
+
+    def test_b_at_nx_2_is_unchanged(self):
+        model = _make_model(nd=1, nx=2, ts=0.1, custom_params={
+            "identity_init": {"A": {"scale": 0.9}},
+        })
+        model._init_identity(normalizer=_MockNormalizer())
+        B = model.B.detach().numpy()
+        assert B[0, 0] == pytest.approx(0.0)
+        assert B[1, 0] != 0.0

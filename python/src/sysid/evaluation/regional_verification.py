@@ -225,6 +225,7 @@ def regional_verification(
     X = np.linalg.inv(P)
 
     Ts = getattr(config.data, "sampling_time", 0.05)
+    f_cut = getattr(config.data, "f_cut", 2.0)
     seed = getattr(config, "seed", 0) or 0
     rng = np.random.default_rng(seed + 17)
 
@@ -271,7 +272,7 @@ def regional_verification(
     for amp in in_amps:
         us = []
         for _ in range(n_traj):
-            u_i = _make_lp_noise(rng, horizon, amp_max=amp, Ts=Ts)
+            u_i = _make_lp_noise(rng, horizon, amp_max=amp, Ts=Ts, f_cut=f_cut)
             u_i = np.hstack((u_i, np.zeros(400)))
             us.append(u_i)
         us = np.stack(us)
@@ -284,7 +285,7 @@ def regional_verification(
         rng, X, radius=initial_state_scale * s / max(alpha, 1e-12), n=n_traj
     )
     st_u = np.stack(
-        [_make_lp_noise(rng, horizon, amp_max=0.01 * s, Ts=Ts) for _ in range(n_traj)]
+        [_make_lp_noise(rng, horizon, amp_max=0.01 * s, Ts=Ts, f_cut=f_cut) for _ in range(n_traj)]
     )
 
     DIVERGE_THRESHOLD = 10

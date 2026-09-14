@@ -289,7 +289,7 @@ def _train(m, tl, vl, epochs, lr, tmp_path, div_loader=None, reg_weight=GATE_REG
         optimizer=get_optimizer(m.parameters(), "adam", learning_rate=lr),
         regularization_weight=reg_weight, warmup_steps=WARMUP,
         gradient_clip_value=GATE_CLIP,
-        max_s_trigger="on_violation", device="cpu", mlflow_tracking=False,
+        sigma_constraint=True, device="cpu", mlflow_tracking=False,
         output_dir=str(tmp_path), model_dir=str(tmp_path), log_dir=str(tmp_path),
     )
     history = []
@@ -354,10 +354,11 @@ class TestGateConfig:
             "gradient_clip_value went missing; without it a single gradient spike "
             "inflates Adam's second moment and freezes training"
         )
-        assert CFG.training.max_s_trigger == "on_violation", (
-            "the gate must keep the after-epoch MaxS solve; without it s decays "
+        assert CFG.training.sigma_constraint is True, (
+            "the gate must keep something holding s up; without it s decays "
             "under the barrier and the certificate goes vacuous"
         )
+        assert CFG.training.sigma_target == "auto"
         assert CFG.model.custom_params.get("learn_L") is True
         assert set(CFG.model.custom_params["structural_constraints"]) == {"D", "D12"}
         assert CFG.data.shuffle is False, "the gate must be deterministic"

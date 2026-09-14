@@ -434,8 +434,15 @@ class LureInitializationMixin:
             else:
                 A_scale = float(A_spec.get('scale', 1.0))
                 device, dtype = self.A.device, self.A.dtype
-                A_ct = torch.tensor([[0.0, 1.0], [0.0, 0.0]], device=device, dtype=dtype)
-                A_ct[1, :] = -A_scale * torch.rand((1, self.nx), device=device, dtype=dtype)
+                # Companion (integrator-chain) form at the model's own nx: ones on
+                # the superdiagonal, last row = -scale * U(0,1). At nx = 2 this is
+                # exactly the [[0, 1], [0, 0]] template it replaces -- the shape was
+                # hard-coded there, so any nx != 2 silently built a 2x2 A and only
+                # failed later inside the LMI with a shape mismatch.
+                A_ct = torch.zeros((self.nx, self.nx), device=device, dtype=dtype)
+                if self.nx > 1:
+                    A_ct[:-1, 1:] = torch.eye(self.nx - 1, device=device, dtype=dtype)
+                A_ct[-1, :] = -A_scale * torch.rand((1, self.nx), device=device, dtype=dtype)
                 # Forward-Euler discretisation, matching how the benchmark's
                 # reference Lur'e model is built (notebooks/Duffing). The exact ZOH
                 # A = expm(A_ct*ts) is available via _zoh_discretize and is more
@@ -457,9 +464,14 @@ class LureInitializationMixin:
                     input_std = getattr(normalizer, 'input_std', None)
                     if input_std is not None:
                         input_scale = float(np.asarray(input_std).reshape(-1)[0])
-                B_init = input_scale * self.ts * torch.tensor(
-                    [[0.0], [1.0]], device=self.B.device, dtype=self.B.dtype
+                # Input enters the last state only -- the bottom of the
+                # integrator chain A_ct sets up above. Built at (nx, nd) rather
+                # than the hard-coded 2x1 it replaces, which is the same vector
+                # at nx = 2, nd = 1 but conformable at any size.
+                B_init = torch.zeros(
+                    (self.nx, self.nd), device=self.B.device, dtype=self.B.dtype
                 )
+                B_init[-1, :] = input_scale * self.ts
                 # B_init = 0.01*self.ts * torch.tensor(
                 #     [[0.0], [1.0]], device=self.B.device, dtype=self.B.dtype
                 # )
@@ -490,9 +502,14 @@ class LureInitializationMixin:
                     # )
                 else:
                     output_scale = normalizer.output_std.squeeze()
-                C_init = (1.0 / output_scale) * torch.tensor(
-                    [[1.0, 0.0]], device=self.C.device, dtype=self.C.dtype
+                # Read the first state out, scaled into normalized units.
+                # Built at (ne, nx) rather than the hard-coded 1x2 it replaces;
+                # identical at ne = 1, nx = 2, conformable at any size.
+                C_init = torch.zeros(
+                    (self.ne, self.nx), device=self.C.device, dtype=self.C.dtype
                 )
+                C_init[0, 0] = 1.0
+                C_init = (1.0 / output_scale) * C_init
                 # C_init = 0.01 * torch.tensor(
                 #     [[1.0, 0.0]], device=self.C.device, dtype=self.C.dtype
                 # )
