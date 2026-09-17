@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Optional, Tuple
@@ -27,6 +28,70 @@ def _known_fields(config_cls, section: str, values: Dict[str, Any]) -> Dict[str,
             section, ", ".join(sorted(unknown)), config_cls.__name__,
         )
     return {k: v for k, v in values.items() if k in allowed}
+
+
+# Keys removed by a feature replacement, mapped to what to do instead. These are
+# checked BEFORE _known_fields, which would otherwise drop them with only a
+# warning -- and a silently-ignored mechanism key turns an archived config into a
+# no-op that looks like a null result rather than a mistake.
+_REMOVED_FIELDS: Dict[str, Dict[str, str]] = {
+    "training": {
+        "sigma_constraint":
+            "the Lagrangian constraint sigma(U) >= c was rolled back in favour "
+            "of the MaxS epoch-boundary trigger; use training.max_s_trigger "
+            "(never / on_violation / every_epoch) instead",
+        "sigma_target":
+            "removed with the sigma constraint; the MaxS solve carries the "
+            "input floor s >= sqrt(u_max) on its own, see training.max_s_trigger",
+        "sigma_dual_lr":
+            "removed with the sigma constraint; there is no dual variable, the "
+            "cadence knob is training.max_s_every",
+        "sigma_dual_init":
+            "removed with the sigma constraint; there is no dual variable",
+        "sigma_dual_max":
+            "removed with the sigma constraint; there is no dual variable",
+        "sigma_warm_start":
+            "removed with the sigma constraint; MaxS is solved in the "
+            "initialization and again at epoch boundaries per "
+            "training.max_s_trigger",
+        "sigma_protect_s":
+            "removed with the sigma constraint; the per-batch repair is back to "
+            "its two tiers (fixed s, then free s)",
+    },
+}
+
+
+def _reject_removed_fields(
+    section: str, values: Dict[str, Any], allow_removed: bool = False
+) -> None:
+    """Raise on keys belonging to a removed feature, naming the replacement.
+
+    ``allow_removed`` downgrades this to a warning and strips the keys. That is
+    for *archived* configs only -- the ``config.yaml`` a finished run wrote next
+    to its checkpoint, which ``resolve_run_artifacts`` reloads so the run can be
+    evaluated or post-processed. There the key is a historical record of how the
+    run was trained, the training already happened, and refusing to load it
+    would make every previous run unevaluatable. A config a person is asking to
+    *train* with still raises: that one is asking for a mechanism that no longer
+    exists.
+    """
+    removed = _REMOVED_FIELDS.get(section, {})
+    hits = [k for k in values if k in removed]
+    if not hits:
+        return
+    detail = "; ".join(f"'{section}.{k}' -- {removed[k]}" for k in sorted(hits))
+    if allow_removed:
+        logger.warning(
+            "Archived config carries removed field(s): %s. Ignoring them; they "
+            "describe how the run was trained, not how it will be.", detail,
+        )
+        for k in hits:
+            values.pop(k, None)
+        return
+    raise ValueError(
+        f"Config uses removed field(s): {detail}. Remove the key(s) to load "
+        "this config."
+    )
 
 
 @dataclass
@@ -56,6 +121,7 @@ class DataConfig:
     shuffle: bool = True
     num_workers: int = 0
     sampling_time: float = 0.01
+    f_cut: float = 2.0  # Cutoff frequency for low-pass filtering the input signal
 
     # Diverging trajectory support. When enabled, the loader additionally reads
     # train_div/, validation_div/, test_div/ sibling folders. Diverging
@@ -479,8 +545,15 @@ class Config:
         return cls.from_dict(config_dict)
 
     @classmethod
-    def from_dict(cls, config_dict: Dict[str, Any]) -> "Config":
-        """Create Config from dictionary, properly instantiating nested dataclasses."""
+    def from_dict(
+        cls, config_dict: Dict[str, Any], allow_removed: bool = False
+    ) -> "Config":
+        """Create Config from dictionary, properly instantiating nested dataclasses.
+
+        ``allow_removed=True`` tolerates keys from removed features instead of
+        raising -- for reloading an archived run's config, never for a config
+        someone is about to train with. See :func:`_reject_removed_fields`.
+        """
         # Normalize field names for each config section
         
         # Handle data config with field name mappings
@@ -510,6 +583,8 @@ class Config:
             optimizer_dict["learning_rate"] = training_dict.pop("learning_rate")
         if "optimizer" in training_dict and "optimizer_type" not in optimizer_dict:
             optimizer_dict["optimizer_type"] = training_dict.pop("optimizer")
+
+        _reject_removed_fields("training", training_dict, allow_removed)
         
         # Handle training config with field name mappings
         if "epochs" in training_dict:
@@ -645,7 +720,9 @@ def resolve_run_artifacts(
     model_type = config_path.parent.parent.name
     with open(config_path) as f:
         cfg_dict = yaml.load(f, Loader=_SafeLoaderWithTuple)
-    config = Config.from_dict(cfg_dict)
+    # Archived config: the run already happened, so removed keys are a
+    # record of how it was trained and must not block evaluation.
+    config = Config.from_dict(cfg_dict, allow_removed=True)
 
     run_dir = base / "models" / model_type / run_id
     model_path = run_dir / "best_model.pt"
@@ -712,7 +789,9 @@ def resolve_run_artifacts_mlflow(
         )
     with open(config_path) as f:
         cfg_dict = yaml.load(f, Loader=_SafeLoaderWithTuple)
-    config = Config.from_dict(cfg_dict)
+    # Archived config: the run already happened, so removed keys are a
+    # record of how it was trained and must not block evaluation.
+    config = Config.from_dict(cfg_dict, allow_removed=True)
 
     model_path = models_dir / "best_model.pt"
     if not model_path.exists():
@@ -731,6 +810,26 @@ def resolve_run_artifacts_mlflow(
             run_info = json.load(f)
 
     return config, model_path, normalizer_path, run_info
+
+
+def allow_file_store() -> None:
+    """Opt out of MLflow's file-store maintenance-mode exception, if unset.
+
+    From MLflow 3.16 a file-backed tracking URI (``./mlruns``) raises unless
+    ``MLFLOW_ALLOW_FILE_STORE`` is set: the file store is in maintenance mode
+    and the project is pushed toward a database backend. Every run this project
+    has ever produced lives in that file store, and several tools read it
+    directly (the run listings under ``reporting/``), so the opt-out keeps the
+    existing history usable.
+
+    ``setdefault``, never an unconditional set: an explicit
+    ``MLFLOW_ALLOW_FILE_STORE=false`` in the environment stays honoured, so this
+    does not silently undo a deliberate migration to
+    ``sqlite:///mlflow.db`` (see ``mlflow migrate-filestore``).
+
+    ``tests/conftest.py`` does the same thing for the test session.
+    """
+    os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
 
 def setup_mlflow_tracking(
@@ -752,6 +851,7 @@ def setup_mlflow_tracking(
     """
     import mlflow  # imported lazily so sysid.config has no hard mlflow dep
 
+    allow_file_store()
     log = logging.getLogger(__name__)
     uri = override_uri if override_uri is not None else config.mlflow.tracking_uri
     if uri:

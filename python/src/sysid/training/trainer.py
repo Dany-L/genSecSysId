@@ -146,6 +146,10 @@ class Trainer:
         # Rollback tracking
         self.rollback_count = 0
         self.epoch_rollback_count = 0
+        # Optimizer steps actually taken this epoch, across BOTH passes, so the
+        # "everything rolled back" test has a denominator that matches its
+        # numerator. See the check in :meth:`train`.
+        self.epoch_step_count = 0
 
         # Logging
         self.mlflow_tracking = mlflow_tracking
@@ -478,6 +482,38 @@ class Trainer:
             alpha = torch.sigmoid(self.model.tau)
             return float(self.model.s.abs() * torch.sqrt(torch.clamp(1 - alpha ** 2, min=0.0)))
 
+    def locality_tightness(self) -> Optional[tuple]:
+        """``(max_i ||h^i||_P, max_i ||h^i||_P * |s|)`` for ``H = L P^-1``.
+
+        A Schur complement on the locality LMI gives ``||h^i||_P <= 1/s``, so:
+
+        * **``h_norm_P``** is the quantity the theory calls ``H``. It is what
+          goes to zero as ``s`` grows, and ``H = 0`` *is* the global sector
+          condition -- a globally absolutely stable, typically near-linear
+          model. This is the mediator for the sigma trade-off, i.e. the price
+          the ``every_epoch`` MaxS arm pays for its large admissible input set.
+        * **``locality_tightness`` = ``||h||_P * |s|``** normalizes it against
+          its own bound, so it lives in ``[0, 1]`` regardless of scale: ``1``
+          means the locality LMI is tight and the certificate is riding the
+          regional boundary; ``0`` means it is slack, which at small ``s`` is
+          the signature of the vacuous certificate rather than of a global one.
+
+        Do not read ``||H||_F`` for this. It is not normalized by ``P`` and can
+        move opposite to ``||h||_P`` when ``P`` changes, which it does.
+
+        ``None`` for models without a learnable ``L``.
+        """
+        if not isinstance(self.model, SimpleLure) or not getattr(
+            self.model, "learn_L", False
+        ):
+            return None
+        with torch.no_grad():
+            P = self.model.P
+            H = self.model.L @ torch.linalg.inv(P)
+            quad = torch.einsum("ij,jk,ik->i", H, P, H)
+            h_p = float(torch.sqrt(torch.clamp(quad, min=0.0)).max())
+        return h_p, h_p * abs(float(self.model.s))
+
     def input_margin(self) -> float:
         """Peak input-constraint margin ``c_max = max_{i,k} c_k`` over the training set.
 
@@ -686,6 +722,11 @@ class Trainer:
             # NO warmup slicing — diverging trajectories often die before
             # warmup_steps would expire, and they share x0 with the model
             # so there is no transient to discard.
+            # try to focus on the last few steps of the diverging trajectories
+            # N = 100
+            # if e_hat.shape[1] > N:
+            #     e_hat = e_hat[:, -N:, :]
+            #     e = e[:, -N:, :]
             pred_loss_div = self.loss_fn(e_hat, e)
 
             if self.regularization_weight > 0:
@@ -713,6 +754,7 @@ class Trainer:
                 }
 
             self.optimizer.step()
+            self.epoch_step_count += 1
 
             if isinstance(self.model, SimpleLure):
                 if not self.model.check_constraints() and self.regularization_weight > 0:
@@ -751,6 +793,7 @@ class Trainer:
 
         # Reset epoch rollback counter
         self.epoch_rollback_count = 0
+        self.epoch_step_count = 0
 
         # Accumulate gradient stats over epoch
         epoch_grad_stats: dict[str, list[float]] = {}
@@ -861,6 +904,7 @@ class Trainer:
 
             # Update weights
             self.optimizer.step()
+            self.epoch_step_count += 1
             # Check if constraints are satisfied (for constrained models)
             if isinstance(self.model, SimpleLure):
                 if not self.model.check_constraints() and self.regularization_weight > 0:
@@ -1150,15 +1194,34 @@ class Trainer:
                     mlflow.log_metric("train_reg_activity", train_results["reg_activity"], step=epoch)
                 if self.h_regularization_weight > 0:
                     mlflow.log_metric("train_reg_H", train_results["reg_H"], step=epoch)
-                    # Current coupling norm ||H||_F (H = L P^-1): watch it climb
-                    # toward h_target as the anti-global term takes effect.
-                    if hasattr(self.model, "get_regularization_H"):
-                        with torch.no_grad():
-                            _, norm_H = self.model.get_regularization_H(
-                                self.h_target if self.h_target > 0 else 1.0,
-                                return_norm=True,
-                            )
-                        mlflow.log_metric("norm_H", float(norm_H), step=epoch)
+                # Coupling norm ||H||_F (H = L P^-1), logged for every SimpleLure
+                # with a learnable L, not only when the anti-global term is on.
+                # It is the mediator for the sigma trade-off: the locality LMI
+                # gives ||h^i||_P <= 1/s, so buying sigma with s drives H -> 0,
+                # which IS the global sector condition (near-linear model). A run
+                # that reports a large sigma is only interesting alongside the
+                # ||H|| it paid for it.
+                if getattr(self.model, "learn_L", False) and hasattr(
+                    self.model, "get_regularization_H"
+                ):
+                    with torch.no_grad():
+                        _, norm_H = self.model.get_regularization_H(
+                            self.h_target if self.h_target > 0 else 1.0,
+                            return_norm=True,
+                        )
+                    mlflow.log_metric("norm_H", float(norm_H), step=epoch)
+                    # ||H||_F is NOT the mediator, despite reading like it.
+                    # The locality LMI bounds the P-norm of the rows,
+                    # ||h^i||_P <= 1/s, and that is what -> 0 as s grows (the
+                    # global sector condition). ||H||_F can move the OPPOSITE
+                    # way at the same time, because P is not held fixed:
+                    # measured on the 1-D benchmark, s 4.4 -> 39.1 took
+                    # ||h||_P from 0.217 down to 0.0254 (as the theory says)
+                    # while ||H||_F went 0.93 UP to 1.09. Log the real one.
+                    hp = self.locality_tightness()
+                    if hp is not None:
+                        mlflow.log_metric("h_norm_P", hp[0], step=epoch)
+                        mlflow.log_metric("locality_tightness", hp[1], step=epoch)
                 if rho is not None:
                     mlflow.log_metric("rho", float(rho), step=epoch)
                 mlflow.log_metric("val_loss", val_loss, step=epoch)
@@ -1239,9 +1302,16 @@ class Trainer:
                 self.decay_regularization()
 
             # If ALL batches rolled back this epoch, reduce learning rate and regularization
-            if epoch_rollback_count >= len(self.train_loader):  # 100% of batches rolled back
+            # Denominator must be the steps actually taken this epoch, across
+            # BOTH passes. It used to be len(self.train_loader) -- the converging
+            # batches only -- while the numerator counts rollbacks from the
+            # diverging pass too. With 8 converging and 30 diverging batches that
+            # fired at 21% rolled back, not 100%, decaying the barrier weight
+            # every epoch until the reg-weight early stop killed the run.
+            n_steps = max(self.epoch_step_count, 1)
+            if epoch_rollback_count >= n_steps:
                 pbar.write(
-                    f"\n⚠ All batches rolled back ({epoch_rollback_count}/{len(self.train_loader)}), reducing LR and regularization"
+                    f"\n⚠ All batches rolled back ({epoch_rollback_count}/{n_steps}), reducing LR and regularization"
                 )
                 self.reduce_lr_on_rollback(
                     factor=self.optimizer.param_groups[0].get("lr_reduction_factor", 0.5)

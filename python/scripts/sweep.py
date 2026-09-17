@@ -186,6 +186,9 @@ def run_task(task_id: int, total: int, sweep_cfg: dict, device: str,
     run_id = None
     try:
         import mlflow
+
+        from sysid.config import allow_file_store
+        allow_file_store()
         if mlflow_cfg.get("tracking_uri"):
             mlflow.set_tracking_uri(mlflow_cfg["tracking_uri"])
         if mlflow_cfg.get("experiment_name"):
@@ -228,6 +231,9 @@ def run_task(task_id: int, total: int, sweep_cfg: dict, device: str,
         run_id = run_id_file.read_text().strip()
         try:
             import mlflow
+
+            from sysid.config import allow_file_store
+            allow_file_store()
             if mlflow_cfg.get("tracking_uri"):
                 mlflow.set_tracking_uri(mlflow_cfg["tracking_uri"])
             with mlflow.start_run(run_id=run_id):

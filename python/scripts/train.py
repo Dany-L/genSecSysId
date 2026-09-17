@@ -12,7 +12,7 @@ import mlflow
 import numpy as np
 import torch
 
-from sysid.config import Config
+from sysid.config import Config, allow_file_store
 from sysid.data import DataLoader, create_dataloaders
 from sysid.data.direct_loader import load_split_data
 from sysid.models import SimpleLure, create_model
@@ -389,6 +389,7 @@ def main():
 
     # Setup MLflow
     logger.info("Setting up MLflow...")
+    allow_file_store()
     if config.mlflow.tracking_uri:
         try:
             mlflow.set_tracking_uri(config.mlflow.tracking_uri)

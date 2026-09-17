@@ -4,6 +4,8 @@ still load, dropping the stale keys with a warning rather than raising."""
 
 import logging
 
+import pytest
+
 from sysid.config import Config
 
 
@@ -64,3 +66,64 @@ def test_clean_config_produces_no_unknown_field_warning(caplog):
     with caplog.at_level(logging.WARNING):
         Config.from_dict(cfg_dict)
     assert "Ignoring unknown config field" not in caplog.text
+
+
+def test_retired_sigma_keys_raise_instead_of_being_dropped():
+    """The sigma-constraint keys are gone; they must not load quietly.
+
+    The original bug was that ``solve_max_s_on_violation`` was silently ignored
+    while the feature was missing, so a config asking for the after-epoch MaxS
+    repair got no repair and no warning. The Lagrangian ``sigma(U) >= c``
+    mechanism that briefly replaced the MaxS trigger has now itself been rolled
+    back, and the same trap would reappear in a worse form: a config selecting
+    the dual-ascent arm would load cleanly and quietly train under the MaxS
+    trigger's default ("never"), which reads as a null result rather than a
+    mistake.
+
+    So the retired keys are rejected outright, and the error names the
+    replacement.
+    """
+    for key, value in (
+        ("sigma_constraint", True),
+        ("sigma_target", "auto"),
+        ("sigma_dual_lr", 0.01),
+        ("sigma_protect_s", True),
+    ):
+        with pytest.raises(ValueError, match="removed field"):
+            Config.from_dict(_min_dict(training={key: value}))
+
+
+def test_the_retired_key_error_points_at_the_replacement():
+    """An error that only says 'removed' makes the reader go digging."""
+    with pytest.raises(ValueError, match="max_s_trigger"):
+        Config.from_dict(_min_dict(training={"sigma_constraint": True}))
+
+
+def test_an_archived_run_config_still_loads(caplog):
+    """The other half of the retired-key rule, and the one that is easy to get
+    wrong in the destructive direction.
+
+    ``resolve_run_artifacts`` reloads the ``config.yaml`` a finished run wrote
+    beside its checkpoint, and every consumer of a past run goes through it:
+    ``evaluate.py``, ``post_process.py``, ``compare.py``,
+    ``export_for_matlab.py``. The runs trained while the sigma constraint was in
+    place recorded those keys. Rejecting them would make every one of those runs
+    unevaluatable -- so an archived config warns and drops, while a config
+    someone is about to *train* with still raises.
+    """
+    cfg_dict = _min_dict(training={
+        "sigma_constraint": True, "sigma_target": "auto",
+        "sigma_dual_lr": 0.1, "sigma_protect_s": True, "max_epochs": 7,
+    })
+    with caplog.at_level(logging.WARNING):
+        cfg = Config.from_dict(cfg_dict, allow_removed=True)
+
+    assert cfg.training.max_epochs == 7
+    assert not hasattr(cfg.training, "sigma_constraint")
+    assert "Archived config carries removed field(s)" in caplog.text
+
+
+def test_the_tolerant_path_is_opt_in():
+    """Default strict, so a hand-written config cannot slip through."""
+    with pytest.raises(ValueError, match="removed field"):
+        Config.from_dict(_min_dict(training={"sigma_constraint": False}))
