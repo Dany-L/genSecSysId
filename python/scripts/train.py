@@ -474,13 +474,10 @@ def main():
                 "max_epochs": config.training.max_epochs,
                 "warmup_steps": config.training.warmup_steps,
                 "input_regularization_weight": config.training.input_regularization_weight,
-                "sigma_constraint": getattr(config.training, "sigma_constraint", False),
-                "sigma_target": getattr(config.training, "sigma_target", "auto"),
-                "sigma_dual_lr": getattr(config.training, "sigma_dual_lr", 0.01),
-                "sigma_dual_init": getattr(config.training, "sigma_dual_init", 1.0),
-                "sigma_dual_max": getattr(config.training, "sigma_dual_max", None),
-                "sigma_warm_start": getattr(config.training, "sigma_warm_start", True),
-                "sigma_protect_s": getattr(config.training, "sigma_protect_s", False),
+                "max_s_trigger": getattr(
+                    config.training, "max_s_trigger", "never"
+                ),
+                "max_s_every": getattr(config.training, "max_s_every", 1),
                 "freeze_alpha": bool(
                     (config.model.custom_params or {}).get("freeze_alpha", False)
                 ),
@@ -581,13 +578,8 @@ def main():
             log_gradients=getattr(config.training, "log_gradients", True),
             warmup_steps=config.training.warmup_steps,
             input_regularization_weight=getattr(config.training, "input_regularization_weight", 0.01),
-            sigma_constraint=getattr(config.training, "sigma_constraint", False),
-            sigma_target=getattr(config.training, "sigma_target", "auto"),
-            sigma_dual_lr=getattr(config.training, "sigma_dual_lr", 0.01),
-            sigma_dual_init=getattr(config.training, "sigma_dual_init", 1.0),
-            sigma_dual_max=getattr(config.training, "sigma_dual_max", None),
-            sigma_warm_start=getattr(config.training, "sigma_warm_start", True),
-            sigma_protect_s=getattr(config.training, "sigma_protect_s", False),
+            max_s_trigger=getattr(config.training, "max_s_trigger", "never"),
+            max_s_every=getattr(config.training, "max_s_every", 1),
             activity_regularization_weight=(
                 getattr(config.training, "activity_regularization_weight", 0.0)
                 if config.training.use_custom_regularization

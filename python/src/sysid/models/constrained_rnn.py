@@ -568,90 +568,32 @@ class SimpleLure(
         satisfies them again and write it back. Returns ``True`` on success;
         ``False`` when none exists, in which case the trainer rolls the step back.
 
-        Three attempts, cheapest and least destructive first:
+        Two attempts, cheapest first:
 
-        1. **fixed ``s``** — only (P, L, Λ) move. The smallest repair, and it
-           leaves the scale where the prediction loss, the barrier and the
-           Lagrangian term put it, which matters because ``s`` is *learned* here.
-        2. **``s`` pinned at the sigma floor** — only if (1) is infeasible and a
-           floor has been set by :meth:`set_sigma_floor`. See below.
-        3. **free ``s``** — the last resort. The ``ŝ = 1/s²`` substitution keeps
-           the problem convex, so this is still one solve. It overwrites the
-           learned scale, which is why it is the fallback and not the default.
-           **Skipped entirely when ``protect_s`` is set** (see
-           :meth:`set_sigma_floor`), in which case this returns ``False`` and the
-           trainer rolls the step back instead.
-
-        Why tiers 2 and 3 are qualified. The repair only has to restore
-        *feasibility*; which feasible point it picks is free, and a free-``s``
-        solve minimizes a conditioning objective that has no reason to respect
-        the admissible-input constraint ``sigma(U) >= c``. Measured on the 1-D
-        benchmark: a single tier-3 repair at epoch 8 reset ``s`` from 38.77 to
-        1.05 — a 37x collapse of the certified input set — which the dual
-        variable then spent 90 epochs climbing back from.
-
-        Rolling back instead is usually the better trade when the constraint is
-        active, because the infeasibility is typically **transient**: on that
-        same run, MaxS at the *final* theta certified ``s = 52.7``, well above
-        the 38.5 the repair discarded, so the iterate was passing through a
-        region its own endpoint had no trouble with. A rollback costs one batch;
-        freeing ``s`` costs the certified set and the epochs needed to rebuild
-        it. The risk it trades for is a rollback storm, which the trainer already
-        counts and reacts to (``epoch_rollback_count``, the all-rolled-back LR
-        decay) — so it is measurable rather than silent.
+        1. **fixed ``s``** — only (P, L, Λ) move. This is the smallest repair and
+           leaves the scale where the prediction loss and the barrier put it,
+           which matters because ``s`` is a *learned* parameter here.
+        2. **free ``s``** — only if (1) is infeasible. The ``ŝ = 1/s²``
+           substitution keeps the problem convex, so this is still one solve. It
+           overwrites the learned scale, which is why it is the fallback and not
+           the default.
         """
         s = float(self.s.cpu().detach().numpy())
         sol = self._synth().feasibility(s)
         self.last_repair_freed_s = False
         if sol is None:
-            floor = getattr(self, "_sigma_s_floor", None)
-            if floor is not None and abs(s) > float(floor):
-                sol = self._synth().feasibility(float(floor))
-                if sol is not None:
-                    logger.debug(
-                        f"Fixed-s repair infeasible at s={s:.4g}; repaired at the "
-                        f"sigma floor s={float(floor):.4g}"
-                    )
-        if sol is None and getattr(self, "_sigma_protect_s", False):
-            # Refuse to buy feasibility with the certified input set. The caller
-            # rolls the step back, which leaves ``s`` exactly where the dual
-            # variable put it.
-            logger.debug(
-                f"Repair infeasible at s={s:.4g} and protect_s is set; "
-                "refusing the free-s tier so the step is rolled back."
-            )
-            return False
-        if sol is None:
             sol = self._synth().feasibility(None)
             if sol is None:
                 return False
-            # Tier 3 moved ``s`` by SDP. With the MaxS trigger gone this is the
-            # only path by which an SDP still changes ``s`` during training, so
-            # it has to be counted or the dual variable is not the sole
-            # mechanism steering sigma(U) that it claims to be.
+            # Tier 2 moved ``s`` without any MaxS solve. This is the only path by
+            # which ``s`` changes under max_s_trigger="never", so it has to be
+            # counted or that arm is not the clean control it appears to be.
             self.last_repair_freed_s = True
             logger.debug(
                 f"Fixed-s repair infeasible at s={s:.4g}; repaired with s free -> {sol.s:.4g}"
             )
         self._apply_certificate_solution(sol)
         return True
-
-    def set_sigma_floor(
-        self, s_floor: Optional[float], protect_s: bool = False
-    ) -> None:
-        """Record the smallest ``s`` the ``sigma(U) >= c`` constraint accepts.
-
-        ``s_floor`` is consulted by :meth:`feasibility_problem` tier 2, to prefer
-        a repair that keeps the certified input set over one that discards it.
-        ``None`` clears it.
-
-        ``protect_s`` additionally forbids tier 3. A repair that would have to
-        move ``s`` is then refused outright, so the trainer rolls the step back
-        and ``s`` stays exactly where the dual variable put it — making the
-        multiplier the *only* thing that ever moves the scale during training.
-        """
-        self._sigma_s_floor = None if s_floor is None else float(s_floor)
-        self._sigma_protect_s = bool(protect_s)
 
     def set_input_bound(self, u_max_sq: Optional[float]) -> None:
         """Store the **input floor** ``u_max = sup_{k,i} u_kᵀu_k`` (NORMALIZED units,

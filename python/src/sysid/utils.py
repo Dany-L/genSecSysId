@@ -247,10 +247,113 @@ def get_volume_of_ellipsoid(P: np.ndarray, s: float) -> float:
     volume = (s**nx) * np.sqrt(np.linalg.det(P)) * (np.pi ** (nx / 2)) / math.gamma(nx / 2 + 1)
     return volume
 
+_LINESTYLE_TOKENS = ("--", "-.", ":", "-")
+
+
+def _fmt_to_line_kwargs(fmt: str) -> dict:
+    """Split a matplotlib format string such as ``"r--"`` into line keywords.
+
+    ``axvline``/``axhline`` take no format string, so the ``nx == 1`` branch of
+    :func:`plot_polytope` has to hand them ``color=`` / ``linestyle=`` instead.
+    Markers in the format string are ignored (a band has no data points).
+    """
+    kwargs = {}
+    rest = fmt or ""
+    for ls in _LINESTYLE_TOKENS:
+        if ls in rest:
+            kwargs["linestyle"] = ls
+            rest = rest.replace(ls, "", 1)
+            break
+    for ch in rest:
+        if ch in "bgrcmykw":
+            kwargs["color"] = ch
+            break
+    return kwargs
+
+
+def _check_orientation(orientation: str) -> None:
+    if orientation not in ("vertical", "horizontal"):
+        raise ValueError(
+            f"orientation must be 'vertical' or 'horizontal', got {orientation!r}."
+        )
+
+
+def _plot_band(
+    ax,
+    r: float,
+    fill: bool,
+    linetype: str,
+    name: str,
+    orientation: str,
+    facecolor,
+    edgecolor: str,
+) -> None:
+    """Draw the scalar region ``|x| <= r`` as a band or its two boundaries.
+
+    This is what both safe sets degenerate to when ``nx == 1``: the polytope
+    ``||H x||_inf <= 1`` and the ellipse ``(1/s^2) x^T X x <= 1`` are then both
+    intervals around the origin.
+    """
+    span = ax.axhspan if orientation == "horizontal" else ax.axvspan
+    line = ax.axhline if orientation == "horizontal" else ax.axvline
+
+    if fill:
+        span(
+            -r,
+            r,
+            facecolor=facecolor,
+            edgecolor=edgecolor,
+            linewidth=1.5,
+            label=name,
+            alpha=0.7,
+        )
+    else:
+        line_kwargs = _fmt_to_line_kwargs(linetype)
+        line(-r, label=name, linewidth=1.5, **line_kwargs)
+        line(r, linewidth=1.5, **line_kwargs)
+
+
 def plot_polytope(
-    ax, H: np.array, fill: bool = True, linetype: str = "r--", name: str = r"$\|Hx\|_\infty \leq 1$"
+    ax,
+    H: np.array,
+    fill: bool = True,
+    linetype: str = "r--",
+    name: str = r"$\|Hx\|_\infty \leq 1$",
+    orientation: str = "horizontal",
 ):
-    if H.shape[1] == 2:
+    """Draw the region ``{x : ||H x||_inf <= 1}`` onto ``ax``.
+
+    Args:
+        ax: Matplotlib axis to draw on.
+        H: Coupling matrix ``(m, nx)``. Only ``nx in (1, 2)`` can be drawn:
+            ``nx == 2`` gives a polygon, ``nx == 1`` degenerates to the interval
+            ``|x| <= 1 / max_i |h_i|``, drawn as a band / pair of lines.
+        fill: Fill the region (``True``) or only draw its boundary (``False``).
+        linetype: Matplotlib format string used for the boundary when
+            ``fill=False``.
+        name: Legend label.
+        orientation: ``nx == 1`` only. A scalar state is plotted against time
+            (see :func:`plot_state_trajectory`), so it sits on the y-axis and
+            the band is ``"horizontal"`` by default. Pass ``"vertical"`` when
+            the state is on the x-axis instead.
+    """
+    _check_orientation(orientation)
+
+    if H.shape[1] == 1:
+        # nx == 1: every row constraint |h_i x| <= 1 collapses into the single
+        # interval |x| <= 1 / max_i |h_i| -- a band, not a polygon.
+        h_max = float(np.max(np.abs(H))) if np.size(H) else 0.0
+        if h_max <= 1e-12:
+            logging.getLogger(__name__).warning(
+                "H is (numerically) zero, the region ||Hx||_infty <= 1 is unbounded."
+            )
+            return
+        _plot_band(
+            ax, 1.0 / h_max, fill, linetype, name, orientation,
+            facecolor=[0.8, 0.9, 1.0], edgecolor="r",
+        )
+
+    elif H.shape[1] == 2:
         try:
             # Each row of H defines constraints: -1 <= H_i @ x <= 1
             # This gives us 2*m linear inequalities defining a polytope
@@ -315,7 +418,7 @@ def plot_polytope(
             logging.getLogger(__name__).warning(f"Failed to plot ||Hx||_infty polytope: {e}")
     else:
         logging.getLogger(__name__).warning(
-            f"H has {H.shape[1]} columns, cannot plot in 2D (need 2 columns)."
+            f"H has {H.shape[1]} columns, cannot plot (need 1 or 2 columns)."
         )
 
 
@@ -326,11 +429,50 @@ def plot_ellipse(
     linetype: str = "b--",
     name: str = r"$\frac{1}{s^2} x^T X x \leq 1$",
     fill: bool = False,
+    orientation: str = "horizontal",
 ):
+    """Draw the ellipse ``{x : (1/s^2) x^T X x <= 1}`` onto ``ax``.
+
+    Args:
+        ax: Matplotlib axis to draw on.
+        X: Inverse Lyapunov matrix ``(nx, nx)``. Only ``nx in (1, 2)`` can be
+            drawn: ``nx == 2`` gives the ellipse, ``nx == 1`` degenerates to the
+            interval ``|x| <= s / sqrt(X)``, drawn as a band / pair of lines.
+        s: Sector bound.
+        linetype: Matplotlib format string used when ``fill=False``.
+        name: Legend label.
+        fill: Fill the region (``True``) or only draw its boundary (``False``).
+        orientation: ``nx == 1`` only, see :func:`plot_polytope`.
+    """
+    _check_orientation(orientation)
+
+    X = np.asarray(X)
+    s_val = float(np.ravel(s)[0])
+
+    if X.shape[0] == 1:
+        # nx == 1: (1/s^2) x X x <= 1 is the interval |x| <= s / sqrt(X).
+        x_val = float(np.ravel(X)[0])
+        if x_val <= 0.0:
+            logging.getLogger(__name__).warning(
+                f"X = {x_val} is not positive definite, cannot plot the ellipse."
+            )
+            return
+        _plot_band(
+            ax, s_val / np.sqrt(x_val), fill, linetype, name, orientation,
+            facecolor=[1.0, 0.8, 0.8], edgecolor="b",
+        )
+        return
+
+    if X.shape[0] != 2:
+        logging.getLogger(__name__).warning(
+            f"X is {X.shape[0]}x{X.shape[0]}, cannot plot (need 1 or 2 states)."
+        )
+        return
+
     theta = np.linspace(0, 2 * np.pi, 100)
     circle = np.array([np.cos(theta), np.sin(theta)])
     # map unit circle through ellipse transform
-    L = np.linalg.cholesky(1 / s**2 * X)
+    L = np.linalg.cholesky(1 / s_val**2 * X)
     X_half_inv = np.linalg.inv(L.T)
     ellipse = X_half_inv @ circle
 
@@ -346,6 +488,54 @@ def plot_ellipse(
         )
     else:
         ax.plot(ellipse[0, :], ellipse[1, :], linetype, linewidth=2, label=name)
+
+
+def plot_state_trajectory(
+    ax,
+    x: np.ndarray,
+    color: str = "C0",
+    marker: Optional[str] = None,
+    linewidth: float = 2.0,
+    alpha: float = 0.5,
+    markersize: float = 4.0,
+    label: Optional[str] = None,
+) -> None:
+    """Draw one state trajectory ``x`` of shape ``(T, nx)``.
+
+    ``nx == 2`` gives the usual phase plane (``x1`` on the x-axis, ``x2`` on the
+    y-axis). ``nx == 1`` has no phase plane, so the scalar state is drawn over
+    the time step ``k`` — which puts it on the y-axis, matching the default
+    ``orientation="horizontal"`` of :func:`plot_polytope` / :func:`plot_ellipse`
+    so the safe set overlays correctly in both cases.
+
+    Args:
+        ax: Matplotlib axis to draw on.
+        x: State trajectory ``(T, nx)`` (a single trajectory, no batch axis).
+        color: Line and marker color.
+        marker: Optional marker for the initial state (e.g. ``"o"`` / ``"x"``).
+        linewidth: Trajectory line width.
+        alpha: Trajectory line alpha (the start marker stays opaque).
+        markersize: Size of the initial-state marker.
+        label: Optional legend label for the trajectory.
+    """
+    x = np.asarray(x)
+    if x.ndim != 2:
+        raise ValueError(f"x must be (T, nx), got shape {x.shape}.")
+
+    nx = x.shape[1]
+    if nx == 2:
+        x_plot, y_plot = x[:, 0], x[:, 1]
+    elif nx == 1:
+        x_plot, y_plot = np.arange(x.shape[0]), x[:, 0]
+    else:
+        logging.getLogger(__name__).warning(
+            f"State has {nx} components, cannot plot (need 1 or 2)."
+        )
+        return
+
+    if marker is not None:
+        ax.plot(x_plot[0], y_plot[0], marker, color=color, markersize=markersize)
+    ax.plot(x_plot, y_plot, color=color, linewidth=linewidth, alpha=alpha, label=label)
 
 
 def _mask_nonfinite(arr: np.ndarray) -> np.ndarray:

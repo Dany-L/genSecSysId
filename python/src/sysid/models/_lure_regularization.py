@@ -276,31 +276,3 @@ class LureRegularizationMixin:
         if return_norm:
             return reg_loss, norm_H
         return reg_loss
-
-    def sigma_u_t(self) -> torch.Tensor:
-        """Differentiable ``sigma(U) = |s| sqrt(1 - alpha^2)`` — the size of the
-        admissible input set.
-
-        On the invariant set ``X`` we have ``V(x) <= s^2``, so the one-step input
-        condition ``||u||^2 <= s^2 - alpha^2 V(x)`` worst-cases to
-        ``||u||^2 <= s^2 (1 - alpha^2)``: ``sigma`` is the radius of the input
-        ball admissible from ANYWHERE in ``X``, as opposed to ``r(0) = s`` which
-        only holds at the operating point.
-
-        This is the tensor form, for the Lagrangian term of the ``sigma(U) >= c``
-        constraint. ``Trainer.sigma_u()`` is the detached float wrapper used for
-        logging. Both ``s`` and ``tau`` are live ``nn.Parameter``s, so the
-        gradient flows: ``d sigma / d|s| = sqrt(1 - alpha^2) > 0``, which pushes
-        ``|s|`` **up** — the counter-push that the log-det barrier lacks (its
-        locality term ``-logdet[[1/s^2, l], [l', P]]`` pushes ``s`` down).
-
-        ``|s|`` on purpose: nothing constrains the sign of ``s`` (the ``-log s``
-        barrier term was deliberately removed) and logged runs do reach ``s < 0``,
-        but every consumer uses only ``s**2``, so the sign is a parameterization
-        artifact and ``|s|`` is the quantity with the geometric meaning.
-
-        The ``clamp`` floor keeps the gradient finite at ``alpha -> 1``, where
-        ``sqrt`` would otherwise be evaluated at 0 and return NaN.
-        """
-        alpha = torch.sigmoid(self.tau)
-        return self.s.abs() * torch.sqrt(torch.clamp(1.0 - alpha ** 2, min=EPS ** 2))

@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 import yaml
 
@@ -32,20 +32,31 @@ def _known_fields(config_cls, section: str, values: Dict[str, Any]) -> Dict[str,
 
 # Keys removed by a feature replacement, mapped to what to do instead. These are
 # checked BEFORE _known_fields, which would otherwise drop them with only a
-# warning -- and a silently-ignored trigger key turns an archived config into a
+# warning -- and a silently-ignored mechanism key turns an archived config into a
 # no-op that looks like a null result rather than a mistake.
 _REMOVED_FIELDS: Dict[str, Dict[str, str]] = {
     "training": {
-        "max_s_trigger":
-            "the MaxS epoch-boundary trigger was replaced by the Lagrangian "
-            "constraint sigma(U) >= c; use training.sigma_constraint / "
-            "sigma_target / sigma_dual_lr instead",
-        "max_s_every":
-            "the MaxS cadence knob was removed with the trigger; the dual "
-            "update now runs every epoch (see training.sigma_dual_lr)",
-        "solve_max_s_on_violation":
-            "deprecated alias of the removed max_s_trigger; use "
-            "training.sigma_constraint instead",
+        "sigma_constraint":
+            "the Lagrangian constraint sigma(U) >= c was rolled back in favour "
+            "of the MaxS epoch-boundary trigger; use training.max_s_trigger "
+            "(never / on_violation / every_epoch) instead",
+        "sigma_target":
+            "removed with the sigma constraint; the MaxS solve carries the "
+            "input floor s >= sqrt(u_max) on its own, see training.max_s_trigger",
+        "sigma_dual_lr":
+            "removed with the sigma constraint; there is no dual variable, the "
+            "cadence knob is training.max_s_every",
+        "sigma_dual_init":
+            "removed with the sigma constraint; there is no dual variable",
+        "sigma_dual_max":
+            "removed with the sigma constraint; there is no dual variable",
+        "sigma_warm_start":
+            "removed with the sigma constraint; MaxS is solved in the "
+            "initialization and again at epoch boundaries per "
+            "training.max_s_trigger",
+        "sigma_protect_s":
+            "removed with the sigma constraint; the per-batch repair is back to "
+            "its two tiers (fixed s, then free s)",
     },
 }
 
@@ -314,101 +325,59 @@ class TrainingConfig:
     # Input constraint regularization weight
     input_regularization_weight: float = 0.01  # Weight for input constraint loss
 
-    # ------------------------------------------------------------------
-    # Constrained learning: the input-set-size constraint sigma(U) >= c.
-    #
-    # The training problem is
-    #     min  prediction error   s.t.  F < 0,  G_j > 0,  sigma(U) >= c
-    # with sigma(U) = |s| * sqrt(1 - alpha^2) the radius of the input ball
-    # admissible from ANYWHERE in the invariant set X (as opposed to r(0) = s,
-    # which only holds at the operating point). ``c`` is therefore the *worst
-    # allowed input*: the amplitude the certificate guarantees is admissible
-    # everywhere on X.
-    #
-    # The LMIs stay with the log-det interior-point barrier. This constraint
-    # instead gets the primal-dual treatment of Chamon & Ribeiro, "Probably
-    # Approximately Correct Constrained Learning" (NeurIPS 2020), Algorithm 1:
-    # a multiplier lambda >= 0 enters the loss as
-    #     L(theta, lambda) = pred + nu_1 * barrier + lambda * (c - sigma(U))
-    # and is itself maximized by projected dual ascent at the epoch boundary,
-    # lambda <- max(0, lambda + eta * (c - sigma(U))). Primal and dual run at
-    # different timescales (one dual step per epoch), as that paper's Sec. 5.2
-    # prescribes.
-    #
-    # Why a multiplier and not a fixed penalty or a barrier: a -log(sigma^2 - c^2)
-    # barrier is UNDEFINED while the constraint is violated, which is exactly the
-    # state at initialization; and a fixed weight has to be retuned per dataset
-    # and keeps distorting the fit after the constraint is met. lambda adapts on
-    # its own and decays back toward 0 once sigma(U) >= c.
-    #
-    # This REPLACES the old ``max_s_trigger`` mechanism, which set sigma only
-    # indirectly by firing a MaxS SDP at an epoch boundary. ``synthesizer.max_s``
-    # itself is untouched and still used for initialization and for verifying
-    # sigma at the final theta.
-    sigma_constraint: bool = False
+    # After each epoch, if the training data breaches the input condition
+    # (any c_k = ||u_k||^2 - s^2 + alpha^2 V(x_k) > 0), re-solve MaxS once so the
+    # certified set grows back over the data. Without it ``s`` only ever moves
+    # where the barrier pushes it — down — and once it falls below the input
+    # floor sqrt(u_max) every optimizer step lands infeasible, so the per-batch
+    # repair SDP fires on every batch and mostly fails into a rollback.
+    # The duffing-soft-7 runs had this on: run 936f56b9 (task 20) re-solved on
+    # 820 of 1500 epochs, s wandered 6.4..36.6 and settled at ~9.9 (the input
+    # floor is 9.7), with 0 rollbacks over the whole run.
+    solve_max_s_on_violation: Optional[bool] = None
 
-    # c, the worst allowed input. "auto" resolves to max_k ||u_k|| over the
-    # converging training split (Trainer.input_floor(), i.e. sqrt(u_max)), which
-    # is the literal reading of the constraint: every training input admissible
-    # from anywhere in X. A float sets it directly, which is what a sweep over
-    # the accuracy-vs-admissible-inputs trade-off wants.
+    # When MaxS is re-solved during training. This is the knob that decides the
+    # size of the admissible input set sigma(U) = |s| * sqrt(1 - alpha^2), because
+    # nothing else ever pushes ``s`` up: the log-det barrier only pushes it down.
     #
-    # NOTE this is strictly stronger than the centre-admissibility s >= max||u||
-    # that the old "on_violation" trigger targeted, by a factor
-    # 1/sqrt(1 - alpha^2) (~71x at alpha = 0.9999, ~7.1x at alpha = 0.99). Pick
-    # alpha with that in mind: sigma(U) is NOT monotone in alpha.
-    sigma_target: Union[float, str] = "auto"
-
-    # eta, the dual step size. The reference implementation of the paper uses
-    # 0.01 with a dual update once per epoch.
-    sigma_dual_lr: float = 0.01
-
-    # lambda^(0). The paper's Algorithm 1 initializes its multipliers at 1.
-    sigma_dual_init: float = 1.0
-
-    # Optional cap on lambda. None leaves it unbounded, in which case an
-    # unreachable c shows up as lambda growing without bound -- which is the
-    # honest diagnostic (the constraint is infeasible at this theta), not a
-    # tuning failure. Set a cap to trade that signal for a bounded run.
-    sigma_dual_max: Optional[float] = None
-
-    # Solve MaxS once before training so ``s`` starts at the largest value
-    # certifiable for the initial theta. ``s`` is otherwise initialized to a
-    # hardcoded 1.0 (the init's own MaxS solve only fires on an infeasible
-    # draw), and Adam is scale invariant -- lambda sets the balance point the
-    # primal converges to, not the speed -- so a start far below the target
-    # costs thousands of epochs of transient before the mechanism is visible.
-    # This is one solve at t=0, not the epoch-boundary repair loop that was
-    # removed. Turn it off to see the dual walk s up from scratch.
-    sigma_warm_start: bool = True
-
-    # When a gradient step breaks the LMIs, the per-batch repair solves for a
-    # certificate that satisfies them again. Its last-resort tier frees ``s``,
-    # and the SDP then picks a scale by a conditioning objective that knows
-    # nothing about sigma(U) >= c -- measured once on the 1-D benchmark, that
-    # single solve cut ``s`` from 38.77 to 1.05 and cost 90 epochs of dual
-    # ascent to rebuild.
+    #   "never"        -- MaxS runs only in the initialization. ``s`` then decays
+    #                     under the barrier for the whole run. The LMIs stay
+    #                     satisfied (the per-batch repair enforces them), so the
+    #                     certificate remains mathematically VALID, but sigma -> 0
+    #                     and the certified region collapses: Theorem 1's input
+    #                     hypothesis fails on the very data the model was fit to,
+    #                     so the guarantee is vacuous. The negative control that
+    #                     shows the epoch-boundary solve is load-bearing.
+    #   "on_violation" -- solve at an epoch boundary only when the training data
+    #                     breaches c_k <= 0. ``s`` then tracks the data: it settles
+    #                     near the input floor max_k||u_k||, giving a genuinely
+    #                     regional certificate matched to the training set. Note
+    #                     this targets CENTRE-admissibility (s >= max||u||), which
+    #                     is weaker than sigma >= max||u|| (admissible everywhere
+    #                     on X).
+    #   "every_epoch"  -- solve unconditionally every ``max_s_every`` epochs. ``s``
+    #                     is driven to the MaxS ceiling, which is set by the solver
+    #                     epsilon (locality LMI >= eps*I forces 1/s^2 >= eps, so
+    #                     s <= 1/sqrt(eps) = 1e3 at EPS=1e-6), NOT by the data or
+    #                     the model. Since ||h^i||_P <= 1/s, this drives H = L P^-1
+    #                     to zero: the global sector condition. All inputs
+    #                     admissible, at the price of a near-linear model.
     #
-    # True refuses that tier: the step is rolled back instead, so ``s`` only
-    # ever moves by gradient and the multiplier. Sound when the target is
-    # REACHABLE, because the infeasibility is then usually transient -- measured
-    # on the 1-D benchmark, True held sigma >= c on 97% of epochs at s = 39.1
-    # for 42 rollbacks (1.8% of batches), against 4% of epochs at s = 4.6 with
-    # False.
+    # ``solve_max_s_on_violation`` is the deprecated boolean spelling: True maps to
+    # "on_violation", False to "never". Kept because unknown YAML keys are dropped
+    # SILENTLY, so removing it would turn every existing config into a no-op that
+    # looks like a null result.
     #
-    # DEFAULT OFF, because when the target is NOT reachable this converts "the
-    # constraint cannot be met" into "training cannot proceed": every repair is
-    # refused, every batch rolls back, and the run stalls with the parameters
-    # exactly where they started -- losing the model as well as the constraint.
-    # Measured on the sanity gate, whose auto target needs s >= 71*u_bar at
-    # alpha = 0.9999: best val_loss == start val_loss, zero progress.
-    #
-    # So turn it on only when the warm-start line in the log reports the
-    # boundary as certifiable at the initial theta; it warns when you have not.
-    # Watch ``rollback_count`` either way.
-    #
-    # Only consulted when sigma_constraint is on.
-    sigma_protect_s: bool = False
+    # The default is "never" only to preserve the old ``solve_max_s_on_violation:
+    # False`` default exactly: a config that omits the key must behave as it always
+    # did, rather than silently gaining an SDP solve that moves ``s``. For new work
+    # "on_violation" is the recommended setting -- set it explicitly.
+    max_s_trigger: str = "never"
+
+    # Cadence for max_s_trigger="every_epoch": solve every k-th epoch. k=1 is every
+    # epoch; larger k interpolates toward "never" and gives a near-continuous axis
+    # for the sigma(U) trade-off. Ignored by the other triggers.
+    max_s_every: int = 1
 
     # Dead-zone activity regularization. Penalizes relu(activity_target - mean||w||)
     # on the rollout so the dead-zone nonlinearity fires, preventing the degenerate
@@ -442,35 +411,43 @@ class TrainingConfig:
     # Device
     device: str = "cuda"  # "cuda", "cpu", "mps"
 
-    def __post_init__(self):
-        """Validate the dual-ascent hyperparameters.
+    MAX_S_TRIGGERS: ClassVar[Tuple[str, ...]] = ("never", "on_violation", "every_epoch")
 
-        A typo here must raise rather than silently select a different arm:
-        unknown YAML keys are only *warned* about (see ``_known_fields``), so
-        validation is the last line of defence.
+    def __post_init__(self):
+        """Resolve the deprecated ``solve_max_s_on_violation`` alias and validate.
+
+        The alias is only honoured when ``max_s_trigger`` was left at its default,
+        so a config that sets both explicitly gets the new key (and a warning).
         """
-        if isinstance(self.sigma_target, str):
-            if self.sigma_target != "auto":
-                raise ValueError(
-                    "training.sigma_target must be a number or \"auto\", got "
-                    f"{self.sigma_target!r}."
+        if self.solve_max_s_on_violation is not None:
+            implied = "on_violation" if self.solve_max_s_on_violation else "never"
+            # A dataclass cannot tell "left at the default" from "explicitly set to
+            # the default value", so the alias is applied only when max_s_trigger
+            # still holds the default "never". The single ambiguous case --- an
+            # explicit max_s_trigger: never together with
+            # solve_max_s_on_violation: true --- is a self-contradictory config,
+            # and resolving it in favour of the new key is the safe choice.
+            if self.max_s_trigger != "never":
+                logger.warning(
+                    "Both 'solve_max_s_on_violation' (%s -> %r) and 'max_s_trigger' "
+                    "(%r) are set; using max_s_trigger and ignoring the deprecated "
+                    "alias.", self.solve_max_s_on_violation, implied, self.max_s_trigger,
                 )
-        elif not isinstance(self.sigma_target, bool) and float(self.sigma_target) < 0.0:
+            elif implied != self.max_s_trigger:
+                logger.warning(
+                    "'solve_max_s_on_violation' is deprecated; use "
+                    "max_s_trigger: %r instead.", implied,
+                )
+                self.max_s_trigger = implied
+
+        if self.max_s_trigger not in self.MAX_S_TRIGGERS:
             raise ValueError(
-                f"training.sigma_target must be >= 0, got {self.sigma_target}."
+                f"training.max_s_trigger must be one of {self.MAX_S_TRIGGERS}, "
+                f"got {self.max_s_trigger!r}."
             )
-        if self.sigma_dual_lr <= 0.0:
+        if self.max_s_every < 1:
             raise ValueError(
-                f"training.sigma_dual_lr must be > 0, got {self.sigma_dual_lr}."
-            )
-        if self.sigma_dual_init < 0.0:
-            raise ValueError(
-                "training.sigma_dual_init must be >= 0 (lambda is a multiplier on "
-                f"an inequality constraint), got {self.sigma_dual_init}."
-            )
-        if self.sigma_dual_max is not None and self.sigma_dual_max <= 0.0:
-            raise ValueError(
-                f"training.sigma_dual_max must be > 0 or None, got {self.sigma_dual_max}."
+                f"training.max_s_every must be >= 1, got {self.max_s_every}."
             )
 
 
@@ -606,9 +583,9 @@ class Config:
             optimizer_dict["learning_rate"] = training_dict.pop("learning_rate")
         if "optimizer" in training_dict and "optimizer_type" not in optimizer_dict:
             optimizer_dict["optimizer_type"] = training_dict.pop("optimizer")
-        
-        _reject_removed_fields("training", training_dict, allow_removed)
 
+        _reject_removed_fields("training", training_dict, allow_removed)
+        
         # Handle training config with field name mappings
         if "epochs" in training_dict:
             training_dict["max_epochs"] = training_dict.pop("epochs")
@@ -842,8 +819,8 @@ def allow_file_store() -> None:
     ``MLFLOW_ALLOW_FILE_STORE`` is set: the file store is in maintenance mode
     and the project is pushed toward a database backend. Every run this project
     has ever produced lives in that file store, and several tools read it
-    directly (``scripts/plot_sigma_tradeoff.py``, and the run listings under
-    ``reporting/``), so the opt-out keeps the existing history usable.
+    directly (the run listings under ``reporting/``), so the opt-out keeps the
+    existing history usable.
 
     ``setdefault``, never an unconditional set: an explicit
     ``MLFLOW_ALLOW_FILE_STORE=false`` in the environment stays honoured, so this

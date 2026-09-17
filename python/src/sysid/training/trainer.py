@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 import matplotlib.pyplot as plt
 import mlflow
@@ -46,13 +46,8 @@ class Trainer:
         log_gradients: bool = True,
         warmup_steps: int = 0,
         input_regularization_weight: float = 0.01,
-        sigma_constraint: bool = False,
-        sigma_target: Union[float, str] = "auto",
-        sigma_dual_lr: float = 0.01,
-        sigma_dual_init: float = 1.0,
-        sigma_dual_max: Optional[float] = None,
-        sigma_warm_start: bool = True,
-        sigma_protect_s: bool = False,
+        max_s_trigger: str = "never",
+        max_s_every: int = 1,
         activity_regularization_weight: float = 0.0,
         activity_target: float = 0.0,
         h_regularization_weight: float = 0.0,
@@ -114,26 +109,20 @@ class Trainer:
         self.warmup_steps = warmup_steps  # Number of steps to skip before computing loss
         self.input_regularization_weight = input_regularization_weight  # Weight for input constraint regularization
         self.initial_input_regularization_weight = input_regularization_weight  # Store initial value
-        # Constrained learning on the input-set size: sigma(U) >= c, enforced by
-        # a Lagrange multiplier under projected dual ascent rather than by an
-        # epoch-boundary MaxS solve. See _dual_ascent_step and TrainingConfig.
-        self.sigma_constraint = sigma_constraint
-        self.sigma_target_spec = sigma_target
-        self.sigma_dual_lr = sigma_dual_lr
-        self.sigma_dual_max = sigma_dual_max
-        self.sigma_warm_start = sigma_warm_start
-        self.sigma_protect_s = sigma_protect_s
-        # lambda^(0) = 1 follows Chamon & Ribeiro, Algorithm 1. Held as a plain
-        # float, NOT an nn.Parameter: train.py hands the optimizer a bare
-        # model.parameters(), so a parameter would be swept into the primal Adam
-        # and DESCENDED -- the exact opposite of the dual ascent we want.
-        self.dual_lambda = float(sigma_dual_init) if sigma_constraint else 0.0
-        # Resolved lazily in _resolve_sigma_target once the input floor is known.
-        self.sigma_target: Optional[float] = None
-        # How often the per-batch repair had to free ``s`` (tier 2) -- the only
-        # remaining way an SDP can move ``s`` during training, so it has to be
-        # reported or the dual variable is not the sole mechanism it claims to be.
+        # Re-solve MaxS after an epoch whose training data breached the input
+        # condition — see _maybe_maximize_s and TrainingConfig.
+        self.max_s_trigger = max_s_trigger
+        self.max_s_every = max_s_every
+        # How often the epoch-boundary MaxS actually fired, and how often the
+        # per-batch repair had to free ``s`` (tier 2). The second one matters for
+        # the "never" arm: it is the only remaining way ``s`` can be moved by an
+        # SDP there, so without it "never" is not the clean control it looks like.
+        self.max_s_solve_count = 0
         self.free_s_repair_count = 0
+        # Solves that fired and left the training data still inadmissible. A
+        # nonzero count means the trigger is spending SDPs without buying the
+        # thing it is triggered on, so it is reported, not swallowed.
+        self.max_s_unrepaired_count = 0
         # Dead-zone activity regularization: pushes mean ||w|| up to activity_target
         # so the nonlinearity fires, preventing the degenerate linear collapse
         # (w == 0 -> pure LTI rollout). NOTE: it does not by itself force a
@@ -501,7 +490,8 @@ class Trainer:
         * **``h_norm_P``** is the quantity the theory calls ``H``. It is what
           goes to zero as ``s`` grows, and ``H = 0`` *is* the global sector
           condition -- a globally absolutely stable, typically near-linear
-          model. This is the mediator for the sigma trade-off.
+          model. This is the mediator for the sigma trade-off, i.e. the price
+          the ``every_epoch`` MaxS arm pays for its large admissible input set.
         * **``locality_tightness`` = ``||h||_P * |s|``** normalizes it against
           its own bound, so it lives in ``[0, 1]`` regardless of scale: ``1``
           means the locality LMI is tight and the certificate is riding the
@@ -531,11 +521,12 @@ class Trainer:
         currently certified set no longer admits the training inputs. One no-grad
         pass over the whole loader, so it is decoupled from the mini-batching.
 
-        Purely diagnostic now: it is the response variable that says whether a
-        certificate is vacuous (a positive margin means the training data
-        falls outside the certified input set), but it no longer decides
-        anything -- the dual variable on ``sigma(U) >= c`` does. Only paid
-        for on a tracked run; see the call site in :meth:`train`.
+        Called in *every* trigger arm on a tracked run, not only in
+        ``on_violation``: it is the response variable that says whether a
+        certificate is vacuous, and running it in all arms equalises per-epoch cost
+        so a wall-clock comparison is not confounded. See the call site in
+        :meth:`train` for when it is skipped. :meth:`_maybe_maximize_s` calls it a
+        second time after a solve, to check the repair actually landed.
         """
         c_max = float("-inf")
         self.model.eval()
@@ -570,232 +561,119 @@ class Trainer:
             return None
         return float(np.sqrt(u))
 
-    def _resolve_sigma_target(self) -> Optional[float]:
-        """Resolve ``c``, the worst allowed input, once per run.
+    def _maybe_maximize_s(self, epoch: int, c_max: float) -> Optional[float]:
+        """Re-solve MaxS at an epoch boundary, per ``max_s_trigger``. Returns the new
+        ``s``, or ``None`` if nothing was solved.
 
-        ``"auto"`` means ``max_k ||u_k||`` over the converging training split,
-        which is :meth:`input_floor` (``sqrt(u_max)``) -- the literal reading of
-        ``sigma(U) >= c``: every training input admissible from anywhere in
-        ``X``. A float is used as given.
+        This is the knob that sets the size of the admissible input set
+        ``sigma(U) = |s| sqrt(1 - alpha^2)``, because nothing else pushes ``s`` up:
+        ``s`` is learnable and the log-det barrier only ever pushes it DOWN.
 
-        Returns ``None`` when the constraint is off or ``"auto"`` cannot be
-        resolved (no input floor recorded), in which case the Lagrangian term is
-        skipped entirely rather than silently defaulting to some number.
-        """
-        if not self.sigma_constraint:
-            return None
-        if self.sigma_target is not None:
-            return self.sigma_target
-        self._warn_sigma_constraint_inert()
-        if isinstance(self.sigma_target_spec, str):
-            floor = self.input_floor()
-            if floor is None:
-                logging.warning(
-                    "training.sigma_target is 'auto' but no input floor was "
-                    "recorded, so sigma(U) >= c cannot be resolved; the "
-                    "constraint is INACTIVE for this run."
-                )
-                return None
-            self.sigma_target = float(floor)
-            logging.info(
-                f"sigma(U) >= c with c = max_k||u_k|| = {self.sigma_target:.6g} "
-                "(auto, from the converging training inputs)"
-            )
-        else:
-            self.sigma_target = float(self.sigma_target_spec)
-            logging.info(f"sigma(U) >= c with c = {self.sigma_target:.6g} (explicit)")
-        # Tell the per-batch repair what scale the constraint needs, so a repair
-        # prefers a certificate that keeps the certified input set over one that
-        # discards it. See SimpleLure.feasibility_problem tier 2.
-        if isinstance(self.model, SimpleLure) and hasattr(self.model, "set_sigma_floor"):
-            alpha = float(torch.sigmoid(self.model.tau))
-            denom = float(np.sqrt(max(1.0 - alpha ** 2, 1e-12)))
-            self.model.set_sigma_floor(
-                self.sigma_target / denom, protect_s=self.sigma_protect_s
-            )
-        return self.sigma_target
+        * ``"never"``        — return immediately. ``s`` decays for the whole run.
+          The per-batch repair keeps the LMIs satisfied, so the certificate stays
+          mathematically valid, but ``sigma -> 0`` and Theorem 1's input hypothesis
+          fails on the training data itself: a valid, vacuous certificate.
+        * ``"on_violation"`` — solve only when ``c_max > 0``. ``s`` then tracks the
+          data and settles near the input floor ``sqrt(u_max)``. Measured on
+          cf9cb54: 820 of 1500 epochs, ``s`` settled at ~9.9 against a floor of
+          9.7, zero rollbacks.
+        * ``"every_epoch"``  — solve every ``max_s_every`` epochs regardless.
+          ``s`` is driven to the MaxS ceiling, which is set by the solver epsilon
+          (``EPS=1e-6`` => ``s <= 1e3``), not by the data. Since
+          ``||h^i||_P <= 1/s`` this drives ``H = L P^-1`` toward the global sector
+          condition.
 
-    def _warn_sigma_constraint_inert(self) -> None:
-        """Say so, loudly, when ``sigma_constraint`` cannot actually do anything.
+        The margin only decides *whether* to solve; it cannot enter the SDP, which
+        is data-blind. So a triggered solve is not assumed to have repaired
+        anything — it is made to, and then checked:
 
-        Two configurations make it structurally inert while still logging a
-        ``dual_lambda`` that climbs, which reads exactly like a constraint that
-        is being enforced:
+        * **enforced** — the solve carries the input floor ``s >= sqrt(u_max)``
+          (:meth:`input_floor`), necessary for the input condition whatever ``P``
+          and ``alpha`` are. A theta whose LMIs cannot reach the floor now returns
+          no solution instead of a certificate that cannot admit its own data.
+        * **verified** — the floor is not sufficient (the condition also needs
+          ``alpha^2 V(x_k) <= s^2 - ||u_k||^2`` along the rollout, and MaxS moves
+          ``P`` as well as ``s``), so the margin is re-scanned on the data after
+          the solution is applied. A solve that leaves ``c_max > 0`` warns and is
+          counted in ``max_s_unrepaired_count``; the enlarged certificate is still
+          kept, since it is feasible and no worse in ``s``, but it is not reported
+          as a repair.
 
-        * **``learn_L: false``** -- ``s`` and ``tau`` are then created with
-          ``requires_grad=False`` (``constrained_rnn.__init__``), so the
-          Lagrangian term is a *constant*. lambda rises forever and sigma never
-          moves. Measured on an 8-epoch Duffing run: ``s`` pinned at its initial
-          1.0, sigma 0.0894 against c = 0.15, lambda climbing past 1.005.
-        * **``use_custom_regularization: false``** -- the LMI barrier and the
-          per-batch feasibility repair are both gated on
-          ``regularization_weight > 0``, so no certificate is enforced at all.
-          ``sigma`` is only a meaningful number when the LMIs hold, so reporting
-          it here describes nothing.
-
-        Warn rather than raise: both are legitimate model classes on their own
-        (the global-sector and no-certificate arms), and it is only the
-        *combination* with the constraint that is meaningless.
+        No-op for non-SimpleLure models, and while the barrier is off
+        (``regularization_weight == 0``) or ``L`` is fixed — there is no regional
+        certificate to enlarge in either case.
         """
         if not isinstance(self.model, SimpleLure):
-            return
-        if not getattr(self.model, "learn_L", True):
-            logging.warning(
-                "sigma_constraint is ON but learn_L is false, which freezes s "
-                "(requires_grad=False). The Lagrangian term is a constant: "
-                "sigma(U) cannot move and lambda will grow without bound while "
-                "reporting a constraint that is not being enforced. Set "
-                "learn_L: true, or turn sigma_constraint off for this arm."
-            )
-        if self.regularization_weight <= 0:
-            logging.warning(
-                "sigma_constraint is ON but use_custom_regularization is false, "
-                "so the LMI barrier and the per-batch repair are both disabled "
-                "and no certificate is enforced. sigma(U) is only meaningful "
-                "when the LMIs hold, so the reported value certifies nothing."
-            )
-
-    def sigma_lagrangian_term(self) -> Optional[torch.Tensor]:
-        """The Lagrangian term ``lambda * (c - sigma(U))``, or ``None`` when off.
-
-        Differentiable in ``s`` and ``tau`` through
-        :meth:`SimpleLure.sigma_u_t`. Since ``lambda >= 0`` and ``c`` is a
-        constant this is ``-lambda * sigma(U)`` up to a constant, so its gradient
-        pushes ``|s|`` **up** -- the counter-push the log-det barrier lacks. The
-        balance is finite because the locality block
-        ``[[1/s^2, l], [l', P]]`` loses definiteness as ``s -> infinity``, and
-        the barrier blows up there.
-        """
-        c = self._resolve_sigma_target()
-        if c is None or not isinstance(self.model, SimpleLure):
             return None
-        return self.dual_lambda * (c - self.model.sigma_u_t())
 
-    def _sigma_warm_start(self) -> Optional[float]:
-        """Put ``s`` on the constraint boundary before training starts.
-
-        Why this is needed rather than nice-to-have. ``s`` is initialized to a
-        hardcoded 1.0 and the init's MaxS solve only fires when the identity
-        draw comes out infeasible (``_lure_initialization.initialize_parameters``),
-        so a feasible draw starts at an arbitrary scale. The dual variable can
-        still walk ``s`` to where the constraint wants it, but **Adam is scale
-        invariant**: lambda sets the *balance point* the primal converges to, not
-        the *speed* it gets there, which is set by the learning rate. Starting
-        two orders of magnitude below the target costs thousands of epochs of
-        pure transient before the mechanism is even observable.
-
-        The target is ``s = c / sqrt(1 - alpha^2)``, the boundary itself -- NOT
-        the largest certifiable ``s``. MaxS would answer ``1/sqrt(EPS) = 1e3``,
-        a solver constant, and since ``||h^i||_P <= 1/s`` that drives ``H = L
-        P^-1`` to zero: the global sector condition, a near-linear model, and a
-        constraint so slack that the dual variable has nothing to do. Landing
-        exactly on the boundary keeps as much locality as the certificate allows
-        and leaves the multiplier something to defend.
-
-        ``feasibility(s)`` pins the scale and moves only (P, L, M), which is
-        sound in the direction we need it: ``s`` appears in the LMIs only as
-        ``1/s^2`` in the locality block, so *lowering* ``s`` from any feasible
-        point only makes that block more positive definite.
-
-        This is not the MaxS trigger coming back: one solve at t=0, not a repair
-        loop at every epoch boundary, and it never looks at the data.
-        """
-        if not self.sigma_constraint or not self.sigma_warm_start:
+        if not self.model.learn_L or self.regularization_weight == 0.0:
             return None
-        if not isinstance(self.model, SimpleLure) or not self.model.learn_L:
+
+        if self.max_s_trigger == "never":
             return None
-        c = self._resolve_sigma_target()
-        if c is None:
-            return None
-        alpha = float(torch.sigmoid(self.model.tau))
-        s_needed = c / float(np.sqrt(max(1.0 - alpha ** 2, 1e-12)))
-        if abs(float(self.model.s)) >= s_needed:
-            logging.info(
-                f"sigma warm start: s = {float(self.model.s):.4g} already meets "
-                f"the boundary {s_needed:.4g}; leaving it."
-            )
-            return None
+        if self.max_s_trigger == "on_violation":
+            if c_max <= 0:
+                return None
+        elif self.max_s_trigger == "every_epoch":
+            if epoch % self.max_s_every != 0:
+                return None
+        else:  # unreachable: TrainingConfig validates the value
+            raise ValueError(f"unknown max_s_trigger {self.max_s_trigger!r}")
+
+        s_floor = self.input_floor()
+        self.model.eval()
         try:
-            sol = self.model._synth().feasibility(s_needed)
+            # s >= sqrt(u_max) is necessary for the input condition, so the solve
+            # enforces it instead of returning a certificate that provably cannot
+            # admit the training inputs. Infeasible under the floor is reported by
+            # max_s as such and arrives here as sol is None.
+            sol = self.model._synth().max_s(s_min=s_floor)
             if sol is None:
-                # The boundary is not certifiable at this theta. Fall back to the
-                # best available scale so training at least starts somewhere
-                # sensible, and say so -- lambda growing without bound from here
-                # is the constraint being infeasible, not a tuning failure.
-                sol = self.model._synth().max_s(s_min=self.input_floor())
-                if sol is None:
-                    logging.warning(
-                        "sigma warm start: no feasible certificate at the initial "
-                        "theta at all; leaving s as initialized."
-                    )
-                    return None
-                self.model._apply_certificate_solution(sol)
                 logging.warning(
-                    f"sigma(U) >= c is NOT reachable at the initial theta: the "
-                    f"boundary needs s = {s_needed:.4g}, the largest certifiable "
-                    f"is {float(self.model.s):.4g} (sigma = {self.sigma_u():.4g} "
-                    f"< c = {c:.4g}). Training must move theta to satisfy it."
+                    f"Epoch {epoch}: MaxS triggered ({self.max_s_trigger}, "
+                    f"max c={c_max:.6f}) but the SDP failed"
+                    + (f" (input floor s >= {s_floor:.6f})" if s_floor is not None else "")
+                    + "; leaving s unchanged."
                 )
-                if self.sigma_protect_s:
-                    logging.warning(
-                        "sigma_protect_s is ON against an unreachable target. "
-                        "Every repair will be refused and every batch rolled "
-                        "back, so training will STALL with the parameters where "
-                        "they started. Either lower sigma_target, lower alpha "
-                        "(sigma is not monotone in it), or set "
-                        "sigma_protect_s: false."
-                    )
-                return float(self.model.s)
-        except Exception as exc:  # solver problems must not kill the run
-            logging.warning(f"sigma warm start: solve raised ({exc}); skipping.")
-            return None
-        self.model._apply_certificate_solution(sol)
+                return None
+
+            s_before = float(self.model.s)
+            self.model._apply_certificate_solution(sol)
+            new_s = float(self.model.s)
+            self.max_s_solve_count += 1
+        finally:
+            self.model.train()
+
+        # Verify, do not assume. The floor the SDP enforces is necessary but not
+        # sufficient: the input condition also needs alpha^2 x_k^T P^-1 x_k <=
+        # s^2 - ||u_k||^2 along the rollout, and MaxS moves P as well as s, so
+        # whether the data is admissible under the NEW certificate is a question
+        # only the data can answer. One extra no-grad pass, paid on the epochs
+        # that actually solved (an SDP costs far more than a rollout), so no arm
+        # pays for a repair it did not attempt.
+        c_after = self.input_margin()
+        repaired = c_after <= 0
+        if not repaired:
+            self.max_s_unrepaired_count += 1
+
         logging.info(
-            f"sigma warm start: s = {float(self.model.s):.4g} on the constraint "
-            f"boundary (sigma = {self.sigma_u():.4g} vs c = {c:.4g}), "
-            f"||H|| = {float(torch.linalg.norm(self.model.L @ torch.linalg.inv(self.model.P))):.4g}"
+            f"Epoch {epoch}: MaxS ({self.max_s_trigger}, max c={c_max:.6f}), "
+            f"s {s_before:.6f} -> {new_s:.6f}, sigma -> {self.sigma_u():.6f}, "
+            f"max c -> {c_after:.6f}"
         )
-        return float(self.model.s)
-
-    def _dual_ascent_step(self, epoch: int = 0) -> Optional[float]:
-        """Projected dual ascent on the multiplier, once per epoch.
-
-        Chamon & Ribeiro, "Probably Approximately Correct Constrained Learning"
-        (NeurIPS 2020), Algorithm 1 step 4::
-
-            lambda <- max(0, lambda + eta * (c - sigma(U)))
-
-        The projection onto ``lambda >= 0`` is what makes this a constraint and
-        not a bonus: once ``sigma(U) >= c`` the slack is negative, ``lambda``
-        decays back toward zero, and a satisfied constraint stops distorting the
-        fit. That is the whole reason for a multiplier over a fixed penalty
-        weight.
-
-        Sec. 5.2 of that paper runs primal and dual at *different timescales* --
-        one dual step per epoch against a full epoch of primal SGD -- which is
-        why this is called from :meth:`train` and not from :meth:`train_epoch`.
-
-        Unlike the paper's setting the dual gradient here is **exact, not
-        stochastic**: ``sigma(U)`` depends only on ``(s, tau)``, never on the
-        data, so there is no sampling noise to average out.
-
-        Returns the constraint slack ``c - sigma(U)``, or ``None`` when off.
-        """
-        c = self._resolve_sigma_target()
-        if c is None:
-            return None
-        sigma = self.sigma_u()
-        if sigma is None:
-            return None
-        slack = c - sigma
-        self.dual_lambda = max(0.0, self.dual_lambda + self.sigma_dual_lr * slack)
-        if self.sigma_dual_max is not None:
-            self.dual_lambda = min(self.dual_lambda, self.sigma_dual_max)
-        logging.debug(
-            f"Epoch {epoch}: sigma={sigma:.6g}, c={c:.6g}, slack={slack:+.6g}, "
-            f"lambda={self.dual_lambda:.6g}"
-        )
-        return slack
+        if not repaired:
+            logging.warning(
+                f"Epoch {epoch}: MaxS solved but the training inputs are STILL "
+                f"inadmissible (max c={c_after:.6f} > 0): the enlarged certificate "
+                "does not cover the training rollout, so the certificate remains "
+                "vacuous on this data."
+            )
+        if self.mlflow_tracking:
+            mlflow.log_metric("max_s_solved", 1, step=epoch)
+            mlflow.log_metric("max_s_value", new_s, step=epoch)
+            mlflow.log_metric("input_margin_after_max_s", c_after, step=epoch)
+            mlflow.log_metric("max_s_repaired", int(repaired), step=epoch)
+        return new_s
 
     def reduce_lr_on_rollback(self, factor: float = 0.5):
         """
@@ -844,6 +722,11 @@ class Trainer:
             # NO warmup slicing — diverging trajectories often die before
             # warmup_steps would expire, and they share x0 with the model
             # so there is no transient to discard.
+            # try to focus on the last few steps of the diverging trajectories
+            # N = 100
+            # if e_hat.shape[1] > N:
+            #     e_hat = e_hat[:, -N:, :]
+            #     e = e[:, -N:, :]
             pred_loss_div = self.loss_fn(e_hat, e)
 
             if self.regularization_weight > 0:
@@ -853,16 +736,7 @@ class Trainer:
                 loss = pred_loss_div + self.regularization_weight * reg_feasibility_loss
             else:
                 loss = pred_loss_div
-
-            # Lagrangian term for sigma(U) >= c, ADDED OUTSIDE the barrier-weight
-            # gate on purpose: the input-set constraint has to survive
-            # regularization_weight decaying to min_regularization_weight, and
-            # folding it into the branch above would silently switch it off
-            # exactly when the barrier stops holding ``s`` down.
-            sigma_term = self.sigma_lagrangian_term()
-            if sigma_term is not None:
-                loss = loss + sigma_term
-
+                
             loss.backward()
 
             if self.gradient_clip_value is not None:
@@ -1003,15 +877,6 @@ class Trainer:
             else:
                 loss = pred_loss
 
-            # Lagrangian term for sigma(U) >= c, ADDED OUTSIDE the barrier-weight
-            # gate on purpose: the input-set constraint has to survive
-            # regularization_weight decaying to min_regularization_weight, and
-            # folding it into the branch above would silently switch it off
-            # exactly when the barrier stops holding ``s`` down.
-            sigma_term = self.sigma_lagrangian_term()
-            if sigma_term is not None:
-                loss = loss + sigma_term
-
             # Backward pass
             loss.backward()  # Retain graph for potential second backward pass if needed
 
@@ -1104,7 +969,6 @@ class Trainer:
             "reg_activity": avg_reg_activity,
             "reg_H": avg_reg_H,
             "rollback_count": self.epoch_rollback_count,
-            "dual_lambda": self.dual_lambda,
             **avg_grad_stats,
         }
 
@@ -1183,11 +1047,6 @@ class Trainer:
         print(f"Starting training for {max_epochs} epochs")
         print(f"Model has {self.model.count_parameters()} trainable parameters")
 
-        # Place s at the largest certifiable value before the first step, so the
-        # dual variable defends a scale rather than spending the run walking to
-        # one. No-op unless the sigma constraint is on.
-        self._sigma_warm_start()
-
         # Plot initial trajectories before training
         self.plot_trajectories(name="initial_trajectories")
         self.plot_trajectories_div(name="initial_trajectories_div")
@@ -1220,7 +1079,6 @@ class Trainer:
                     "reg_activity",
                     "reg_H",
                     "rollback_count",
-                    "dual_lambda",
                 ]
             }
 
@@ -1246,17 +1104,17 @@ class Trainer:
             # set, so it runs only where it earns its cost: "on_violation" needs
             # it to decide, and any tracked run needs it in EVERY arm both as a
             # response variable (a positive margin is what makes a certificate
-            # vacuous). It no longer *decides* anything -- the dual variable does
-            # that -- so it is only paid for on a tracked run.
+            # vacuous) and to keep per-epoch cost equal across arms so a
+            # wall-clock comparison is not confounded. An untracked run on the
+            # default "never" trigger skips it and pays nothing, matching the
+            # old solve_max_s_on_violation=False path exactly.
             needs_margin = (
                 isinstance(self.model, SimpleLure)
                 and self.model.learn_L
-                and self.mlflow_tracking
+                and (self.max_s_trigger == "on_violation" or self.mlflow_tracking)
             )
             c_max = self.input_margin() if needs_margin else float("nan")
-            # Dual ascent on sigma(U) >= c. One dual step per epoch against a
-            # full epoch of primal SGD, per Chamon & Ribeiro Sec. 5.2.
-            sigma_slack = self._dual_ascent_step(epoch)
+            self._maybe_maximize_s(epoch, c_max)
 
             # Validate
             val_results = self.validate()
@@ -1405,24 +1263,18 @@ class Trainer:
                     alpha = 1/(1+ np.exp(-self.model.tau.cpu().detach().numpy()))
                     mlflow.log_metric("s", self.model.s.item(), step=epoch)
                     mlflow.log_metric("alpha", alpha, step=epoch)
-                    # sigma(U) = |s| sqrt(1-alpha^2): the admissible-input
-                    # radius, the quantity the dual variable steers.
+                    # sigma(U) = |s| sqrt(1-alpha^2): the admissible-input radius,
+                    # the quantity the MaxS trigger actually controls.
                     sigma = self.sigma_u()
                     if sigma is not None:
                         mlflow.log_metric("sigma_u", sigma, step=epoch)
                     if np.isfinite(c_max):
                         mlflow.log_metric("input_margin_max", c_max, step=epoch)
+                    mlflow.log_metric("max_s_solve_count", self.max_s_solve_count, step=epoch)
                     mlflow.log_metric("free_s_repair_count", self.free_s_repair_count, step=epoch)
-                    # The constrained-learning triple: the target, how far off it
-                    # is, and the price the dual has put on it. lambda rising
-                    # while the slack is positive and turning over once it goes
-                    # negative is the mechanism working.
-                    if self.sigma_constraint:
-                        mlflow.log_metric("dual_lambda", self.dual_lambda, step=epoch)
-                        if self.sigma_target is not None:
-                            mlflow.log_metric("sigma_target", self.sigma_target, step=epoch)
-                        if sigma_slack is not None:
-                            mlflow.log_metric("sigma_slack", sigma_slack, step=epoch)
+                    mlflow.log_metric(
+                        "max_s_unrepaired_count", self.max_s_unrepaired_count, step=epoch
+                    )
                     s = float(self.model.s.cpu().detach().numpy())
                     P = self.model.P.cpu().detach().numpy()
                     vol_X = get_volume_of_ellipsoid(P, s)
@@ -1455,10 +1307,7 @@ class Trainer:
             # batches only -- while the numerator counts rollbacks from the
             # diverging pass too. With 8 converging and 30 diverging batches that
             # fired at 21% rolled back, not 100%, decaying the barrier weight
-            # every epoch until the reg-weight early stop killed the run. On the
-            # sigma sweep that truncated every c >= 6.5 run to 9-10 of 200
-            # epochs and made their error look like the cost of a large
-            # certified input set.
+            # every epoch until the reg-weight early stop killed the run.
             n_steps = max(self.epoch_step_count, 1)
             if epoch_rollback_count >= n_steps:
                 pbar.write(
@@ -1564,11 +1413,6 @@ class Trainer:
             "train_reg_feasibility": self.train_reg_feasibility,
             "train_reg_inputs": self.train_reg_inputs,
             "val_losses": self.val_losses,
-            # The dual variable is trainer state, not model state, so it would
-            # be lost on a resume and the constraint would silently restart from
-            # lambda^(0) with the certificate already moved.
-            "dual_lambda": self.dual_lambda,
-            "sigma_target": self.sigma_target,
         }
 
         if self.scheduler is not None:

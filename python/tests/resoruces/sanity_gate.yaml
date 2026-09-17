@@ -89,12 +89,11 @@ training:
   input_regularization_weight: 0.0
   activity_regularization_weight: 0.0
   h_regularization_weight: 0.0
-  # Holds s up against the barrier. Replaces the retired
-  # solve_max_s_on_violation trigger: sigma(U) >= c under a Lagrange
-  # multiplier rather than an epoch-boundary MaxS solve.
-  sigma_constraint: true
-  sigma_target: auto
-  sigma_dual_lr: 0.01
+  # Holds s up against the barrier: without an epoch-boundary MaxS solve, s
+  # only ever moves the way the log-det barrier pushes it -- down -- and the
+  # certificate goes vacuous. "on_violation" is the deprecation-free spelling
+  # of the old solve_max_s_on_violation: true.
+  max_s_trigger: on_violation
 
 mlflow:
   tracking_uri: null
