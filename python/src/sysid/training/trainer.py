@@ -253,6 +253,28 @@ class Trainer:
 
         return stats
 
+    def _safe_plot(self, fn, *args, **kwargs) -> None:
+        """Run a plotting call, downgrading any failure to a warning.
+
+        Diagnostics must never cost a training run. The plotting helpers mask
+        diverged values themselves (``utils._PLOT_ABS_MAX``), but that only
+        covers the failure we have already seen: a diverged rollout reaching
+        ~1e308 and crashing matplotlib < 3.8 inside the tick locator. Rendering
+        depends on the matplotlib version, the backend and the data, and a run
+        that has trained for hours should not die because a PNG could not be
+        laid out. The traceback is logged so the cause is still visible.
+        """
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            logging.warning(
+                "Plotting %s failed; continuing training without this figure.",
+                getattr(fn, "__name__", repr(fn)), exc_info=True,
+            )
+            # A half-built figure would otherwise leak into the next call and
+            # keep re-raising through pyplot's global state.
+            plt.close("all")
+
     def plot_trajectories(self, normalizer=None, name="initial_trajectories"):
         """
         Plot initial model predictions before training as a reference.
@@ -1047,9 +1069,11 @@ class Trainer:
         print(f"Starting training for {max_epochs} epochs")
         print(f"Model has {self.model.count_parameters()} trainable parameters")
 
-        # Plot initial trajectories before training
-        self.plot_trajectories(name="initial_trajectories")
-        self.plot_trajectories_div(name="initial_trajectories_div")
+        # Plot initial trajectories before training. Wrapped because a model
+        # that diverges at initialization renders here FIRST, before a single
+        # epoch has run -- so an unguarded failure kills the run at epoch 0.
+        self._safe_plot(self.plot_trajectories, name="initial_trajectories")
+        self._safe_plot(self.plot_trajectories_div, name="initial_trajectories_div")
 
         # Epoch-level progress bar
         pbar = tqdm(range(max_epochs), desc="Training Progress")
@@ -1283,9 +1307,12 @@ class Trainer:
 
             # Plot trajectories and ellipse periodically (at checkpoint frequency)
             if (epoch + 1) % self.checkpoint_frequency == 0:
-                self.plot_trajectories(name=f"epoch_{epoch}", normalizer=normalizer)
-                self.plot_trajectories_div(
-                    name=f"epoch_{epoch}_div", normalizer=normalizer
+                self._safe_plot(
+                    self.plot_trajectories, name=f"epoch_{epoch}", normalizer=normalizer
+                )
+                self._safe_plot(
+                    self.plot_trajectories_div,
+                    name=f"epoch_{epoch}_div", normalizer=normalizer,
                 )
 
             # Learning rate scheduling

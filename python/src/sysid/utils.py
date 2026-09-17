@@ -155,6 +155,10 @@ def plot_safe_set_trajectories(
     count_stable = 0
     count_unstable = 0
     for c_i, x_i in zip(c, x_traj):
+        # Same masking as plot_predictions: this figure is saved with
+        # bbox_inches="tight", which runs the same tick locator that a diverged
+        # trajectory crashes on older matplotlib. See _PLOT_ABS_MAX.
+        x_i = _mask_nonfinite(x_i)
         if np.any(c_i > 0):
             ax.plot(x_i[warmup_steps, 0], x_i[warmup_steps, 1], "rx")
             ax.plot(x_i[warmup_steps:M, 0],x_i[warmup_steps:M, 1], "--")
@@ -169,6 +173,9 @@ def plot_safe_set_trajectories(
     fig, ax = plot_ellipse_and_parallelogram(
         X, H, s, None, ax=ax, show=False, fill_polytope=fill_polytope,
     )
+    # Guard here rather than at the call site: every caller saves this figure,
+    # and a fully diverged batch leaves the axis with nothing to autoscale from.
+    _ensure_finite_axis_limits([ax])
     return fig, ax, count_stable, count_unstable
 
 
@@ -522,6 +529,9 @@ def plot_state_trajectory(
     if x.ndim != 2:
         raise ValueError(f"x must be (T, nx), got shape {x.shape}.")
 
+    # A diverged state trajectory would otherwise poison the axis limits of
+    # whatever figure this is drawn onto. See _PLOT_ABS_MAX.
+    x = _mask_nonfinite(x)
     nx = x.shape[1]
     if nx == 2:
         x_plot, y_plot = x[:, 0], x[:, 1]
@@ -538,32 +548,67 @@ def plot_state_trajectory(
     ax.plot(x_plot, y_plot, color=color, linewidth=linewidth, alpha=alpha, label=label)
 
 
-def _mask_nonfinite(arr: np.ndarray) -> np.ndarray:
-    """Return a float copy with non-finite (NaN/Inf) entries set to NaN.
+# Magnitude past which a plotted value is treated as diverged and masked away.
+#
+# Testing ``np.isfinite`` alone is not enough, which is what the earlier version
+# of this guard did. A diverged rollout passes through ~1e308 on its way to Inf,
+# and those values are *finite*, so they survived the mask. matplotlib then
+# autoscaled over them (``_AxesBase._autoscale_view``: ``delta = (x1t - x0t) *
+# margin``), that subtraction alone overflowed to Inf, the tick step derived
+# from it became Inf, and ``MaxNLocator._raw_ticks`` indexed the resulting empty
+# array::
+#
+#     istep = np.nonzero(steps >= raw_step)[0][0]
+#     IndexError: index 0 is out of bounds for axis 0 with size 0
+#
+# matplotlib 3.8.0 added an ``if any(large_steps)`` fallback, so this only
+# crashes on older matplotlib. Pinning the version is NOT a portable fix: 3.8.0
+# requires Python >= 3.9, so a Python 3.8 environment can never install it (the
+# newest it can hold is 3.7.5, which is unguarded). The masking therefore has to
+# happen on our side.
+#
+# 1e100 sits far above any physical signal in this package and far below the
+# ~9e307 where the subtraction overflows, so it clears the failure band with
+# room to spare without ever touching real data.
+_PLOT_ABS_MAX = 1e100
+
+
+def _mask_nonfinite(arr: np.ndarray, abs_max: float = _PLOT_ABS_MAX) -> np.ndarray:
+    """Return a float copy with non-finite or diverged entries set to NaN.
 
     matplotlib skips NaN points when drawing and autoscaling, so masking a
-    diverged trajectory keeps its finite portion visible instead of letting
-    Inf leak into the axis limits.
+    diverged trajectory keeps its finite portion visible instead of letting Inf
+    — or a finite-but-astronomical value, see ``_PLOT_ABS_MAX`` — leak into the
+    axis limits.
     """
     arr = np.asarray(arr, dtype=float)
-    return np.where(np.isfinite(arr), arr, np.nan)
+    keep = np.isfinite(arr) & (np.abs(arr) <= abs_max)
+    return np.where(keep, arr, np.nan)
 
 
 def _ensure_finite_axis_limits(axes, default: Tuple[float, float] = (-1.0, 1.0)) -> None:
-    """Force finite limits on any axis left with no finite data.
+    """Force usable limits on any axis left without plottable data.
 
-    When a model diverges, a whole trajectory can be non-finite, leaving the
-    axis with no data to autoscale from. matplotlib then produces non-finite
-    limits and older versions crash inside the tick locator
-    (``MaxNLocator._raw_ticks``: ``np.nonzero(steps >= raw_step)[0][0]`` on an
-    empty array). Plotting must never abort a training run, so we clamp such
-    axes to a finite default. Axes that already have finite data are untouched.
+    Two failure modes end in the same tick-locator crash: an axis with no finite
+    data at all, whose limits come back non-finite; and an axis whose limits are
+    each finite but so far apart that matplotlib's own ``x1 - x0`` overflows to
+    Inf. The span is therefore computed here — under ``errstate`` so the probe
+    itself cannot raise — and checked, rather than trusting the endpoints.
+
+    Plotting must never abort a training run, so such axes are clamped to a
+    finite default. Axes that already hold sane data are untouched.
     """
+    def _usable(lo, hi) -> bool:
+        if not np.isfinite([lo, hi]).all():
+            return False
+        with np.errstate(over="ignore", invalid="ignore"):
+            return bool(np.isfinite(np.float64(hi) - np.float64(lo)))
+
     for ax in axes:
         x0, y0, x1, y1 = ax.dataLim.extents  # [xmin, ymin, xmax, ymax]
-        if not np.isfinite([x0, x1]).all():
+        if not _usable(x0, x1):
             ax.set_xlim(*default)
-        if not np.isfinite([y0, y1]).all():
+        if not _usable(y0, y1):
             ax.set_ylim(*default)
 
 
