@@ -3,6 +3,7 @@
 import logging
 import math
 import random
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -651,17 +652,23 @@ def plot_predictions(
     else:
         axes = ax
 
-    if num_samples == 1:
-        axes = axes.reshape(1, -1) if num_plots > 1 else [[axes]]
-    elif num_plots == 1:
-        axes = axes.reshape(-1, 1)
+    # Normalize to a (num_samples, num_plots) object array. plt.subplots squeezes
+    # away axes of length 1, so the 1xN, Nx1 and 1x1 cases each come back a
+    # different type; the 1x1 case (one sample, no input signal) used to become a
+    # plain nested list and then raised TypeError on the axes[i, 0] indexing
+    # below. Reshaping once here makes the indexing uniform.
+    axes = np.empty((num_samples, num_plots), dtype=object)
+    axes.flat[:] = np.ravel(np.asarray(ax if ax is not None else fig.axes, dtype=object))
+    # fig is unset when a caller supplied `ax`, and `return_axes` would then
+    # raise NameError; take it from an axis instead.
+    fig = axes[0, 0].figure
 
     for i in range(num_samples):
         # Use the actual index from the indices list
         idx = indices[i]
 
         # Plot predictions vs targets
-        ax_pred = axes[i, 0] if num_plots > 1 else axes[i, 0]
+        ax_pred = axes[i, 0]
 
         # dashes vertical line at warmup_steps if specified
         ax_pred.axvline(x=warmup_steps, color="k", linestyle=":", label="Warmup Steps")
@@ -713,7 +720,9 @@ def plot_predictions(
     plt.tight_layout()
 
     if save_path is None:
-        save_path = output_dir / "predictions_plot.png"
+        # output_dir is annotated str and callers pass one, but this line needs
+        # a Path; wrap rather than requiring every caller to convert.
+        save_path = Path(output_dir) / "predictions_plot.png"
 
     if return_axes:
         return fig, axes
