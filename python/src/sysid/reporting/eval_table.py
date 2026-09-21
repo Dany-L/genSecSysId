@@ -43,23 +43,26 @@ MODEL_TO_LATEX: Dict[str, str] = {
 }
 ROW_ORDER: List[str] = ["NoSec", "StdSec", "GenSec"]
 
-HEADER: List[str] = [
-    "Experiment",
-    "Model",
-    "NRMSE",
-    r"$\bar y$",
-    r"$y_{\text{max}}$",
-    r"\# div/ total",
-    r"\# pars",
-    r"$\nw$",
+# Per-experiment column group: the two metrics that matter, side by side.
+SUB_HEADER: List[str] = ["NRMSE", r"\# div/ total"]
+# Rows carried above the GenSec block (one metric pair per experiment).
+PLAIN_ROWS: List[str] = ["NoSec", "StdSec"]
+# Rows that only GenSec has: a certificate quantity spanning the whole column
+# group, because it is not one of the two per-model metrics.
+GENSEC_EXTRA_ROWS: List[Tuple[str, str]] = [
+    (r"$\bar y$", "y_bar"),
+    (r"$\bar \sigma(\theta)$", "sigma_u"),
 ]
-COLUMN_SPEC = "rrllllll"
 
 # ── where each column comes from ──────────────────────────────────────────────
 # ȳ moved from a flat key to the per-certificate namespace part-way through the
 # project (duffing-soft-7 predates the move), so both spellings are accepted.
 Y_BAR_KEYS: Tuple[str, ...] = ("post_process/max_s/y_bar", "post_process/y_bar")
 Y_MAX_KEY = "data/max_output_train"
+# sigma(U) = |s|*sqrt(1 - alpha^2), the size of the admissible input set --
+# logged every epoch by the trainer (see Trainer.sigma_u). Reported for GenSec
+# only: without a regional certificate there is no admissible input set to size.
+SIGMA_KEY = "sigma_u"
 # config.model.nw is an alias for hidden_size (see sysid.config), and
 # hidden_size is the one logged on every experiment.
 NW_PARAM = "hidden_size"
@@ -85,6 +88,10 @@ class EvalRow:
     y_bar: Optional[float] = None
     y_max: Optional[float] = None
     diverged: Optional[Tuple[int, int]] = None  # (n_diverged, n_total)
+    sigma_u: Optional[float] = None  # GenSec only; see SIGMA_KEY
+    # Collected and logged but no longer tabulated -- the table now carries the
+    # two metrics that matter per model, and the parameter counts crowded them
+    # out without separating the arms (they differ by ~50 out of ~780).
     n_pars: Optional[int] = None
     nw: Optional[int] = None
     note: Optional[str] = None  # why a cell (or the whole row) is empty
@@ -374,6 +381,30 @@ def _number(value: Optional[float], decimals: int) -> str:
     return f"{value:.{decimals}f}"
 
 
+def significant(value: Optional[float], digits: int = 3) -> str:
+    r"""A certificate quantity at ``digits`` significant figures.
+
+    Used for ``y_max``, ``ȳ`` and ``σ(θ)``, which span a whole column group and
+    so need no decimal alignment, but DO span orders of magnitude: on the
+    shipped experiments ``σ`` runs from 5e-5 (a collapsed admissible input set)
+    to 19.7, and ``ȳ`` reaches 335. One shared decimal count then prints the
+    others at a precision they do not carry -- ``y_max = 0.934495``.
+
+    Outside ``[1e-3, 1e5)`` the result is LaTeX scientific notation, wrapped in
+    math mode; inside it, a plain decimal.
+    """
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "--"
+    value = float(value)
+    if value == 0.0:
+        return "0"
+    if 1e-3 <= abs(value) < 1e5:
+        return f"{value:.{digits}g}"
+    exponent = int(math.floor(math.log10(abs(value))))
+    mantissa = value / (10 ** exponent)
+    return rf"${mantissa:.{digits - 1}f} \cdot 10^{{{exponent}}}$"
+
+
 def _integer(value: Optional[int]) -> str:
     return "--" if value is None else str(int(value))
 
@@ -385,62 +416,209 @@ def _div_cell(diverged: Optional[Tuple[int, int]]) -> str:
     return f"{n_diverged}/{n_total}"
 
 
+def adaptive_decimals(
+    values: Sequence[Optional[float]],
+    significant: int = 2,
+    min_decimals: int = 2,
+    max_decimals: int = 6,
+) -> int:
+    """Decimals that give the SMALLEST value in ``values`` ``significant`` digits.
+
+    One count per column, chosen from the column's own numbers, so every cell in
+    a column lines up on the decimal point while none of them rounds away. The
+    1-D benchmark is the case that forces this: its NRMSEs are ~2e-3, and the
+    two decimals that suit the Duffing columns print all of them as ``0.00``.
+
+    Values that are ``None``/NaN/zero are ignored; an empty column falls back to
+    ``min_decimals``.
+    """
+    finite = [
+        abs(float(v))
+        for v in values
+        if v is not None and not (isinstance(v, float) and math.isnan(v)) and v != 0
+    ]
+    if not finite:
+        return min_decimals
+    smallest = min(finite)
+    needed = int(math.ceil(-math.log10(smallest))) + significant - 1
+    return max(min_decimals, min(max_decimals, needed))
+
+
+def rank_emphasis(
+    values: Sequence[Optional[float]], lower_is_better: bool = True
+) -> Dict[int, Tuple[bool, bool]]:
+    """``{index: (bold, italic)}`` marking the best and second-best entries.
+
+    Best is bold, second best bold-italic — the convention
+    :func:`sysid.reporting.tables.build_table` already uses, so the two tables in
+    the paper read the same way. ``lower_is_better`` because these are error
+    metrics. Ties share a rank: two identical best values are both bold and
+    nothing is marked second.
+    """
+    scored = [
+        (float(v), i)
+        for i, v in enumerate(values)
+        if v is not None and not (isinstance(v, float) and math.isnan(v))
+    ]
+    if not scored:
+        return {}
+    ordered = sorted(scored, key=lambda t: t[0] if lower_is_better else -t[0])
+    best = ordered[0][0]
+    marks: Dict[int, Tuple[bool, bool]] = {i: (True, False) for v, i in scored if v == best}
+    runners = [v for v, _ in ordered if v != best]
+    if runners:
+        second = runners[0]
+        marks.update({i: (True, True) for v, i in scored if v == second})
+    return marks
+
+
+def _emphasize(text: str, bold: bool, italic: bool) -> str:
+    """Text-mode emphasis, matching ``tables._emphasize``."""
+    if bold and italic:
+        return rf"\textbf{{\textit{{{text}}}}}"
+    if bold:
+        return rf"\textbf{{{text}}}"
+    return text
+
+
+def _trace(row: Optional[EvalRow], experiment_key: str) -> str:
+    """``<mlflow experiment>=<run id>`` for one cell, or why it is empty."""
+    if row is None:
+        return f"{experiment_key}=<no row>"
+    # Name the MLflow experiment whether or not a run was found, so a reader
+    # chasing an empty cell knows which experiment to go looking in.
+    name = row.mlflow_experiment_name or experiment_key
+    if row.run_id is None:
+        return f"{name}=<{row.note or 'no matching run'}>"
+    trace = f"{name}={row.run_id}"
+    return f"{trace} [{row.note}]" if row.note else trace
+
+
 def build_eval_table(
     rows: Sequence[EvalRow],
-    decimals: int = 2,
     comment: Optional[str] = None,
+    nrmse_significant: int = 2,
+    min_decimals: int = 2,
+    max_decimals: int = 6,
+    significant_digits: int = 3,
 ) -> str:
-    """Render rows as the LaTeX table of ``results/eval_table_template.tex``.
+    r"""Render rows as the LaTeX table of ``results/eval_table_template.tex``.
 
-    ``rows`` are grouped by :attr:`EvalRow.experiment` in first-seen order; the
-    group's experiment name spans its rows via ``\\multirow`` and groups are
-    separated by ``\\midrule``. Within a group the rows are ordered by
-    :data:`ROW_ORDER`. Every row ends in a LaTeX comment carrying the run id and
-    the MLflow experiment name it was filled from, so a number in the paper can
-    be traced back to its run.
+    EXPERIMENTS ARE COLUMNS and models are rows, so one model can be read across
+    every benchmark at a glance — the transpose of the earlier layout, which put
+    one experiment per block and made that comparison a vertical scan.
+
+    Each experiment owns a two-column group ``(NRMSE, # div/total)`` under a
+    spanning header carrying its name and its ``y_max``. ``\MLtiRnn`` and
+    ``\MStdSec`` take one row each; ``\MGenSec`` takes a row plus two more,
+    ``$\bar y$`` and ``$\bar\sigma(\theta)$``, which span the whole group
+    because they are certificate quantities rather than per-model metrics and
+    only the regional arm has them.
+
+    NRMSE decimals are chosen per column by :func:`adaptive_decimals`; the
+    certificate quantities use :func:`significant` instead, because they span
+    a column group and orders of magnitude. Per NRMSE
+    column the lowest is bold, the second lowest bold-italic
+    (:func:`rank_emphasis`). Every row ends in a LaTeX comment mapping each
+    experiment to the run it was filled from.
+
+    (LaTeX needs ``booktabs``; the labels are the project's ``\MLtiRnn`` /
+    ``\MStdSec`` / ``\MGenSec`` macros.)
     """
-    grouped: Dict[str, List[EvalRow]] = {}
+    # Experiments in first-seen order -> column groups.
+    experiments: List[str] = []
+    by_experiment: Dict[str, Dict[str, EvalRow]] = {}
     for row in rows:
-        grouped.setdefault(row.experiment, []).append(row)
+        if row.experiment not in by_experiment:
+            experiments.append(row.experiment)
+            by_experiment[row.experiment] = {}
+        by_experiment[row.experiment][row.model_name] = row
+    if not experiments:
+        raise ValueError("no rows to render")
 
-    order = {name: i for i, name in enumerate(ROW_ORDER)}
+    def cell(experiment: str, model: str) -> Optional[EvalRow]:
+        return by_experiment[experiment].get(model)
+
+    # One decimal count and one emphasis map per experiment column.
+    decimals: Dict[str, int] = {}
+    emphasis: Dict[str, Dict[int, Tuple[bool, bool]]] = {}
+    for experiment in experiments:
+        nrmse = [
+            (cell(experiment, m).nrmse if cell(experiment, m) else None) for m in ROW_ORDER
+        ]
+        decimals[experiment] = adaptive_decimals(
+            nrmse,
+            significant=nrmse_significant,
+            min_decimals=min_decimals,
+            max_decimals=max_decimals,
+        )
+        emphasis[experiment] = rank_emphasis(nrmse)
+
+    # y_max belongs to the dataset, not the model, so it goes in the header.
+    # Any arm of the experiment carries it; take the first that does.
+    y_max: Dict[str, Optional[float]] = {}
+    for experiment in experiments:
+        levels = [
+            cell(experiment, m).y_max
+            for m in ROW_ORDER
+            if cell(experiment, m) is not None and cell(experiment, m).y_max is not None
+        ]
+        y_max[experiment] = levels[0] if levels else None
+
+    header_names = " ".join(
+        rf"& \multicolumn{{2}}{{c}}{{{_escape(e)}}}" for e in experiments
+    )
+    header_levels = " ".join(
+        rf"& \multicolumn{{2}}{{l}}{{$y_{{\text{{max}}}} = "
+        rf"{significant(y_max[e], digits=significant_digits)}$}}"
+        for e in experiments
+    )
+    header_metrics = "Model  & " + " & ".join(
+        " & ".join(SUB_HEADER) for _ in experiments
+    )
+
     body: List[str] = []
-    for block_i, (experiment, block) in enumerate(grouped.items()):
-        block = sorted(block, key=lambda r: order.get(r.model_name, len(order)))
-        if block_i:
-            body.append(r"\midrule")
-        for row_i, row in enumerate(block):
-            lead = (
-                rf"\multirow{{{len(block)}}}{{*}}{{{_escape(experiment)}}}"
-                if row_i == 0
-                else ""
-            )
-            cells = [
-                lead,
-                row.model_label,
-                _number(row.nrmse, decimals),
-                _number(row.y_bar, decimals),
-                _number(row.y_max, decimals),
-                _div_cell(row.diverged),
-                _integer(row.n_pars),
-                _integer(row.nw),
+
+    def metric_row(model: str) -> str:
+        cells: List[str] = []
+        traces: List[str] = []
+        for i_exp, experiment in enumerate(experiments):
+            row = cell(experiment, model)
+            i_model = ROW_ORDER.index(model)
+            bold, italic = emphasis[experiment].get(i_model, (False, False))
+            value = _number(row.nrmse if row else None, decimals[experiment])
+            cells += [
+                _emphasize(value, bold, italic) if value != "--" else value,
+                _div_cell(row.diverged if row else None),
             ]
-            if row.run_id:
-                trace = f"run_id={row.run_id} experiment={row.mlflow_experiment_name}"
-                # A '--' on a row that *does* have a run needs its reason on the
-                # line, so "no diverging set logged" is not read as "0 diverged".
-                if row.note:
-                    trace += f" [{row.note}]"
-            else:
-                trace = row.note or "no matching run"
-            # lstrip so continuation rows read "& \MStdSec{} & ..." as in the template.
-            body.append(" & ".join(cells).lstrip() + rf"\\ % {trace}")
+            traces.append(_trace(row, experiment))
+        return (
+            f"{MODEL_TO_LATEX[model]} & " + " & ".join(cells) + r" \\ % " + ", ".join(traces)
+        )
+
+    body.append(metric_row("NoSec"))
+    body.append(metric_row("StdSec"))
+    body.append(r"\midrule")
+    body.append(metric_row("GenSec"))
+
+    # GenSec-only certificate rows, each spanning its experiment's whole group.
+    for label, attribute in GENSEC_EXTRA_ROWS:
+        cells = []
+        for experiment in experiments:
+            row = cell(experiment, "GenSec")
+            value = getattr(row, attribute) if row else None
+            cells.append(
+                rf"\multicolumn{{2}}{{l}}{{{significant(value, digits=significant_digits)}}}"
+            )
+        body.append(f"{label} & " + " & ".join(cells) + r" \\")
 
     lines = [f"% {comment}"] if comment else []
     lines += [
-        rf"\begin{{tabular}}{{{COLUMN_SPEC}}}",
+        rf"\begin{{tabular}}{{r{'ll' * len(experiments)}}}",
         r"\toprule",
-        " & ".join(HEADER) + r"\\",
+        f"{header_names} \\\\",
+        f"{header_levels} \\\\",
+        rf"{header_metrics} \\",
         r"\midrule",
         *body,
         r"\bottomrule",

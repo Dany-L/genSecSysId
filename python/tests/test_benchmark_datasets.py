@@ -250,7 +250,10 @@ class TestF16Layout:
 # ── the shipped configs ───────────────────────────────────────────────────────
 CONFIGS = [
     ("crnn_cascaded-tanks", "CascadedTanks", "standard", ["y"]),
-    ("crnn_f16", "F16", "scale_only", ["y1"]),
+    # output_col is deliberately NOT pinned for the F-16: it is the knob for
+    # fitting one accelerometer or all three. What must hold either way is the
+    # nx >= ne invariant below.
+    ("crnn_f16", "F16", "scale_only", None),
 ]
 
 
@@ -269,7 +272,8 @@ class TestShippedConfigs:
         # Unknown keys are dropped with a warning only, so a renamed field would
         # silently become a no-op. Check the settings that matter round-trip.
         assert cfg.data.normalization_method == norm_method == raw["data"]["normalization_method"]
-        assert cfg.data.output_col == output_col
+        if output_col is not None:
+            assert cfg.data.output_col == output_col
         assert data_dir in cfg.data.train_path
         assert cfg.training.use_custom_regularization is True
         assert cfg.model.custom_params["learn_L"] is True
@@ -286,13 +290,54 @@ class TestShippedConfigs:
             assert isinstance(value, float), f"{value!r} parsed as {type(value).__name__}"
 
     def test_alpha_0_clears_the_initial_A_spectrum(self, stem, data_dir, norm_method, output_col):
-        # The sampling-rate failure mode: if the explicit A has an eigenvalue at
-        # or above alpha_0, no P satisfies A'PA - alpha^2 P < 0 and
-        # initialization dies before epoch 0.
+        """rho(A) < alpha_0 at initialization, however A is specified.
+
+        The sampling-rate failure mode: with an eigenvalue at or above alpha_0
+        no P satisfies A'PA - alpha^2 P < 0 and initialization dies before
+        epoch 0. Both A specs have to be checked -- a pinned {value} matrix
+        directly, and a drawn {radius} band by its upper bound, which is what
+        rho(A) equals by construction for every seed.
+        """
         cfg = Config.from_yaml(str(self._path(stem)))
         custom = cfg.model.custom_params
-        A = np.array(custom["identity_init"]["A"]["value"], dtype=float)
-        assert np.abs(np.linalg.eigvals(A)).max() < custom["alpha_0"]
+        # Default from SimpleLure.__init__ when the config does not set it.
+        alpha_0 = custom.get("alpha_0", 0.9999)
+        spec = custom["identity_init"]["A"]
+        if "value" in spec:
+            rho = float(np.abs(np.linalg.eigvals(np.array(spec["value"], float))).max())
+        elif "radius" in spec:
+            radius = spec["radius"]
+            rho = float(radius if isinstance(radius, (int, float)) else max(radius))
+        else:
+            pytest.fail(
+                f"{stem}.yaml uses the {{scale}} A spec; at these sampling rates it "
+                "draws rho(A) > 1. Use {radius, freq_hz} or a pinned {value}."
+            )
+        assert rho < alpha_0, f"rho(A)={rho} is not below alpha_0={alpha_0}"
+
+    def test_state_dimension_admits_the_number_of_outputs(
+        self, stem, data_dir, norm_method, output_col
+    ):
+        """``nx >= ne``, or the certified OUTPUT SET is degenerate.
+
+        The certified set is the image of the state ellipsoid under ``y = C x``.
+        With ``nx < ne`` that image is flat -- it lives in an ``nx``-dimensional
+        subspace of ``R^ne`` -- so ``W = s^2 S (C P C^T) S`` is singular, there
+        is no ``Y`` with ``Yc = {y : y^T Y y <= 1}``, and the worst-direction
+        ``ybar`` (hence ``coverage_ratio``) is exactly 0. Training still runs,
+        which is why this is worth pinning: the failure is silent in the loss
+        and only shows up as an empty certificate.
+        """
+        cfg = Config.from_yaml(str(self._path(stem)))
+        ne = len(cfg.data.output_col)
+        if ne == 1:
+            pytest.skip("single output; the invariant is vacuous")
+        assert cfg.model.nx >= ne, (
+            f"{stem}.yaml fits {ne} outputs with nx={cfg.model.nx}: the certified "
+            f"output set is flat, so ybar and coverage_ratio come out 0. Raise nx "
+            f"to at least {ne} (and give identity_init.A a matching {ne}x{ne} or "
+            f"larger block)."
+        )
 
     def test_windowing_fits_the_prepared_record(self, stem, data_dir, norm_method, output_col):
         cfg = Config.from_yaml(str(self._path(stem)))

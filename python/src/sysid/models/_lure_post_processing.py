@@ -56,7 +56,10 @@ class LurePostProcessingMixin:
         coverage floor ``(σ·s)²·C P Cᵀ ⪰ y_max²·I`` is *checked afterwards*
         (``coverage_ok``). Reported: the ellipsoid ``volume`` (``sⁿˣ·√(det P)``),
         the coupling norm ``‖H‖ = ‖L P⁻¹‖``, the scale ``s`` and the certified
-        output half-width ``ȳ_c = σ·s·√(C P Cᵀ)`` (physical; ``ne == 1`` only).
+        output half-width ``ȳ_c`` (physical) -- the worst direction of the
+        certified output set, with the per-channel half-widths alongside it
+        under ``output_set``. Defined at every ``ne``; see
+        :mod:`sysid.optimization.output_set`.
 
         **Problem 2 — tightest coverage** (MinTrProb, :meth:`~sysid.optimization.LureCertificateSynthesizer.coverage_at_s` swept
         over a finite s-grid). The joint problem is bilinear (convex once ``s`` is

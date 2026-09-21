@@ -6,6 +6,8 @@ and LaTeX assembly are all covered offline. The divergence rollout is exercised
 against a tiny stand-in model with the same call signature as the real one.
 """
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -274,105 +276,224 @@ def test_count_diverged_reshapes_broadcast_normalizer_output():
     ) == (1, 2)
 
 
+# ── number formatting ─────────────────────────────────────────────────────────
+def test_adaptive_decimals_keeps_the_smallest_value_readable():
+    # The 1-D benchmark's NRMSEs are ~2e-3: at the two decimals that suit the
+    # Duffing columns every one of them prints as "0.00".
+    assert eval_table.adaptive_decimals([0.00205, 0.0192, 0.0246]) == 4
+    assert eval_table.adaptive_decimals([0.0643, 0.191, 0.0712]) == 3
+    assert eval_table.adaptive_decimals([0.22, 1.84, 0.55]) == 2
+
+
+def test_adaptive_decimals_honours_its_bounds_and_ignores_holes():
+    assert eval_table.adaptive_decimals([1e-9], max_decimals=4) == 4
+    assert eval_table.adaptive_decimals([123.0], min_decimals=2) == 2
+    # 0.05 needs 3 decimals for two significant digits (0.050).
+    assert eval_table.adaptive_decimals([None, float("nan"), 0.0, 0.05]) == 3
+    assert eval_table.adaptive_decimals([]) == 2
+    assert eval_table.adaptive_decimals([None, None]) == 2
+
+
+def test_rank_emphasis_marks_best_then_second_best():
+    # Lower is better, matching tables.build_table.
+    marks = eval_table.rank_emphasis([0.3, 0.1, 0.2])
+    assert marks[1] == (True, False)    # best -> bold
+    assert marks[2] == (True, True)     # second -> bold italic
+    assert 0 not in marks
+
+
+def test_rank_emphasis_shares_a_rank_on_ties_and_skips_holes():
+    marks = eval_table.rank_emphasis([0.1, 0.1, 0.5])
+    assert marks[0] == (True, False) and marks[1] == (True, False)
+    assert marks[2] == (True, True)     # the only runner-up value
+    assert eval_table.rank_emphasis([None, 0.4]) == {1: (True, False)}
+    assert eval_table.rank_emphasis([None, float("nan")]) == {}
+
+
 # ── LaTeX assembly ────────────────────────────────────────────────────────────
-def _body_lines(tex):
-    """The model rows of a rendered table (the header also has `\\` and `&`)."""
-    macros = tuple(eval_table.MODEL_TO_LATEX.values())
-    return [line for line in tex.splitlines() if any(m in line for m in macros)]
+def _rows(experiment="Exp A", mlflow_name="exp-a", nrmse=(0.3, 0.2, 0.1), y_max=0.9, **kw):
+    """One full column group: NoSec, StdSec, GenSec."""
+    out = []
+    for model, value in zip(eval_table.ROW_ORDER, nrmse):
+        base = dict(
+            experiment=experiment,
+            model_name=model,
+            run_id=f"rid-{model}",
+            mlflow_experiment_name=mlflow_name,
+            nrmse=value,
+            y_max=y_max,
+            diverged=(12, 15),
+        )
+        if model == "GenSec":
+            base.update(y_bar=0.5, sigma_u=1.25)
+        base.update(kw.get(model, {}))
+        out.append(eval_table.EvalRow(**base))
+    return out
 
 
-def _row(model_name, **kw):
-    base = dict(
-        experiment="Exp A",
-        model_name=model_name,
-        run_id=f"rid-{model_name}",
-        mlflow_experiment_name="exp-a",
-        nrmse=0.1234,
-        y_bar=0.5,
-        y_max=0.93,
-        diverged=(12, 15),
-        n_pars=532,
-        nw=20,
+def _line(tex, prefix):
+    return next(line for line in tex.splitlines() if line.startswith(prefix))
+
+
+def test_experiments_are_columns_and_models_are_rows():
+    tex = eval_table.build_eval_table(_rows() + _rows("Exp B", "exp-b", (0.9, 0.8, 0.7), 1.4))
+
+    # Two experiments -> r + 2 two-column groups, matching the template's "rll".
+    assert r"\begin{tabular}{rllll}" in tex
+    assert r"& \multicolumn{2}{c}{Exp A} & \multicolumn{2}{c}{Exp B} \\" in tex
+    assert r"Model  & NRMSE & \# div/ total & NRMSE & \# div/ total \\" in tex
+    # One row per model, each carrying both experiments.
+    for macro in (r"\MLtiRnn{}", r"\MStdSec{}", r"\MGenSec{}"):
+        assert len([line for line in tex.splitlines() if line.startswith(macro)]) == 1
+
+
+def test_single_experiment_matches_the_template_column_spec():
+    tex = eval_table.build_eval_table(_rows())
+    assert r"\begin{tabular}{rll}" in tex
+
+
+def test_y_max_is_a_header_row_not_a_column():
+    tex = eval_table.build_eval_table(_rows(y_max=0.29))
+    assert r"& \multicolumn{2}{l}{$y_{\text{max}} = 0.29$} \\" in tex
+    # It is no longer one of the per-model metrics.
+    assert r"Model  & NRMSE & \# div/ total \\" in tex
+
+
+def test_gensec_gets_its_own_spanning_certificate_rows():
+    tex = eval_table.build_eval_table(_rows())
+    # ybar and sigma span the whole two-column group -- they are certificate
+    # quantities, not one of the per-model metrics.
+    assert _line(tex, r"$\bar y$") == r"$\bar y$ & \multicolumn{2}{l}{0.5} \\"
+    assert _line(tex, r"$\bar \sigma(\theta)$") == (
+        r"$\bar \sigma(\theta)$ & \multicolumn{2}{l}{1.25} \\"
     )
-    base.update(kw)
-    return eval_table.EvalRow(**base)
-
-
-def test_build_eval_table_structure_and_template_header():
-    tex = eval_table.build_eval_table([_row("GenSec")], comment="generated")
-    assert tex.startswith("% generated\n")
-    assert r"\begin{tabular}{rrllllll}" in tex
-    assert (
-        r"Experiment & Model & NRMSE & $\bar y$ & $y_{\text{max}}$ "
-        r"& \# div/ total & \# pars & $\nw$\\" in tex
-    )
-    assert tex.rstrip().endswith(r"\end{tabular}")
-    assert r"\toprule" in tex and r"\bottomrule" in tex
-
-
-def test_build_eval_table_row_order_multirow_and_trace_comments():
-    # Supplied in YAML order (GenSec, StdSec, NoSec); rendered in template order.
-    rows = [_row("GenSec"), _row("StdSec"), _row("NoSec")]
-    body = _body_lines(eval_table.build_eval_table(rows))
-
-    assert r"\MLtiRnn{}" in body[0] and r"\MStdSec{}" in body[1] and r"\MGenSec{}" in body[2]
-    # The experiment name spans the block from its first row only.
-    assert body[0].startswith(r"\multirow{3}{*}{Exp A} & \MLtiRnn{}")
-    assert body[1].startswith(r"& \MStdSec{}")
-    # Every row is traceable back to the run it was filled from.
-    assert body[0].endswith(r"\\ % run_id=rid-NoSec experiment=exp-a")
-    assert "0.12 & 0.50 & 0.93 & 12/15 & 532 & 20" in body[0]
-
-
-def test_build_eval_table_groups_experiments_with_midrule():
-    rows = [
-        _row("GenSec"),
-        _row("GenSec", experiment="Exp B", mlflow_experiment_name="exp-b"),
-    ]
-    tex = eval_table.build_eval_table(rows)
+    # A \midrule separates the GenSec block from the other two arms.
     lines = tex.splitlines()
-    # One \midrule under the header, one more between the two blocks.
-    assert lines.count(r"\midrule") == 2
-    assert r"\multirow{1}{*}{Exp A}" in tex and r"\multirow{1}{*}{Exp B}" in tex
+    assert lines[lines.index(_line(tex, r"\MGenSec{}")) - 1] == r"\midrule"
 
 
-def test_build_eval_table_renders_missing_values_as_dashes():
-    rows = [
-        _row("GenSec", diverged=None, y_bar=None),
-        _row(
-            "NoSec",
-            run_id=None,
-            nrmse=None,
-            y_bar=None,
-            y_max=None,
-            diverged=None,
-            n_pars=None,
-            nw=None,
-            note="no run matching {'x': False}",
-        ),
-    ]
-    body = _body_lines(eval_table.build_eval_table(rows))
-
-    # A run with no diverging test set still reports its other columns.
-    gensec = next(line for line in body if r"\MGenSec{}" in line)
-    assert "0.12 & -- & 0.93 & -- & 532 & 20" in gensec
-    # A model class with no matching run at all is kept as an empty row, and the
-    # comment says why instead of pointing at a run.
-    nosec = next(line for line in body if r"\MLtiRnn{}" in line)
-    assert nosec.count("--") == 6
-    assert nosec.endswith(r"\\ % no run matching {'x': False}")
+def test_certificate_rows_are_dashes_without_a_gensec_run():
+    rows = _rows(GenSec={"y_bar": None, "sigma_u": None})
+    tex = eval_table.build_eval_table(rows)
+    assert _line(tex, r"$\bar y$").endswith(r"\multicolumn{2}{l}{--} \\")
+    assert _line(tex, r"$\bar \sigma(\theta)$").endswith(r"\multicolumn{2}{l}{--} \\")
 
 
-def test_build_eval_table_notes_why_a_populated_row_has_no_count():
-    # A "--" on a row that has a run must say why, so "no diverging set logged"
-    # is never read as "nothing diverged".
-    rows = [_row("GenSec", diverged=None, note="no diverging test set logged")]
-    line = _body_lines(eval_table.build_eval_table(rows))[0]
-    assert line.endswith(
-        r"\\ % run_id=rid-GenSec experiment=exp-a [no diverging test set logged]"
+def test_parameter_counts_are_no_longer_tabulated():
+    tex = eval_table.build_eval_table(_rows())
+    assert r"\# pars" not in tex and r"$\nw$" not in tex
+
+
+def test_nrmse_precision_is_chosen_per_column():
+    # Small-valued column keeps 4 decimals; the larger one stays at 2. Both in
+    # the same table, because the decimals are a property of the column.
+    tex = eval_table.build_eval_table(
+        _rows(nrmse=(0.00205, 0.0192, 0.0246)) + _rows("Exp B", "exp-b", (0.22, 1.84, 0.55), 1.4)
+    )
+    nosec = _line(tex, r"\MLtiRnn{}")
+    assert "0.0021" in nosec and "0.00 " not in nosec
+    assert "0.22" in nosec
+
+
+def test_lowest_nrmse_per_column_is_bold_and_second_lowest_bold_italic():
+    tex = eval_table.build_eval_table(_rows(nrmse=(0.30, 0.20, 0.10)))
+    assert r"\textbf{0.10}" in _line(tex, r"\MGenSec{}")          # best
+    assert r"\textbf{\textit{0.20}}" in _line(tex, r"\MStdSec{}")  # second
+    assert r"\textbf" not in _line(tex, r"\MLtiRnn{}")             # worst: plain
+
+
+def test_emphasis_is_independent_per_experiment_column():
+    tex = eval_table.build_eval_table(
+        _rows(nrmse=(0.30, 0.20, 0.10)) + _rows("Exp B", "exp-b", (0.10, 0.20, 0.30), 1.4)
+    )
+    # NoSec is worst in A but best in B, so its single row carries both.
+    nosec = _line(tex, r"\MLtiRnn{}")
+    assert nosec.count(r"\textbf{0.10}") == 1
+    assert "0.30" in nosec
+
+
+def test_missing_values_render_as_dashes_and_are_not_emphasized():
+    rows = _rows(NoSec={"run_id": None, "nrmse": None, "diverged": None,
+                        "note": "no run matching {'x': False}"})
+    tex = eval_table.build_eval_table(rows)
+    nosec = _line(tex, r"\MLtiRnn{}")
+    assert nosec.startswith(r"\MLtiRnn{} & -- & -- \\")
+    assert r"\textbf{--}" not in tex
+
+
+def test_every_row_traces_each_experiment_to_its_run():
+    tex = eval_table.build_eval_table(_rows() + _rows("Exp B", "exp-b", (0.9, 0.8, 0.7), 1.4))
+    assert _line(tex, r"\MGenSec{}").endswith(
+        r"\\ % exp-a=rid-GenSec, exp-b=rid-GenSec"
     )
 
 
-def test_build_eval_table_escapes_experiment_names():
-    tex = eval_table.build_eval_table([_row("GenSec", experiment="Sanity: a_b & c")])
+def test_trace_reports_why_a_cell_is_empty():
+    rows = _rows(NoSec={"run_id": None, "nrmse": None, "note": "no run matching {'x': False}"})
+    tex = eval_table.build_eval_table(rows)
+    assert _line(tex, r"\MLtiRnn{}").endswith("% exp-a=<no run matching {'x': False}>")
+
+
+def test_trace_keeps_a_note_alongside_a_run_that_did_produce_one():
+    rows = _rows(GenSec={"note": "no diverging test set logged"})
+    tex = eval_table.build_eval_table(rows)
+    assert _line(tex, r"\MGenSec{}").endswith(
+        "% exp-a=rid-GenSec [no diverging test set logged]"
+    )
+
+
+def test_escapes_experiment_names_and_rejects_empty_input():
+    tex = eval_table.build_eval_table(_rows(experiment="Sanity: a_b & c"))
     assert r"Sanity: a\_b \& c" in tex
+    with pytest.raises(ValueError, match="no rows"):
+        eval_table.build_eval_table([])
+
+
+def test_structure_matches_the_shipped_template():
+    template = (
+        Path(__file__).resolve().parents[1] / "results" / "eval_table_template.tex"
+    )
+    if not template.exists():
+        pytest.skip(f"{template} not present")
+    wanted = template.read_text()
+    tex = eval_table.build_eval_table(_rows())
+    # Every structural line of the template appears in the rendered table.
+    for token in (r"\begin{tabular}{rll}", r"\toprule", r"\midrule", r"\bottomrule",
+                  r"Model  & NRMSE & \# div/ total \\", r"$\bar \sigma(\theta)$",
+                  r"$\bar y$", r"\MLtiRnn{}", r"\MStdSec{}", r"\MGenSec{}"):
+        assert token in wanted, f"{token} missing from the template itself"
+        assert token in tex, f"{token} missing from the rendered table"
+
+
+# ── certificate-quantity formatting ───────────────────────────────────────────
+def test_significant_keeps_three_figures_across_magnitudes():
+    # These three live in the same table: y_max ~ 0.9, ybar ~ 335, sigma ~ 5e-5.
+    # One shared decimal count printed y_max as 0.934495.
+    assert eval_table.significant(0.934495) == "0.934"
+    assert eval_table.significant(0.358288) == "0.358"
+    assert eval_table.significant(335.46) == "335"
+    assert eval_table.significant(19.7) == "19.7"
+
+
+def test_significant_switches_to_latex_scientific_at_the_extremes():
+    # A collapsed admissible input set really is ~5e-5; "0.000050" is noise.
+    assert eval_table.significant(5.0e-5) == r"$5.00 \cdot 10^{-5}$"
+    assert eval_table.significant(-5.0e-5) == r"$-5.00 \cdot 10^{-5}$"
+    assert eval_table.significant(2.5e6) == r"$2.50 \cdot 10^{6}$"
+    # ... but stays plain inside [1e-3, 1e5).
+    assert eval_table.significant(1.0e-3) == "0.001"
+    assert eval_table.significant(99999.0) == "1e+05"
+
+
+def test_significant_handles_holes_and_zero():
+    assert eval_table.significant(None) == "--"
+    assert eval_table.significant(float("nan")) == "--"
+    assert eval_table.significant(0.0) == "0"
+
+
+def test_a_tiny_sigma_does_not_drag_the_other_certificate_cells():
+    rows = _rows(y_max=0.934495, GenSec={"y_bar": 0.358288, "sigma_u": 5.0e-5})
+    tex = eval_table.build_eval_table(rows)
+    assert r"$y_{\text{max}} = 0.934$" in tex
+    assert _line(tex, r"$\bar y$").endswith(r"{0.358} \\")
+    assert r"$5.00 \cdot 10^{-5}$" in _line(tex, r"$\bar \sigma(\theta)$")
