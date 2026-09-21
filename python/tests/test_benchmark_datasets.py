@@ -29,7 +29,6 @@ import yaml
 
 from sysid.config import Config
 from sysid.data import benchmark_prep as bp
-from sysid.data.direct_loader import load_split_data
 
 REPO_PY = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_PY / "scripts"
@@ -42,12 +41,6 @@ def _load_script_module(name: str, path: Path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-tanks_prep = _load_script_module(
-    "prepare_cascaded_tanks_dataset", SCRIPTS / "prepare_cascaded_tanks_dataset.py"
-)
-f16_prep = _load_script_module("prepare_f16_dataset", SCRIPTS / "prepare_f16_dataset.py")
 
 
 # ── shared helpers ────────────────────────────────────────────────────────────
@@ -102,154 +95,15 @@ class TestBenchmarkPrepHelpers:
 
 
 # ── Cascaded Tanks ────────────────────────────────────────────────────────────
-def _tanks_records(n=1024):
-    """Synthetic records shaped like the tanks: offset, positive, saturating."""
-    rng = np.random.default_rng(0)
-    u = 3.0 + rng.standard_normal(n) * 0.9
-    y = np.clip(5.0 + np.cumsum(u - 3.0) * 0.05, None, 10.0)
-    return u.reshape(-1, 1), y.reshape(-1, 1)
-
-
-@pytest.fixture(scope="module")
-def tanks_dir(tmp_path_factory):
-    out = tmp_path_factory.mktemp("tanks") / "id"
-    tanks_prep.prepare_dataset(
-        estimation=_tanks_records(1024),
-        test=_tanks_records(1024),
-        out_dir=out,
-        sampling_time=4.0,
-        val_fraction=0.2,
-    )
-    return out
-
-
-class TestCascadedTanksLayout:
-    def test_split_sizes_and_columns(self, tanks_dir):
-        train = pd.read_csv(tanks_dir / "train" / "tanks_train.csv")
-        val = pd.read_csv(tanks_dir / "validation" / "tanks_validation.csv")
-        test = pd.read_csv(tanks_dir / "test" / "tanks_test.csv")
-        assert list(train.columns) == ["u", "y"]
-        assert len(train) == 819 and len(val) == 205  # 1024 split 80/20
-        assert len(test) == 1024  # test is never chunked
-
-    def test_loader_reads_the_layout_back(self, tanks_dir):
-        out = load_split_data(str(tanks_dir), input_col=["u"], output_col=["y"])
-        train_in, train_out = out[0], out[1]
-        assert train_in.shape == (1, 819, 1)
-        assert train_out.shape == (1, 819, 1)
-
-    def test_metadata_records_the_offset_warning(self, tanks_dir):
-        meta = json.loads((tanks_dir / "metadata.json").read_text())
-        assert meta["sampling_time"] == 4.0
-        assert meta["benchmark_state_initialization_window_length"] == 5
-        # The non-zero-mean property is what drives normalization_method in the
-        # config, so it is recorded rather than left for the reader to rediscover.
-        assert "not zero-mean" in meta["notes"]
-        assert meta["records"]["train"]["y_mean"][0] > 1.0
-
-    def test_clean_removes_stale_files_of_another_length(self, tmp_path):
-        out = tmp_path / "id"
-        rec = _tanks_records(1024)
-        tanks_prep.prepare_dataset(estimation=rec, test=rec, out_dir=out,
-                                   sampling_time=4.0, subsequence_length=128)
-        n_chunked = len(list((out / "train").glob("*.csv")))
-        assert n_chunked > 1
-        # Re-preparing full-length must not leave the 128-row files behind, or
-        # the np.stack in load_split_data hits mixed lengths.
-        tanks_prep.prepare_dataset(estimation=rec, test=rec, out_dir=out,
-                                   sampling_time=4.0, subsequence_length=None)
-        assert len(list((out / "train").glob("*.csv"))) == 1
 
 
 # ── F-16 ──────────────────────────────────────────────────────────────────────
-def _f16_record(n=4096, seed=0, amplitude=1.0):
-    """One synthetic F-16-shaped record: 1 force in, 3 accelerations out."""
-    rng = np.random.default_rng(seed)
-    u = rng.standard_normal(n) * 36.0 * amplitude
-    y = np.stack([np.cumsum(u) * 1e-4 * g for g in (1.0, 1.5, 1.4)], axis=1)
-    return u.reshape(-1, 1), y
-
-
-@pytest.fixture(scope="module")
-def f16_records():
-    return {
-        "F16Data_FullMSine_Level3": _f16_record(4096, seed=0),
-        "F16Data_FullMSine_Level4_Validation": _f16_record(2048, seed=1, amplitude=1.6),
-        "F16Data_FullMSine_Level6_Validation": _f16_record(2048, seed=2, amplitude=2.3),
-    }
-
-
-@pytest.fixture(scope="module")
-def f16_dir(tmp_path_factory, f16_records):
-    out = tmp_path_factory.mktemp("f16") / "id"
-    f16_prep.prepare_dataset(
-        records=f16_records,
-        out_dir=out,
-        sampling_time=0.0025,
-        extra_test_records=["F16Data_FullMSine_Level6_Validation"],
-    )
-    return out
-
-
-class TestF16Layout:
-    def test_all_three_accelerometers_are_written(self, f16_dir):
-        df = pd.read_csv(f16_dir / "train" / "f16_train.csv")
-        # The point: ne is chosen by the config's output_col, so the CSV must
-        # carry every channel regardless of what a given run fits.
-        assert list(df.columns) == ["u", "y1", "y2", "y3"]
-
-    def test_loader_reads_one_or_three_outputs_from_the_same_files(self, f16_dir):
-        one = load_split_data(str(f16_dir), input_col=["u"], output_col=["y1"])
-        three = load_split_data(str(f16_dir), input_col=["u"], output_col=["y1", "y2", "y3"])
-        assert one[1].shape == (1, 3277, 1)
-        assert three[1].shape == (1, 3277, 3)
-        np.testing.assert_allclose(three[1][..., 0], one[1][..., 0])
-
-    def test_test_folder_is_the_higher_amplitude_record(self, f16_dir):
-        train = pd.read_csv(f16_dir / "train" / "f16_train.csv")
-        test = pd.read_csv(f16_dir / "test" / "F16Data_FullMSine_Level4_Validation.csv")
-        # The default split tests one amplitude level UP, so the test set is an
-        # extrapolation rather than a resample.
-        assert test["u"].abs().max() > train["u"].abs().max()
-
-    def test_sibling_folders_keep_other_records_addressable(self, f16_dir):
-        sibling = f16_dir / "test_F16Data_FullMSine_Level6_Validation"
-        assert sibling.is_dir() and len(list(sibling.glob("*.csv"))) == 1
-        # Inert as far as load_split_data is concerned -- it only knows
-        # train/validation/test.
-        assert load_split_data(str(f16_dir), input_col=["u"], output_col=["y1"])[0] is not None
-
-    def test_metadata_flags_the_missing_official_split(self, f16_dir):
-        meta = json.loads((f16_dir / "metadata.json").read_text())
-        assert meta["official_split"] is False
-        assert "no train/test split" in meta["split_note"]
-        assert meta["accelerometers_written"] == [1, 2, 3]
-        assert meta["output_col"] == ["y1", "y2", "y3"]
-        assert "TypeError" in meta["multi_output_note"]
-
-    def test_select_outputs_picks_1_based_channels(self):
-        y = np.arange(30.0).reshape(10, 3)
-        np.testing.assert_array_equal(f16_prep.select_outputs(y, [1]), y[:, :1])
-        np.testing.assert_array_equal(f16_prep.select_outputs(y, [1, 3]), y[:, [0, 2]])
-        with pytest.raises(ValueError, match="must be in 1..3"):
-            f16_prep.select_outputs(y, [0])
-
-    def test_single_output_preparation(self, tmp_path, f16_records):
-        out = tmp_path / "id"
-        meta = f16_prep.prepare_dataset(records=f16_records, out_dir=out,
-                                        sampling_time=0.0025, outputs=[2])
-        assert meta["output_col"] == ["y2"]
-        assert list(pd.read_csv(out / "train" / "f16_train.csv").columns) == ["u", "y2"]
-
-    def test_unknown_record_is_rejected(self, tmp_path, f16_records):
-        with pytest.raises(ValueError, match="was not loaded"):
-            f16_prep.prepare_dataset(records=f16_records, out_dir=tmp_path,
-                                     sampling_time=0.0025, train_record="nope")
 
 
 # ── the shipped configs ───────────────────────────────────────────────────────
+# Cascaded Tanks was dropped from the adapter (its signals are not zero-mean;
+# see benchmark_registry.REGISTRY), so its config is no longer pinned here.
 CONFIGS = [
-    ("crnn_cascaded-tanks", "CascadedTanks", "standard", ["y"]),
     # output_col is deliberately NOT pinned for the F-16: it is the knob for
     # fitting one accelerometer or all three. What must hold either way is the
     # nx >= ne invariant below.

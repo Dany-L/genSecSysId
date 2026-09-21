@@ -1,4 +1,4 @@
-"""Tests for the Silverbox benchmark dataset (scripts/prepare_silverbox_dataset.py).
+"""Tests for the Silverbox benchmark dataset (scripts/prepare_benchmark.py).
 
 Three things are pinned here:
 
@@ -19,18 +19,15 @@ synthetic records instead of fetching 6 MB from Google Drive.
 """
 
 import importlib.util
-import json
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import pytest
 import yaml
 
 from sysid.config import Config
-from sysid.data.direct_loader import load_split_data
 from tests.solver_utils import requires_mosek
 
 REPO_PY = Path(__file__).resolve().parents[1]
@@ -60,8 +57,8 @@ def _load_script_module(name: str, path: Path):
     return module
 
 
-prep = _load_script_module(
-    "prepare_silverbox_dataset", SCRIPTS / "prepare_silverbox_dataset.py"
+prepare_benchmark = _load_script_module(
+    "prepare_benchmark", SCRIPTS / "prepare_benchmark.py"
 )
 
 
@@ -88,201 +85,47 @@ def _lure_record(n_steps: int, seed: int, amplitude: float = 0.02):
 
 
 def _synthetic_records(n_train_val=4000, n_test=1200):
-    """(train_val, test_records) in the shape prepare_dataset expects."""
-    train_val = _lure_record(n_train_val, seed=0)
-    return train_val, {
-        "multisine": _lure_record(n_test, seed=1),
+    """(train_records, test_records) in the shape `prepare` expects."""
+    from sysid.data.benchmark_registry import Record
+
+    train = [Record("multisine_train", *_lure_record(n_train_val, seed=0))]
+    tests = [
+        Record("multisine", *_lure_record(n_test, seed=1)),
         # The real arrow record extrapolates past the training amplitude; mirror
-        # that here so a test can assert the metadata reports it.
-        "arrow": _lure_record(n_test + 300, seed=2, amplitude=0.05),
-        "arrow_no_extrapolation": _lure_record(n_test, seed=3, amplitude=0.015),
-    }
+        # that here, including its different length, so the ragged-test rule is
+        # exercised.
+        Record("arrow", *_lure_record(n_test + 300, seed=2, amplitude=0.05)),
+        Record("arrow_no_extrapolation", *_lure_record(n_test, seed=3, amplitude=0.015)),
+    ]
+    return train, tests
 
 
 @pytest.fixture(scope="module")
 def prepared_dir(tmp_path_factory):
-    """A full prepared Silverbox layout built from synthetic records."""
+    """A full prepared Silverbox layout built from synthetic records.
+
+    Goes through the generic adapter (`scripts/prepare_benchmark.py`), which
+    replaced the per-benchmark prep scripts. The arms below are what this file
+    is really for: they check that a CRNN trains end to end on this layout.
+    """
+    from sysid.data.benchmark_registry import get
+
     out = tmp_path_factory.mktemp("silverbox") / "id"
-    train_val, tests = _synthetic_records()
-    prep.prepare_dataset(
-        train_val=train_val,
-        test_records=tests,
-        out_dir=out,
-        sampling_time=1 / 610.35,
-        val_fraction=0.2,
-        subsequence_length=None,
-        test_set="multisine",
+    train, tests = _synthetic_records()
+    prepare_benchmark.prepare(
+        get("Silverbox"), out, train, tests, 1 / 610.35,
+        val_fraction=0.2, test_record="multisine",
     )
     return out
 
 
 # --------------------------------------------------------------------------
-# split arithmetic
-# --------------------------------------------------------------------------
-class TestSplitTrainVal:
-    def test_split_is_contiguous_and_lossless(self):
-        u = np.arange(1000, dtype=float).reshape(-1, 1)
-        y = u * 2.0
-        u_tr, y_tr, u_va, y_va = prep.split_train_val(u, y, val_fraction=0.2)
-
-        assert len(u_tr) == 800 and len(u_va) == 200
-        # Contiguous, validation is the TAIL — a shuffled split would leak the
-        # validation dynamics into training through overlapping windows.
-        np.testing.assert_array_equal(np.concatenate([u_tr, u_va]), u)
-        np.testing.assert_array_equal(u_va[0], [800.0])
-        np.testing.assert_array_equal(y_tr, u_tr * 2.0)
-        np.testing.assert_array_equal(y_va, u_va * 2.0)
-
-    def test_accepts_1d_signals(self):
-        u_tr, _, u_va, _ = prep.split_train_val(
-            np.arange(100, dtype=float), np.arange(100, dtype=float), 0.25
-        )
-        assert u_tr.shape == (75, 1) and u_va.shape == (25, 1)
-
-    @pytest.mark.parametrize("frac", [0.0, 1.0, -0.1, 1.5])
-    def test_rejects_degenerate_fractions(self, frac):
-        with pytest.raises(ValueError):
-            prep.split_train_val(np.zeros(100), np.zeros(100), frac)
-
-    def test_rejects_mismatched_lengths(self):
-        with pytest.raises(ValueError, match="differ in length"):
-            prep.split_train_val(np.zeros(100), np.zeros(90), 0.2)
-
-
-# --------------------------------------------------------------------------
 # CSV writing
 # --------------------------------------------------------------------------
-class TestWriteSplit:
-    def test_single_file_keeps_every_sample(self, tmp_path):
-        u, y = _lure_record(500, seed=7)
-        written = prep.write_split(tmp_path / "train", u, y)
-
-        assert len(written) == 1
-        df = pd.read_csv(written[0])
-        assert list(df.columns) == ["u", "y"]
-        assert len(df) == 500
-        np.testing.assert_allclose(df["u"].values, u[:, 0])
-
-    def test_chunking_drops_the_short_remainder(self, tmp_path):
-        """A short trailing file would break load_split_data's np.stack."""
-        u, y = _lure_record(1050, seed=8)
-        written = prep.write_split(tmp_path / "train", u, y, subsequence_length=100)
-
-        assert len(written) == 10  # 1050 // 100, the last 50 samples dropped
-        lengths = {len(pd.read_csv(p)) for p in written}
-        assert lengths == {100}
-        # Chunks are consecutive, not shuffled.
-        np.testing.assert_allclose(pd.read_csv(written[1])["u"].values, u[100:200, 0])
-
-    def test_rejects_subsequence_longer_than_the_record(self, tmp_path):
-        u, y = _lure_record(50, seed=9)
-        with pytest.raises(ValueError, match="exceeds the 50-sample record"):
-            prep.write_split(tmp_path / "train", u, y, subsequence_length=100)
-
 
 # --------------------------------------------------------------------------
 # the prepared layout
 # --------------------------------------------------------------------------
-class TestPrepareDataset:
-    def test_writes_every_folder_the_loader_and_the_study_need(self, prepared_dir):
-        for name in [
-            "train", "validation", "test",
-            "test_multisine", "test_arrow", "test_arrow_no_extrapolation",
-        ]:
-            folder = prepared_dir / name
-            assert folder.is_dir(), f"missing {name}/"
-            assert list(folder.glob("*.csv")), f"{name}/ has no CSVs"
-
-    def test_loader_reads_it_back(self, prepared_dir):
-        """The actual contract: direct_loader.load_split_data must not raise."""
-        (train_in, train_out, val_in, val_out, test_in, test_out, *_) = load_split_data(
-            str(prepared_dir), input_col=["u"], output_col=["y"]
-        )
-        # One full-length CSV per split -> (1, T, 1).
-        assert train_in.shape == (1, 3200, 1)
-        assert val_in.shape == (1, 800, 1)
-        assert test_in.shape == (1, 1200, 1)
-        assert train_out.shape == train_in.shape
-        assert val_out.shape == val_in.shape
-        assert test_out.shape == test_in.shape
-
-    def test_chunked_layout_also_loads(self, tmp_path):
-        train_val, tests = _synthetic_records()
-        out = tmp_path / "chunked"
-        prep.prepare_dataset(
-            train_val=train_val, test_records=tests, out_dir=out,
-            sampling_time=1 / 610.35, subsequence_length=400,
-        )
-        train_in, *_ = load_split_data(str(out), input_col=["u"], output_col=["y"])
-        assert train_in.shape == (8, 400, 1)  # 3200 // 400
-
-    def test_test_folder_mirrors_the_selected_record(self, prepared_dir):
-        a = pd.read_csv(next((prepared_dir / "test").glob("*.csv")))
-        b = pd.read_csv(next((prepared_dir / "test_multisine").glob("*.csv")))
-        pd.testing.assert_frame_equal(a, b)
-
-    def test_test_set_flag_selects_the_arrow_record(self, tmp_path):
-        train_val, tests = _synthetic_records()
-        out = tmp_path / "arrow"
-        prep.prepare_dataset(
-            train_val=train_val, test_records=tests, out_dir=out,
-            sampling_time=1 / 610.35, test_set="arrow",
-        )
-        _, _, _, _, test_in, *_ = load_split_data(
-            str(out), input_col=["u"], output_col=["y"]
-        )
-        assert test_in.shape[1] == 1500  # the longer arrow record
-
-    def test_metadata_records_provenance_and_amplitudes(self, prepared_dir):
-        meta = json.loads((prepared_dir / "metadata.json").read_text())
-
-        assert meta["dataset"] == "Silverbox"
-        assert "official train/test split" in meta["source"]
-        assert meta["input_col"] == ["u"] and meta["output_col"] == ["y"]
-        assert meta["test_set_in_test_folder"] == "multisine"
-        assert meta["benchmark_state_initialization_window_length"] == 50
-        assert meta["sampling_time"] == pytest.approx(1 / 610.35)
-        # The whole point of keeping the arrow record separate: it leaves the
-        # amplitude range the certificate was fit over.
-        assert (
-            meta["records"]["test_arrow"]["u_abs_max"]
-            > meta["records"]["train"]["u_abs_max"]
-        )
-
-    def test_clean_removes_stale_csvs(self, tmp_path):
-        """Re-preparing with a different chunk size must not mix row counts."""
-        train_val, tests = _synthetic_records()
-        out = tmp_path / "restage"
-        prep.prepare_dataset(
-            train_val=train_val, test_records=tests, out_dir=out,
-            sampling_time=1 / 610.35, subsequence_length=400,
-        )
-        prep.prepare_dataset(
-            train_val=train_val, test_records=tests, out_dir=out,
-            sampling_time=1 / 610.35, subsequence_length=800,
-        )
-        lengths = {
-            len(pd.read_csv(p)) for p in (out / "train").glob("*.csv")
-        }
-        assert lengths == {800}, "stale 400-row CSVs survived the re-prepare"
-
-    def test_rejects_an_unknown_test_set(self, tmp_path):
-        train_val, tests = _synthetic_records()
-        with pytest.raises(ValueError, match="test_set must be one of"):
-            prep.prepare_dataset(
-                train_val=train_val, test_records=tests, out_dir=tmp_path / "x",
-                sampling_time=1 / 610.35, test_set="schroeder",
-            )
-
-    def test_rejects_incomplete_test_records(self, tmp_path):
-        train_val, tests = _synthetic_records()
-        tests.pop("arrow")
-        with pytest.raises(ValueError, match="missing"):
-            prep.prepare_dataset(
-                train_val=train_val, test_records=tests, out_dir=tmp_path / "x",
-                sampling_time=1 / 610.35,
-            )
-
 
 # --------------------------------------------------------------------------
 # the three model arms, end to end
@@ -520,8 +363,9 @@ def _silverbox_is_cached() -> bool:
 @pytest.mark.skipif(
     not _silverbox_is_cached(),
     reason="Silverbox not in the nonlinear_benchmarks cache; "
-           "run scripts/prepare_silverbox_dataset.py once to fetch it",
+           "run scripts/prepare_benchmark.py once to fetch it",
 )
+@pytest.mark.benchmark_data
 def test_official_split_shapes_are_the_documented_ones():
     """Pins the package's split against what the configs and docstring assume.
 
@@ -529,14 +373,21 @@ def test_official_split_shapes_are_the_documented_ones():
     from under the prepared dataset — every published Silverbox number depends
     on these exact index ranges.
     """
-    (u_tv, y_tv), records, ts = prep.load_official_silverbox()
+    from sysid.data.benchmark_registry import REGISTRY
 
+    try:
+        train, test, ts = REGISTRY["Silverbox"].fetch()
+    except Exception as exc:  # not cached / no network
+        pytest.skip(f"Silverbox unavailable: {exc}")
+
+    by_name = {r.name: r for r in test}
+    u_tv = train[0].u
     assert len(u_tv) == 65062, "train_val block changed"
-    assert len(records["multisine"][0]) == 21688
-    assert len(records["arrow"][0]) == 40475
-    assert len(records["arrow_no_extrapolation"][0]) == 32000
+    assert len(by_name["multisine"].u) == 21688
+    assert len(by_name["arrow"].u) == 40475
+    assert len(by_name["arrow_no_extrapolation"].u) == 32000
     assert ts == pytest.approx(1 / 610.35)
-    # The ordering assumption the package's own .name attributes get wrong:
-    # test[1] is the arrow record and it extrapolates past the training range.
-    assert np.abs(records["arrow"][0]).max() > np.abs(u_tv).max()
-    assert np.abs(records["arrow_no_extrapolation"][0]).max() <= np.abs(u_tv).max()
+    # The naming assumption the package's own .name attributes get wrong:
+    # test[1] is the arrow record, and it extrapolates past the training range.
+    assert np.abs(by_name["arrow"].u).max() > np.abs(u_tv).max()
+    assert np.abs(by_name["arrow_no_extrapolation"].u).max() <= np.abs(u_tv).max()

@@ -12,6 +12,15 @@ import numpy as np
 os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
 
+def pytest_configure(config):
+    """Register the marks the suite uses, so -m filtering is not a typo risk."""
+    config.addinivalue_line(
+        "markers",
+        "benchmark_data: needs the nonlinear_benchmarks package and its cached "
+        "downloads; skips itself when they are unavailable",
+    )
+
+
 @pytest.fixture(autouse=True)
 def set_seed():
     """Set random seeds for reproducibility."""
