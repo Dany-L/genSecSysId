@@ -26,6 +26,7 @@ from typing import Optional
 import numpy as np
 import torch
 
+from sysid.optimization.output_set import output_ellipsoid
 from sysid.utils import get_volume_of_ellipsoid
 
 logger = logging.getLogger(__name__)
@@ -86,7 +87,8 @@ class LurePostProcessingMixin:
         y_max = float(y_max) if y_max is not None else None
 
         C = self.C.cpu().detach().numpy()
-        sigma = float(self.output_std)
+        # Per output channel; output_ellipsoid broadcasts a scalar.
+        sigma = self.output_std.cpu().detach().numpy()
 
         def _fmt(v):
             return "n/a" if v is None else f"{v:.4f}"
@@ -109,16 +111,13 @@ class LurePostProcessingMixin:
         P_c, L_c, s_c = max_s_sol.P, max_s_sol.L, max_s_sol.s
         vol_c = float(get_volume_of_ellipsoid(P_c, s_c))
         norm_H_c = float(np.linalg.norm(L_c @ np.linalg.inv(P_c), ord=2))
-        if self.ne == 1:
-            CPCt_c = max(float((C @ P_c @ C.T).item()), 0.0)
-            y_c = float(sigma * s_c * np.sqrt(CPCt_c))
-            coverage_ok = (
-                bool((sigma * s_c) ** 2 * CPCt_c >= y_max ** 2)
-                if y_max is not None else None
-            )
-        else:
-            y_c = None
-            coverage_ok = None
+        # The certified OUTPUT set of this certificate. ȳ_c is its worst
+        # direction; ellipsoid_c.y_bar_per_output holds the per-channel
+        # half-widths. Defined at every ne -- multi-output used to fall through
+        # to y_c = None here.
+        ellipsoid_c = output_ellipsoid(C, P_c, s_c, sigma)
+        y_c = ellipsoid_c.y_bar
+        coverage_ok = ellipsoid_c.covers(y_max) if y_max is not None else None
 
         logger.info("[Problem 1: MaxS — largest regional invariant set]")
         logger.info(f"  volume   = {vol_c:.3e}")
@@ -188,6 +187,7 @@ class LurePostProcessingMixin:
                 "volume": vol_c,
                 "norm_H": norm_H_c,
                 "y_bar": y_c,
+                "output_set": ellipsoid_c.to_dict(),
                 "max_eig_F": float(max_s_sol.max_eig_F),
                 "coverage_ok": coverage_ok,
                 "rho": rho,
@@ -355,13 +355,12 @@ class LurePostProcessingMixin:
 
         y_feas = s_feas = norm_H_feas = None
         ceil_sol = synth.max_s()  # pure; depends only on the (fixed) θ
-        if ceil_sol is not None and self.ne == 1:
+        if ceil_sol is not None:
             P_c = ceil_sol.P
             C_np = self.C.cpu().detach().numpy()
-            sigma = float(self.output_std)
-            CPCt_c = float((C_np @ P_c @ C_np.T).item())
+            sigma = self.output_std.cpu().detach().numpy()
             s_feas = float(ceil_sol.s)
-            y_feas = float(sigma * s_feas * np.sqrt(CPCt_c))
+            y_feas = output_ellipsoid(C_np, P_c, s_feas, sigma).y_bar
             H_c = ceil_sol.L @ np.linalg.inv(P_c)
             norm_H_feas = float(np.linalg.norm(H_c, ord=2))
 

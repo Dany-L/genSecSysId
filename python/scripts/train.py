@@ -592,8 +592,11 @@ def main():
                 else 0.0
             ),
             h_target=getattr(config.training, "h_target", 0.0),
+            # Per output channel -- reshape(-1) not [0], so a multi-output run
+            # reports each channel in its own physical units instead of all of
+            # them in channel 0's.
             output_std=(
-                float(np.asarray(normalizer.output_std).reshape(-1)[0])
+                np.asarray(normalizer.output_std, dtype=float).reshape(-1)
                 if normalizer is not None and getattr(normalizer, "output_std", None) is not None
                 else 1.0
             ),

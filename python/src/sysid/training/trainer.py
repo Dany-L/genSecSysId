@@ -137,8 +137,10 @@ class Trainer:
         self.h_regularization_weight = float(h_regularization_weight)
         self.h_target = float(h_target)
         # Physical output scale — relates the model's normalized C/P/s to the
-        # physical y_max it records for reporting.
-        self.output_std = float(output_std)
+        # physical y_max it records for reporting. PER OUTPUT CHANNEL: kept as a
+        # (ne,) array so multi-output models report each channel in its own
+        # units; a scalar is accepted and broadcast downstream.
+        self.output_std = np.asarray(output_std, dtype=float).reshape(-1)
 
         # Cached batch for the per-epoch dead-zone diagnostic
         self._diag_batch: Optional[tuple] = None
@@ -204,7 +206,11 @@ class Trainer:
             if e.numel() > 0:
                 peak_n = max(peak_n, float(e.abs().max()))
         if peak_n > 0.0:
-            y_max_phys = peak_n * self.output_std
+            # peak_n is the largest normalized |e| over every channel, so the
+            # physical level it implies is the largest over channels too --
+            # y_max is one level, the coverage requirement being that the
+            # certified set reaches it in EVERY direction.
+            y_max_phys = float(peak_n * np.max(self.output_std))
             self.model.set_output_coverage_level(y_max_phys, self.output_std)
             logging.info(f"Data output level y_max recorded (reporting only): {y_max_phys:.6f}")
 

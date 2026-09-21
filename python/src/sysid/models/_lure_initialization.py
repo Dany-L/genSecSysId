@@ -215,10 +215,11 @@ class LureInitializationMixin:
 
         # y_max is PHYSICAL (max |raw training output|); output_std relates the
         # model's normalized C/P/s to physical units.
+        # Per channel -- set_output_coverage_level broadcasts a scalar, so this
+        # is unchanged at ne == 1 and correct above it.
         sigma = normalizer.output_std if normalizer is not None else 1.0
-        sigma_scalar = float(np.asarray(sigma).reshape(-1)[0])
         y_max = max_abs_output(train_outputs) if normalizer is not None else None
-        self.set_output_coverage_level(y_max, sigma_scalar)
+        self.set_output_coverage_level(y_max, sigma)
 
         # Dead-zone activity of the final initialized model: firing_rate == 0 means
         # the nonlinearity is inert on the training data and, because Δ'(z) = 0 in
@@ -616,22 +617,39 @@ class LureInitializationMixin:
             else:
                 
                 if normalizer is None or getattr(normalizer, 'output_std', None) is None:
-                    output_scale = 1.0
-                    # raise ValueError(
-                    #     "Identity initialization of 'C' requires a normalizer with "
-                    #     "'output_std', or an explicit 'identity_init.C.value' / "
-                    #     "'identity_init.C.load_from' override in custom_params."
-                    # )
+                    output_scale = np.ones(self.ne)
                 else:
-                    output_scale = normalizer.output_std.squeeze()
-                # Read the first state out, scaled into normalized units.
-                # Built at (ne, nx) rather than the hard-coded 1x2 it replaces;
-                # identical at ne = 1, nx = 2, conformable at any size.
+                    # PER CHANNEL: each output has its own physical scale, so
+                    # each ROW of C carries its own 1/sigma_i. Flattening to one
+                    # number would put every channel in channel 0's units, and
+                    # multiplying a (ne,) numpy vector into a (ne, nx) tensor
+                    # would broadcast along nx -- scaling columns, not rows.
+                    output_scale = np.asarray(
+                        normalizer.output_std, dtype=float
+                    ).reshape(-1)
+                    if output_scale.size == 1:
+                        output_scale = np.repeat(output_scale, self.ne)
+                    if output_scale.size != self.ne:
+                        raise ValueError(
+                            f"normalizer.output_std has {output_scale.size} entries "
+                            f"but the model has ne={self.ne}."
+                        )
+                # Read one state out per output channel, scaled into normalized
+                # units. Built at (ne, nx) rather than the hard-coded 1x2 it
+                # replaces; identical at ne = 1, nx = 2, conformable at any size.
+                # Channel i reads state i when there is one, so a multi-output
+                # model does not start with every channel on the same state (and
+                # rows beyond nx start at zero, which is all a flat readout can
+                # do).
                 C_init = torch.zeros(
                     (self.ne, self.nx), device=self.C.device, dtype=self.C.dtype
                 )
-                C_init[0, 0] = 1.0
-                C_init = (1.0 / output_scale) * C_init
+                for i in range(min(self.ne, self.nx)):
+                    C_init[i, i] = 1.0
+                scale = torch.as_tensor(
+                    output_scale.reshape(-1, 1), device=self.C.device, dtype=self.C.dtype
+                )
+                C_init = C_init / scale
                 # C_init = 0.01 * torch.tensor(
                 #     [[1.0, 0.0]], device=self.C.device, dtype=self.C.dtype
                 # )
@@ -800,7 +818,8 @@ class LureInitializationMixin:
                 f"warm_start_units must be 'physical' or 'normalized', got {units!r}."
             )
 
-        sigma_u = sigma_y = 1.0
+        sigma_u = 1.0
+        sigma_y = torch.ones((self.ne, 1), device=self.C.device, dtype=self.C.dtype)
         if units == "physical":
             if normalizer is None:
                 raise ValueError(
@@ -810,10 +829,24 @@ class LureInitializationMixin:
                     "scaled for THIS dataset."
                 )
             sigma_u = float(np.asarray(normalizer.input_std).reshape(-1)[0])
-            sigma_y = float(np.asarray(normalizer.output_std).reshape(-1)[0])
+            # Per OUTPUT CHANNEL, as a column so it divides the ROWS of C / D12
+            # (one row per output). A scalar would put every channel in channel
+            # 0's units; broadcasting the flat vector would scale columns.
+            sigma_y_vec = np.asarray(normalizer.output_std, dtype=float).reshape(-1)
+            if sigma_y_vec.size == 1:
+                sigma_y_vec = np.repeat(sigma_y_vec, self.ne)
+            if sigma_y_vec.size != self.ne:
+                raise ValueError(
+                    f"normalizer.output_std has {sigma_y_vec.size} entries but the "
+                    f"model has ne={self.ne}."
+                )
+            sigma_y = torch.tensor(
+                sigma_y_vec.reshape(-1, 1), device=self.C.device, dtype=self.C.dtype
+            )
             logger.info(
                 f"  converting stored theta to model units: "
-                f"input_std={sigma_u:.6g}, output_std={sigma_y:.6g}"
+                f"input_std={sigma_u:.6g}, "
+                f"output_std={np.array2string(sigma_y_vec, precision=6)}"
             )
 
         shapes = {
