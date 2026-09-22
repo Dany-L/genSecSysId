@@ -20,7 +20,13 @@ unit-tested without a tracking server or a checkpoint:
   * :func:`resolve_run_config` — dotted key -> tag, else logged config.yaml
   * :func:`select_best_run`    — best run of a model class by the criterion
   * :func:`count_diverged`     — the zero-padded rollout
+  * :func:`split_by_stability` — rows -> one group of rows per table
   * :func:`build_eval_table`   — rows -> LaTeX
+
+The benchmarks split into one table per ``stability`` class of the YAML: the
+synthetic systems, where the true dynamics are known to be regionally stable
+and a diverging test set exists, and the measured ones, where stability is
+unknown and the ``# div/total`` column has nothing to report.
 
 (LaTeX needs ``booktabs`` and ``multirow``; the row labels are the project's
 ``\\MLtiRnn`` / ``\\MStdSec`` / ``\\MGenSec`` macros and ``\\nw``.)
@@ -50,9 +56,23 @@ PLAIN_ROWS: List[str] = ["NoSec", "StdSec"]
 # Rows that only GenSec has: a certificate quantity spanning the whole column
 # group, because it is not one of the two per-model metrics.
 GENSEC_EXTRA_ROWS: List[Tuple[str, str]] = [
-    (r"$\bar y$", "y_bar"),
     (r"$\bar \sigma(\theta)$", "sigma_u"),
+    (r"$\bar y$", "y_bar"),
 ]
+# A fixed label carried directly under each of the two reference arms, spelling
+# out the admissible input set they imply. Neither is a measured quantity -- the
+# row holds the label and no cells, exactly as the template writes it.
+MODEL_ANNOTATIONS: Dict[str, str] = {
+    "NoSec": r"$\bar \sigma(\theta) = \infty$",
+    "StdSec": r"$\bar \sigma(\theta) = 0$",
+}
+
+# ── stability classes ─────────────────────────────────────────────────────────
+# `stability:` in the YAML names which table an experiment belongs to. Only the
+# synthetic, regionally stable systems have a diverging test set, so only their
+# table emphasises the '# div/total' column.
+DEFAULT_STABILITY = "unknown"
+REGIONAL_STABILITY = "regionally-stable"
 
 # ── where each column comes from ──────────────────────────────────────────────
 # ȳ moved from a flat key to the per-certificate namespace part-way through the
@@ -84,6 +104,7 @@ class EvalRow:
     model_name: str
     run_id: Optional[str] = None
     mlflow_experiment_name: Optional[str] = None
+    stability: str = DEFAULT_STABILITY  # which table this row belongs in
     nrmse: Optional[float] = None
     y_bar: Optional[float] = None
     y_max: Optional[float] = None
@@ -126,13 +147,46 @@ def _as_selector(raw: Any, where: str) -> Dict[str, Any]:
     )
 
 
+def _canon_stability(value: Any) -> str:
+    """The ``stability:`` field as a lowercase, dash-separated class name."""
+    text = str(value if value is not None else DEFAULT_STABILITY).strip().lower()
+    return "-".join(text.replace("_", " ").replace("-", " ").split()) or DEFAULT_STABILITY
+
+
+def stability_slug(stability: str) -> str:
+    """Filename-safe form of a stability class (``Regionally Stable`` -> ...)."""
+    return _canon_stability(stability)
+
+
+def is_regional(stability: str) -> bool:
+    """True for the regionally-stable class, however the YAML spells it.
+
+    Only that class has a diverging test set, so only its table emphasises the
+    ``# div/total`` column.
+    """
+    return _canon_stability(stability).startswith("regional")
+
+
+def split_by_stability(rows: Sequence["EvalRow"]) -> List[Tuple[str, List["EvalRow"]]]:
+    """``[(stability, rows), ...]`` in first-seen order -- one entry per table.
+
+    The synthetic systems and the measured ones answer different questions and
+    no longer share a table: grouping happens here so the MLflow lookup still
+    runs once over every experiment.
+    """
+    groups: Dict[str, List["EvalRow"]] = {}
+    for row in rows:
+        groups.setdefault(_canon_stability(row.stability), []).append(row)
+    return list(groups.items())
+
+
 def load_table_config(path) -> Dict[str, Any]:
     """Parse the evaluation-table YAML into a normalised, validated structure.
 
     Returns ``{"experiments": [...]}`` where each experiment carries a resolved
-    ``criterion`` and ``divergence`` block (experiment value, else the file's
-    ``defaults``, else the module default) and each run carries a flat
-    ``selector`` dict.
+    ``criterion``, ``stability`` class and ``divergence`` block (experiment
+    value, else the file's ``defaults``, else the module default) and each run
+    carries a flat ``selector`` dict.
     """
     with open(path) as fh:
         raw = yaml.safe_load(fh)
@@ -142,6 +196,7 @@ def load_table_config(path) -> Dict[str, Any]:
 
     defaults = raw.get("defaults") or {}
     base_criterion = defaults.get("criterion", DEFAULT_CRITERION)
+    base_stability = defaults.get("stability", DEFAULT_STABILITY)
     base_divergence = {**DEFAULT_DIVERGENCE, **(defaults.get("divergence") or {})}
 
     experiments: List[Dict[str, Any]] = []
@@ -169,6 +224,10 @@ def load_table_config(path) -> Dict[str, Any]:
                 "mlflow_server_uri": exp.get("mlflow_server_uri"),
                 "mlflow_experiment_name": exp["mlflow_experiment_name"],
                 "criterion": exp.get("criterion", base_criterion),
+                # An experiment that names no stability class is treated as
+                # unknown: the conservative side, since "regionally stable" is
+                # a claim about the true system, not a default.
+                "stability": _canon_stability(exp.get("stability", base_stability)),
                 "divergence": {**base_divergence, **(exp.get("divergence") or {})},
                 "runs": runs,
             }
@@ -472,6 +531,26 @@ def rank_emphasis(
     return marks
 
 
+def max_emphasis(values: Sequence[Optional[float]]) -> Dict[int, bool]:
+    """``{index: True}`` for every entry holding the LARGEST value.
+
+    Used for ``# div/total`` on the regionally-stable table, where the inputs
+    are ones the true system diverges on: a model that reproduces the most of
+    them is the faithful one, so there the highest count -- not the lowest --
+    is the one to mark. Only the leader is marked, ties share it, and holes are
+    skipped.
+    """
+    scored = [
+        (float(v), i)
+        for i, v in enumerate(values)
+        if v is not None and not (isinstance(v, float) and math.isnan(v))
+    ]
+    if not scored:
+        return {}
+    largest = max(v for v, _ in scored)
+    return {i: True for v, i in scored if v == largest}
+
+
 def _emphasize(text: str, bold: bool, italic: bool) -> str:
     """Text-mode emphasis, matching ``tables._emphasize``."""
     if bold and italic:
@@ -501,6 +580,8 @@ def build_eval_table(
     min_decimals: int = 2,
     max_decimals: int = 6,
     significant_digits: int = 3,
+    with_diverged: bool = True,
+    emphasize_diverged: bool = False,
 ) -> str:
     r"""Render rows as the LaTeX table of ``results/eval_table_template.tex``.
 
@@ -509,18 +590,25 @@ def build_eval_table(
     one experiment per block and made that comparison a vertical scan.
 
     Each experiment owns a two-column group ``(NRMSE, # div/total)`` under a
-    spanning header carrying its name and its ``y_max``. ``\MLtiRnn`` and
-    ``\MStdSec`` take one row each; ``\MGenSec`` takes a row plus two more,
-    ``$\bar y$`` and ``$\bar\sigma(\theta)$``, which span the whole group
-    because they are certificate quantities rather than per-model metrics and
-    only the regional arm has them.
+    spanning header carrying its name and its ``y_max`` -- or a single NRMSE
+    column with ``with_diverged`` false, for the benchmarks that have no
+    diverging trajectories to count, where the column is "--" throughout. ``\MLtiRnn`` and
+    ``\MStdSec`` take a metric row each, followed by the template's fixed
+    ``$\bar\sigma(\theta) = \infty$`` / ``$= 0$`` label row; ``\MGenSec`` takes a
+    row plus ``$\bar\sigma(\theta)$`` and ``$\bar y$``, which span the whole
+    group because they are certificate quantities rather than per-model metrics
+    and only the regional arm has them.
 
     NRMSE decimals are chosen per column by :func:`adaptive_decimals`; the
     certificate quantities use :func:`significant` instead, because they span
     a column group and orders of magnitude. Per NRMSE
     column the lowest is bold, the second lowest bold-italic
-    (:func:`rank_emphasis`). Every row ends in a LaTeX comment mapping each
-    experiment to the run it was filled from.
+    (:func:`rank_emphasis`). With ``emphasize_diverged`` the highest
+    ``# div/total`` per column is bold too (:func:`max_emphasis`) -- the
+    regionally-stable table, where reproducing a divergence of the true system
+    is the good outcome. Every row ends in a LaTeX comment mapping each
+    experiment to the run it was filled from, whether or not its divergence
+    count is shown.
 
     (LaTeX needs ``booktabs``; the labels are the project's ``\MLtiRnn`` /
     ``\MStdSec`` / ``\MGenSec`` macros.)
@@ -539,9 +627,13 @@ def build_eval_table(
     def cell(experiment: str, model: str) -> Optional[EvalRow]:
         return by_experiment[experiment].get(model)
 
+    # Columns per experiment: NRMSE alone, or NRMSE and the divergence count.
+    span = 2 if with_diverged else 1
+
     # One decimal count and one emphasis map per experiment column.
     decimals: Dict[str, int] = {}
     emphasis: Dict[str, Dict[int, Tuple[bool, bool]]] = {}
+    div_emphasis: Dict[str, Dict[int, bool]] = {}
     for experiment in experiments:
         nrmse = [
             (cell(experiment, m).nrmse if cell(experiment, m) else None) for m in ROW_ORDER
@@ -553,6 +645,17 @@ def build_eval_table(
             max_decimals=max_decimals,
         )
         emphasis[experiment] = rank_emphasis(nrmse)
+        # Ranked on the count, not the ratio: one experiment's column shares a
+        # single diverging test set, so the totals agree by construction.
+        diverged = [
+            (cell(experiment, m).diverged if cell(experiment, m) else None)
+            for m in ROW_ORDER
+        ]
+        div_emphasis[experiment] = (
+            max_emphasis([d[0] if d else None for d in diverged])
+            if emphasize_diverged
+            else {}
+        )
 
     # y_max belongs to the dataset, not the model, so it goes in the header.
     # Any arm of the experiment carries it; take the first that does.
@@ -566,15 +669,15 @@ def build_eval_table(
         y_max[experiment] = levels[0] if levels else None
 
     header_names = " ".join(
-        rf"& \multicolumn{{2}}{{c}}{{{_escape(e)}}}" for e in experiments
+        rf"& \multicolumn{{{span}}}{{c}}{{{_escape(e)}}}" for e in experiments
     )
     header_levels = " ".join(
-        rf"& \multicolumn{{2}}{{l}}{{$y_{{\text{{max}}}} = "
+        rf"& \multicolumn{{{span}}}{{c}}{{$y_{{\text{{max}}}} = "
         rf"{significant(y_max[e], digits=significant_digits)}$}}"
         for e in experiments
     )
     header_metrics = "Model  & " + " & ".join(
-        " & ".join(SUB_HEADER) for _ in experiments
+        " & ".join(SUB_HEADER[:span]) for _ in experiments
     )
 
     body: List[str] = []
@@ -582,22 +685,31 @@ def build_eval_table(
     def metric_row(model: str) -> str:
         cells: List[str] = []
         traces: List[str] = []
-        for i_exp, experiment in enumerate(experiments):
+        for experiment in experiments:
             row = cell(experiment, model)
             i_model = ROW_ORDER.index(model)
             bold, italic = emphasis[experiment].get(i_model, (False, False))
             value = _number(row.nrmse if row else None, decimals[experiment])
-            cells += [
-                _emphasize(value, bold, italic) if value != "--" else value,
-                _div_cell(row.diverged if row else None),
-            ]
+            cells.append(_emphasize(value, bold, italic) if value != "--" else value)
+            if with_diverged:
+                div = _div_cell(row.diverged if row else None)
+                cells.append(
+                    _emphasize(div, True, False)
+                    if div != "--" and div_emphasis[experiment].get(i_model)
+                    else div
+                )
             traces.append(_trace(row, experiment))
         return (
             f"{MODEL_TO_LATEX[model]} & " + " & ".join(cells) + r" \\ % " + ", ".join(traces)
         )
 
-    body.append(metric_row("NoSec"))
-    body.append(metric_row("StdSec"))
+    def annotation_row(model: str) -> str:
+        """The template's fixed label under a reference arm -- no numbers."""
+        return MODEL_ANNOTATIONS[model] + " &" * (span * len(experiments)) + r" \\"
+
+    for model in PLAIN_ROWS:
+        body.append(metric_row(model))
+        body.append(annotation_row(model))
     body.append(r"\midrule")
     body.append(metric_row("GenSec"))
 
@@ -608,19 +720,21 @@ def build_eval_table(
             row = cell(experiment, "GenSec")
             value = getattr(row, attribute) if row else None
             cells.append(
-                rf"\multicolumn{{2}}{{l}}{{{significant(value, digits=significant_digits)}}}"
+                rf"\multicolumn{{{span}}}{{c}}"
+                rf"{{{significant(value, digits=significant_digits)}}}"
             )
         body.append(f"{label} & " + " & ".join(cells) + r" \\")
 
     lines = [f"% {comment}"] if comment else []
     lines += [
-        rf"\begin{{tabular}}{{r{'ll' * len(experiments)}}}",
+        rf"\begin{{tabular}}{{r{'l' * span * len(experiments)}}}",
         r"\toprule",
         f"{header_names} \\\\",
         f"{header_levels} \\\\",
         rf"{header_metrics} \\",
         r"\midrule",
         *body,
+        r"\midrule",
         r"\bottomrule",
         r"\end{tabular}",
     ]

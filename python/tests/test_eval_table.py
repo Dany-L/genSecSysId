@@ -311,7 +311,14 @@ def test_rank_emphasis_shares_a_rank_on_ties_and_skips_holes():
 
 
 # ── LaTeX assembly ────────────────────────────────────────────────────────────
-def _rows(experiment="Exp A", mlflow_name="exp-a", nrmse=(0.3, 0.2, 0.1), y_max=0.9, **kw):
+def _rows(
+    experiment="Exp A",
+    mlflow_name="exp-a",
+    nrmse=(0.3, 0.2, 0.1),
+    y_max=0.9,
+    stability=eval_table.REGIONAL_STABILITY,
+    **kw,
+):
     """One full column group: NoSec, StdSec, GenSec."""
     out = []
     for model, value in zip(eval_table.ROW_ORDER, nrmse):
@@ -320,6 +327,7 @@ def _rows(experiment="Exp A", mlflow_name="exp-a", nrmse=(0.3, 0.2, 0.1), y_max=
             model_name=model,
             run_id=f"rid-{model}",
             mlflow_experiment_name=mlflow_name,
+            stability=stability,
             nrmse=value,
             y_max=y_max,
             diverged=(12, 15),
@@ -354,7 +362,7 @@ def test_single_experiment_matches_the_template_column_spec():
 
 def test_y_max_is_a_header_row_not_a_column():
     tex = eval_table.build_eval_table(_rows(y_max=0.29))
-    assert r"& \multicolumn{2}{l}{$y_{\text{max}} = 0.29$} \\" in tex
+    assert r"& \multicolumn{2}{c}{$y_{\text{max}} = 0.29$} \\" in tex
     # It is no longer one of the per-model metrics.
     assert r"Model  & NRMSE & \# div/ total \\" in tex
 
@@ -363,9 +371,14 @@ def test_gensec_gets_its_own_spanning_certificate_rows():
     tex = eval_table.build_eval_table(_rows())
     # ybar and sigma span the whole two-column group -- they are certificate
     # quantities, not one of the per-model metrics.
-    assert _line(tex, r"$\bar y$") == r"$\bar y$ & \multicolumn{2}{l}{0.5} \\"
+    assert _line(tex, r"$\bar y$") == r"$\bar y$ & \multicolumn{2}{c}{0.5} \\"
     assert _line(tex, r"$\bar \sigma(\theta)$") == (
-        r"$\bar \sigma(\theta)$ & \multicolumn{2}{l}{1.25} \\"
+        r"$\bar \sigma(\theta)$ & \multicolumn{2}{c}{1.25} \\"
+    )
+    # sigma before ybar, the order the template writes them in.
+    lines = tex.splitlines()
+    assert lines.index(_line(tex, r"$\bar \sigma(\theta)$")) < lines.index(
+        _line(tex, r"$\bar y$")
     )
     # A \midrule separates the GenSec block from the other two arms.
     lines = tex.splitlines()
@@ -375,8 +388,8 @@ def test_gensec_gets_its_own_spanning_certificate_rows():
 def test_certificate_rows_are_dashes_without_a_gensec_run():
     rows = _rows(GenSec={"y_bar": None, "sigma_u": None})
     tex = eval_table.build_eval_table(rows)
-    assert _line(tex, r"$\bar y$").endswith(r"\multicolumn{2}{l}{--} \\")
-    assert _line(tex, r"$\bar \sigma(\theta)$").endswith(r"\multicolumn{2}{l}{--} \\")
+    assert _line(tex, r"$\bar y$").endswith(r"\multicolumn{2}{c}{--} \\")
+    assert _line(tex, r"$\bar \sigma(\theta)$").endswith(r"\multicolumn{2}{c}{--} \\")
 
 
 def test_parameter_counts_are_no_longer_tabulated():
@@ -460,7 +473,10 @@ def test_structure_matches_the_shipped_template():
     # Every structural line of the template appears in the rendered table.
     for token in (r"\begin{tabular}{rll}", r"\toprule", r"\midrule", r"\bottomrule",
                   r"Model  & NRMSE & \# div/ total \\", r"$\bar \sigma(\theta)$",
-                  r"$\bar y$", r"\MLtiRnn{}", r"\MStdSec{}", r"\MGenSec{}"):
+                  r"$\bar y$", r"\MLtiRnn{}", r"\MStdSec{}", r"\MGenSec{}",
+                  r"$\bar \sigma(\theta) = \infty$ & & \\",
+                  r"$\bar \sigma(\theta) = 0$ & & \\",
+                  r"\multicolumn{2}{c}{"):
         assert token in wanted, f"{token} missing from the template itself"
         assert token in tex, f"{token} missing from the rendered table"
 
@@ -497,3 +513,210 @@ def test_a_tiny_sigma_does_not_drag_the_other_certificate_cells():
     assert r"$y_{\text{max}} = 0.934$" in tex
     assert _line(tex, r"$\bar y$").endswith(r"{0.358} \\")
     assert r"$5.00 \cdot 10^{-5}$" in _line(tex, r"$\bar \sigma(\theta)$")
+
+
+# ── stability classes: one table per class ────────────────────────────────────
+def test_load_table_config_carries_the_stability_class(tmp_path):
+    path = _write(
+        tmp_path,
+        """
+experiments:
+  - name: Synthetic
+    mlflow_experiment_name: a
+    stability: regionally-stable
+    runs:
+      - {model_name: GenSec, config: {k: true}}
+  - name: Measured
+    mlflow_experiment_name: b
+    stability: Unknown
+    runs:
+      - {model_name: GenSec, config: {k: true}}
+  - name: Unlabelled
+    mlflow_experiment_name: c
+    runs:
+      - {model_name: GenSec, config: {k: true}}
+""",
+    )
+    a, b, c = eval_table.load_table_config(path)["experiments"]
+    assert a["stability"] == "regionally-stable"
+    assert b["stability"] == "unknown"  # normalised to lowercase
+    # Regional stability is a claim about the true system, so it is never the
+    # default -- an experiment that says nothing lands in the unknown table.
+    assert c["stability"] == eval_table.DEFAULT_STABILITY == "unknown"
+
+
+def test_stability_defaults_block_applies_to_every_experiment(tmp_path):
+    path = _write(
+        tmp_path,
+        """
+defaults:
+  stability: regionally-stable
+experiments:
+  - name: Inherits
+    mlflow_experiment_name: a
+    runs:
+      - {model_name: GenSec, config: {k: true}}
+  - name: Overrides
+    mlflow_experiment_name: b
+    stability: unknown
+    runs:
+      - {model_name: GenSec, config: {k: true}}
+""",
+    )
+    a, b = eval_table.load_table_config(path)["experiments"]
+    assert (a["stability"], b["stability"]) == ("regionally-stable", "unknown")
+
+
+@pytest.mark.parametrize(
+    "written, slug, regional",
+    [
+        ("regionally-stable", "regionally-stable", True),
+        ("Regionally Stable", "regionally-stable", True),
+        ("regionally_stable", "regionally-stable", True),
+        ("regional", "regional", True),
+        ("unknown", "unknown", False),
+        (None, "unknown", False),
+    ],
+)
+def test_stability_slug_and_is_regional_accept_the_spellings(written, slug, regional):
+    assert eval_table.stability_slug(written) == slug
+    assert eval_table.is_regional(written) is regional
+
+
+def test_split_by_stability_groups_rows_in_first_seen_order():
+    rows = (
+        _rows("Synthetic", "syn", stability="regionally-stable")
+        + _rows("Measured", "meas", stability="unknown")
+        + _rows("Synthetic 2", "syn2", stability="Regionally_Stable")
+    )
+    groups = eval_table.split_by_stability(rows)
+    assert [name for name, _ in groups] == ["regionally-stable", "unknown"]
+    regional, unknown = (rows for _, rows in groups)
+    # The two synthetic experiments share a table even though the YAML spells
+    # their stability differently; the measured one gets its own.
+    assert {r.experiment for r in regional} == {"Synthetic", "Synthetic 2"}
+    assert {r.experiment for r in unknown} == {"Measured"}
+
+
+def test_split_by_stability_keeps_one_group_when_all_rows_agree():
+    groups = eval_table.split_by_stability(_rows())
+    assert len(groups) == 1 and groups[0][0] == "regionally-stable"
+
+
+# ── the divergence column ─────────────────────────────────────────────────────
+def test_max_emphasis_marks_the_largest_and_shares_it_on_ties():
+    assert eval_table.max_emphasis([3, 15, 7]) == {1: True}
+    assert eval_table.max_emphasis([15, 15, 0]) == {0: True, 1: True}
+    assert eval_table.max_emphasis([None, 4]) == {1: True}
+    assert eval_table.max_emphasis([None, float("nan")]) == {}
+    assert eval_table.max_emphasis([]) == {}
+
+
+def test_highest_divergence_count_per_column_is_bold_when_asked():
+    # The test inputs are ones the true system diverges on, so reproducing the
+    # most of them is the good outcome -- the highest count is the one marked.
+    rows = _rows(
+        NoSec={"diverged": (15, 15)},
+        StdSec={"diverged": (0, 15)},
+        GenSec={"diverged": (7, 15)},
+    )
+    tex = eval_table.build_eval_table(rows, emphasize_diverged=True)
+    assert r"\textbf{15/15}" in _line(tex, r"\MLtiRnn{}")
+    assert "& 0/15" in _line(tex, r"\MStdSec{}")
+    assert "& 7/15" in _line(tex, r"\MGenSec{}")
+
+
+def test_divergence_emphasis_is_off_by_default_and_per_column():
+    rows = _rows(
+        NoSec={"diverged": (15, 15)},
+        StdSec={"diverged": (0, 15)},
+        GenSec={"diverged": (7, 15)},
+    ) + _rows(
+        "Exp B", "exp-b", (0.9, 0.8, 0.7), 1.4,
+        NoSec={"diverged": (1, 15)},
+        StdSec={"diverged": (2, 15)},
+        GenSec={"diverged": (9, 15)},
+    )
+    # The unknown-stability table asks for no emphasis at all.
+    assert r"\textbf{15/15}" not in eval_table.build_eval_table(rows)
+
+    tex = eval_table.build_eval_table(rows, emphasize_diverged=True)
+    # Each column picks its own leader: NoSec in A, GenSec in B.
+    assert r"\textbf{15/15}" in _line(tex, r"\MLtiRnn{}")
+    assert r"\textbf{9/15}" in _line(tex, r"\MGenSec{}")
+    # NoSec leads column A but not column B, and its single row shows both.
+    assert r"\textbf{1/15}" not in tex
+
+
+def test_a_missing_divergence_count_is_never_emphasized():
+    rows = _rows(
+        NoSec={"diverged": None},
+        StdSec={"diverged": None},
+        GenSec={"diverged": None},
+    )
+    tex = eval_table.build_eval_table(rows, emphasize_diverged=True)
+    assert r"\textbf{--}" not in tex
+
+
+# ── the reference arms' fixed label rows ──────────────────────────────────────
+def test_reference_arms_carry_the_templates_sigma_label_row():
+    tex = eval_table.build_eval_table(_rows())
+    lines = tex.splitlines()
+    # Each label row follows its model's metric row and holds no numbers.
+    assert lines[lines.index(_line(tex, r"\MLtiRnn{}")) + 1] == (
+        r"$\bar \sigma(\theta) = \infty$ & & \\"
+    )
+    assert lines[lines.index(_line(tex, r"\MStdSec{}")) + 1] == (
+        r"$\bar \sigma(\theta) = 0$ & & \\"
+    )
+
+
+def test_label_rows_span_every_experiment_group():
+    tex = eval_table.build_eval_table(_rows() + _rows("Exp B", "exp-b", (0.9, 0.8, 0.7), 1.4))
+    # Two experiments -> four empty cells behind the label.
+    assert _line(tex, r"$\bar \sigma(\theta) = \infty$") == (
+        r"$\bar \sigma(\theta) = \infty$ & & & & \\"
+    )
+
+
+def test_table_closes_with_a_midrule_before_the_bottomrule():
+    # The template draws both; the last certificate row sits above them.
+    tex = eval_table.build_eval_table(_rows())
+    assert tex.splitlines()[-3:] == [r"\midrule", r"\bottomrule", r"\end{tabular}"]
+
+
+# ── the table for benchmarks with no diverging trajectories ───────────────────
+def test_divergence_column_is_dropped_when_there_is_nothing_to_count():
+    # The measured benchmarks have no diverging test set at all, so the column
+    # would be "--" from top to bottom; it goes rather than being rendered empty.
+    tex = eval_table.build_eval_table(
+        _rows(stability="unknown") + _rows("Exp B", "exp-b", (0.9, 0.8, 0.7), 1.4),
+        with_diverged=False,
+    )
+    assert r"\begin{tabular}{rll}" in tex          # one column per experiment
+    assert r"Model  & NRMSE & NRMSE \\" in tex
+    assert r"\# div/ total" not in tex
+    assert "12/15" not in tex
+    # Name, y_max and the certificate rows span the narrowed group.
+    assert r"& \multicolumn{1}{c}{Exp A} & \multicolumn{1}{c}{Exp B} \\" in tex
+    assert r"& \multicolumn{1}{c}{$y_{\text{max}} = 0.9$}" in tex
+    assert _line(tex, r"$\bar y$") == (
+        r"$\bar y$ & \multicolumn{1}{c}{0.5} & \multicolumn{1}{c}{0.5} \\"
+    )
+    # ... and the label rows shrink with it: one empty cell per experiment.
+    assert _line(tex, r"$\bar \sigma(\theta) = 0$") == r"$\bar \sigma(\theta) = 0$ & & \\"
+
+
+def test_dropping_the_column_keeps_the_nrmse_emphasis_and_the_traces():
+    tex = eval_table.build_eval_table(_rows(nrmse=(0.30, 0.20, 0.10)), with_diverged=False)
+    assert _line(tex, r"\MGenSec{}") == r"\MGenSec{} & \textbf{0.10} \\ % exp-a=rid-GenSec"
+    assert r"\textbf{\textit{0.20}}" in _line(tex, r"\MStdSec{}")
+
+
+def test_dropping_the_column_ignores_a_request_to_emphasize_it():
+    # Nothing to emphasize once the cells are gone -- and no stray \textbf.
+    tex = eval_table.build_eval_table(
+        _rows(NoSec={"diverged": (15, 15)}), with_diverged=False, emphasize_diverged=True
+    )
+    assert "15/15" not in tex
+    assert _line(tex, r"\MLtiRnn{}").count("&") == 1
