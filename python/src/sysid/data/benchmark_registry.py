@@ -69,6 +69,9 @@ class BenchmarkSpec:
     official_split: bool = True
     reference: str = ""
     notes: str = ""
+    #: Upstream names to try beyond `name` -- the package renames things
+    #: between versions (ParWHF in 0.1.2 became ParWH in 1.0.1).
+    loader_aliases: Sequence[str] = ()
     #: Set to a reason string to register a dataset we deliberately do not support.
     unsupported: Optional[str] = None
 
@@ -161,17 +164,134 @@ def rename(records: Sequence[Record], names: Sequence[str]) -> List[Record]:
     return [Record(n, r.u, r.y) for n, r in zip(names, records)]
 
 
+# ── locating a loader across package versions ─────────────────────────────────
+# Which submodule a benchmark lives in is NOT stable across versions of
+# nonlinear_benchmarks. v0.1.2 puts CED/EMPS/Silverbox/... at the top level and
+# F16/ParWHF/BoucWen in `not_splitted_benchmarks`; other versions move them.
+# Hard-coding the submodule produced
+#     AttributeError: module 'nonlinear_benchmarks.not_splitted_benchmarks'
+#     has no attribute 'ParWHF'
+# on a server with a different build, so the lookup searches instead -- ending
+# with the package's own `all_benchmarks` lists, which name the functions
+# regardless of where they are defined.
+_LOADER_SUBMODULES = (
+    "not_splitted_benchmarks",
+    "benchmarks",
+    "splitted_benchmarks",
+)
+_LOADER_REGISTRIES = (
+    "all_benchmarks",
+    "all_not_splitted_benchmarks",
+    "all_splitted_benchmarks",
+)
+
+
+def package_version() -> str:
+    """Installed nonlinear_benchmarks version, or 'unknown'.
+
+    Recorded in metadata.json because the package's splits are NOT stable
+    across versions: 0.1.2 gives ParWH 200 records of 16384 samples and warns
+    there is no official split; 1.0.1 gives 100 of 32768 and declares the split
+    official. Silverbox is identical in both. A result is only comparable to
+    another produced by the same version.
+    """
+    try:
+        import importlib.metadata as md
+
+        return md.version("nonlinear_benchmarks")
+    except Exception:
+        try:
+            import nonlinear_benchmarks as nb
+
+            return str(getattr(nb, "__version__", "unknown"))
+        except Exception:
+            return "unknown"
+
+
+def has_official_split(loader_name: str, aliases: Sequence[str] = ()) -> Optional[bool]:
+    """Does the INSTALLED package consider this benchmark officially split?
+
+    Derived rather than declared, because it moved: ParWH is absent from
+    ``all_splitted_benchmarks`` in 0.1.2 and present in 1.0.1. ``None`` when the
+    package exposes no such list to ask.
+    """
+    try:
+        import nonlinear_benchmarks as nb
+    except Exception:
+        return None
+    listed = getattr(nb, "all_splitted_benchmarks", None)
+    if not listed:
+        return None
+    names = {getattr(f, "__name__", "") for f in listed}
+    return bool(names & {loader_name, *aliases})
+
+
+def available_loaders() -> Dict[str, str]:
+    """``{loader name: where it was found}`` for the installed package."""
+    import nonlinear_benchmarks as nb
+
+    found: Dict[str, str] = {}
+    for sub in ("", *_LOADER_SUBMODULES):
+        mod = nb if sub == "" else getattr(nb, sub, None)
+        if mod is None:
+            continue
+        for attr in dir(mod):
+            if attr.startswith("_"):
+                continue
+            obj = getattr(mod, attr, None)
+            if callable(obj) and getattr(obj, "__module__", "").startswith(
+                "nonlinear_benchmarks"
+            ):
+                found.setdefault(attr, sub or "nonlinear_benchmarks")
+    for reg in _LOADER_REGISTRIES:
+        for fn in getattr(nb, reg, None) or ():
+            name = getattr(fn, "__name__", None)
+            if name:
+                found.setdefault(name, reg)
+    return found
+
+
+def find_loader(name: str, aliases: Sequence[str] = ()):
+    """The package's loader function for ``name``, wherever it lives."""
+    import nonlinear_benchmarks as nb
+
+    candidates = [name, *aliases]
+    modules = [nb]
+    for sub in _LOADER_SUBMODULES:
+        mod = getattr(nb, sub, None)
+        if mod is not None:
+            modules.append(mod)
+
+    for cand in candidates:
+        for mod in modules:
+            fn = getattr(mod, cand, None)
+            if callable(fn):
+                return fn
+    for reg in _LOADER_REGISTRIES:
+        for fn in getattr(nb, reg, None) or ():
+            if getattr(fn, "__name__", None) in candidates:
+                return fn
+
+    have = available_loaders()
+    version = getattr(nb, "__version__", "unknown")
+    raise AttributeError(
+        f"nonlinear_benchmarks (version {version}) has no loader named "
+        f"{' or '.join(repr(c) for c in candidates)}. It does have: "
+        f"{', '.join(sorted(have))}. If one of those is the right dataset under "
+        f"another name, add it to the spec's `loader_aliases`."
+    )
+
+
 # ── per-benchmark fetch hooks ─────────────────────────────────────────────────
-def _pair(loader_name: str, *, test_names=None, atleast_2d=True, prefix=None):
+def _pair(loader_name: str, *, test_names=None, atleast_2d=True, prefix=None,
+          aliases: Sequence[str] = ()):
     """Fetch for a package benchmark that returns ``(train_val, test)``."""
     def fetch(force_download: bool = False):
-        import nonlinear_benchmarks as nb
-        import nonlinear_benchmarks.not_splitted_benchmarks as nsb
-
-        loader = getattr(nb, loader_name, None) or getattr(nsb, loader_name)
+        loader = find_loader(loader_name, aliases)
         kwargs = {"force_download": force_download}
         if atleast_2d:
             kwargs["atleast_2d"] = True
+        kwargs = _supported_kwargs(loader, kwargs)
         train, test, ts = normalize_records(loader(**kwargs), prefix or loader_name)
         if test_names:
             test = rename(test, test_names)
@@ -188,13 +308,15 @@ def _fetch_f16(force_download: bool = False):
     keeps the amplitude level in each record's name -- the split below is stated
     in terms of those levels.
     """
-    import nonlinear_benchmarks.not_splitted_benchmarks as nsb
-    from nonlinear_benchmarks.benchmarks import loadmat
     from pathlib import Path
 
+    loadmat = _find_loadmat()
+    f16 = find_loader("F16")
     paths = {
         Path(p).stem: p
-        for p in nsb.F16(data_file_locations=True, force_download=force_download)
+        for p in f16(**_supported_kwargs(
+            f16, {"data_file_locations": True, "force_download": force_download}
+        ))
     }
     records, sampling_times = [], set()
     for name in sorted(paths):
@@ -211,6 +333,33 @@ def _fetch_f16(force_download: bool = False):
     if len(sampling_times) != 1:
         raise RuntimeError(f"F16 records disagree on sampling time: {sampling_times}")
     return records, [], sampling_times.pop()
+
+
+def _supported_kwargs(fn, kwargs: Dict) -> Dict:
+    """Drop kwargs the installed version's signature does not accept."""
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
+def _find_loadmat():
+    """``loadmat`` moved between versions too; find it or fall back to scipy."""
+    import nonlinear_benchmarks as nb
+
+    for sub in ("benchmarks", "not_splitted_benchmarks", "utilities"):
+        mod = getattr(nb, sub, None)
+        fn = getattr(mod, "loadmat", None) if mod is not None else None
+        if callable(fn):
+            return fn
+    from scipy.io import loadmat as scipy_loadmat
+
+    return scipy_loadmat
 
 
 # ── the registry ──────────────────────────────────────────────────────────────
@@ -275,15 +424,21 @@ REGISTRY: Dict[str, BenchmarkSpec] = {
         name="ParWHF",
         default_nx=6,
         default_nw=20,
-        fetch=_pair("ParWHF", atleast_2d=False),
+        fetch=_pair("ParWHF", atleast_2d=False,
+                    aliases=("ParWH", "Parallel_Wiener_Hammerstein")),
+        loader_aliases=("ParWH", "Parallel_Wiener_Hammerstein"),
         official_split=False,
         reference="Parallel Wiener-Hammerstein benchmark; see nonlinearbenchmark.org.",
         notes=(
-            "200 training and 12 test realizations of 16384 samples each. They "
-            "are INDEPENDENT experiments, so the train/validation split is by "
-            "record rather than within a record. The package warns there is no "
-            "official split, but it does return a (train, test) pair and that "
-            "is what is used."
+            "UPSTREAM NAME CHANGED: 'ParWHF' in nonlinear_benchmarks 0.1.2, "
+            "'ParWH' from 1.0.1. The DATA changed with it -- 0.1.2 returns 200 "
+            "train / 12 test realizations of 16384 samples and warns there is "
+            "no official split; 1.0.1 returns 100 / 5 of 32768 and lists it as "
+            "officially split. Same total samples, paired up. The actual counts "
+            "for THIS run are in metadata.json under 'records', along with the "
+            "package version that produced them. The realizations are "
+            "independent experiments either way, so the train/validation split "
+            "is by record rather than within a record."
         ),
     ),
     "F16": BenchmarkSpec(

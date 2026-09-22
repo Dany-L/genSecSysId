@@ -305,3 +305,137 @@ class TestGeneratedSweep:
         assert cfg["base_config"] == "/data/work/me/benchmarks/configs/crnn_silverbox.yaml"
         assert cfg["n_seeds"] == 5
         assert cfg["sweep_name"] == "Silverbox"
+
+
+# ── loader lookup across package versions ─────────────────────────────────────
+class TestLoaderLookup:
+    """Which submodule a benchmark lives in is not stable across versions.
+
+    Hard-coding `not_splitted_benchmarks` worked locally and failed on a server
+    with a different build:
+        AttributeError: module 'nonlinear_benchmarks.not_splitted_benchmarks'
+        has no attribute 'ParWHF'
+    """
+
+    def test_finds_a_loader_in_any_submodule(self, monkeypatch):
+        import types
+        from sysid.data import benchmark_registry as br
+
+        def marker():
+            pass
+        marker.__module__ = "nonlinear_benchmarks.somewhere_else"
+
+        fake = types.ModuleType("nonlinear_benchmarks")
+        fake.benchmarks = types.ModuleType("benchmarks")
+        fake.benchmarks.Thing = marker
+        monkeypatch.setitem(__import__("sys").modules, "nonlinear_benchmarks", fake)
+        assert br.find_loader("Thing") is marker
+
+    def test_falls_back_to_the_all_benchmarks_registry(self, monkeypatch):
+        import types
+        from sysid.data import benchmark_registry as br
+
+        def marker():
+            pass
+        marker.__name__ = "Renamed"
+
+        fake = types.ModuleType("nonlinear_benchmarks")
+        fake.all_benchmarks = [marker]
+        monkeypatch.setitem(__import__("sys").modules, "nonlinear_benchmarks", fake)
+        assert br.find_loader("Renamed") is marker
+
+    def test_aliases_are_tried(self, monkeypatch):
+        import types
+        from sysid.data import benchmark_registry as br
+
+        def marker():
+            pass
+        marker.__module__ = "nonlinear_benchmarks.x"
+        fake = types.ModuleType("nonlinear_benchmarks")
+        fake.ParWH = marker
+        monkeypatch.setitem(__import__("sys").modules, "nonlinear_benchmarks", fake)
+        assert br.find_loader("ParWHF", aliases=("ParWH",)) is marker
+
+    def test_a_missing_loader_lists_what_is_available(self, monkeypatch):
+        import types
+        from sysid.data import benchmark_registry as br
+
+        def other():
+            pass
+        other.__module__ = "nonlinear_benchmarks.x"
+        fake = types.ModuleType("nonlinear_benchmarks")
+        fake.__version__ = "9.9.9"
+        fake.SomethingElse = other
+        monkeypatch.setitem(__import__("sys").modules, "nonlinear_benchmarks", fake)
+        with pytest.raises(AttributeError) as exc:
+            br.find_loader("Absent")
+        # The message has to be actionable from a server log alone.
+        assert "9.9.9" in str(exc.value)
+        assert "SomethingElse" in str(exc.value)
+
+    def test_unsupported_kwargs_are_dropped(self):
+        from sysid.data.benchmark_registry import _supported_kwargs
+
+        def narrow(a, b=1):
+            pass
+        assert _supported_kwargs(narrow, {"a": 1, "b": 2, "c": 3}) == {"a": 1, "b": 2}
+
+        def wide(**kw):
+            pass
+        assert _supported_kwargs(wide, {"anything": 1}) == {"anything": 1}
+
+
+# ── version-dependent facts ───────────────────────────────────────────────────
+class TestVersionHandling:
+    """The package's own splits are not stable across versions.
+
+    Measured: 0.1.2 gives ParWH 200 records of 16384 samples and leaves it out
+    of `all_splitted_benchmarks`; 1.0.1 gives 100 of 32768 and lists it. Same
+    total samples, paired up. Silverbox is byte-identical in both. So anything
+    version-dependent is derived at run time and recorded, never hard-coded.
+    """
+
+    def test_parwhf_declares_its_upstream_rename(self):
+        spec = REGISTRY["ParWHF"]
+        # 'ParWHF' in 0.1.2, 'ParWH' from 1.0.1.
+        assert "ParWH" in spec.loader_aliases
+        assert "renamed" in spec.notes.lower() or "NAME CHANGED" in spec.notes
+
+    def test_notes_do_not_hard_code_counts_that_move(self):
+        # An earlier version of this note claimed "200 training and 12 test
+        # realizations" as fact, which is wrong on 1.0.1.
+        notes = REGISTRY["ParWHF"].notes
+        assert "metadata.json" in notes, "notes must point at the per-run counts"
+
+    def test_official_split_is_derived_from_the_installed_package(self, monkeypatch):
+        import types
+        from sysid.data import benchmark_registry as br
+
+        def mk(name):
+            f = types.FunctionType((lambda: None).__code__, {})
+            f.__name__ = name
+            return f
+
+        fake = types.ModuleType("nonlinear_benchmarks")
+        fake.all_splitted_benchmarks = [mk("ParWH")]
+        monkeypatch.setitem(__import__("sys").modules, "nonlinear_benchmarks", fake)
+        # Found under the alias, not the registry key.
+        assert br.has_official_split("ParWHF", ("ParWH",)) is True
+        assert br.has_official_split("F16", ()) is False
+
+    def test_official_split_is_none_when_the_package_cannot_say(self, monkeypatch):
+        import types
+        from sysid.data import benchmark_registry as br
+
+        fake = types.ModuleType("nonlinear_benchmarks")
+        monkeypatch.setitem(__import__("sys").modules, "nonlinear_benchmarks", fake)
+        # None means "fall back to the spec", not "no official split".
+        assert br.has_official_split("Silverbox", ()) is None
+
+    def test_package_version_is_reported_not_guessed(self):
+        from sysid.data.benchmark_registry import package_version
+
+        version = package_version()
+        assert isinstance(version, str) and version
+        # Either a real version or an explicit admission of ignorance.
+        assert version == "unknown" or version[0].isdigit()

@@ -45,6 +45,8 @@ from sysid.data.benchmark_registry import (          # noqa: E402
     BenchmarkSpec,
     apply_declared_split,
     get,
+    has_official_split,
+    package_version,
 )
 
 DEFAULT_VAL_FRACTION = 0.2
@@ -105,11 +107,20 @@ def prepare(
     for rec in test_records:
         stats[f"test_{rec.name}"] = bp.record_stats(rec.u, rec.y)
 
+    # Ask the INSTALLED package rather than trusting the spec: ParWH is absent
+    # from all_splitted_benchmarks in 0.1.2 and present in 1.0.1.
+    derived = has_official_split(spec.name, spec.loader_aliases)
+    official = spec.official_split if derived is None else derived
+
     metadata = {
         "dataset": spec.name,
         "source": "nonlinear_benchmarks (see reference)",
+        # The splits are NOT stable across versions -- ParWH changed shape
+        # between 0.1.2 and 1.0.1 -- so a result is only comparable to another
+        # produced by the same one.
+        "nonlinear_benchmarks_version": package_version(),
         "reference": spec.reference,
-        "official_split": spec.official_split,
+        "official_split": official,
         "sampling_time": sampling_time,
         "input_col": list(spec.input_cols),
         "output_col": list(spec.output_cols),
