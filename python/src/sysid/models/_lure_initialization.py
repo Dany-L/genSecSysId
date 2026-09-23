@@ -522,126 +522,6 @@ class LureInitializationMixin:
         )
         return A_init
 
-    def _draw_companion_from_poles(self, spec: dict) -> torch.Tensor:
-        """Draw ``A`` by placing its DISCRETE poles, instead of Euler-discretizing.
-
-        Config (under ``custom_params['identity_init']['A']``)::
-
-            A: {radius: [0.95, 0.995], freq_hz: [40, 100]}
-            A: {radius: 0.99}                  # scalar = degenerate range
-            A: {radius: [0.9, 0.99], freq_hz: 69.63}
-
-        Why this exists alongside ``{scale: ...}``. That spec draws CONTINUOUS
-        damping in ``[0, scale]`` and forward-Euler discretizes it, so where the
-        poles land depends on ``ts`` — and the stability LMI needs
-        ``rho(A) < alpha``, which the draw never sees. At a fine sampling rate
-        the two disagree badly. Measured at Silverbox's ``ts = 1/610.35`` with
-        ``alpha_0 = 0.9999``:
-
-            scale      P(rho >= alpha_0)   median pole freq   % oscillatory
-                1               15.2%              0.1 Hz            91.5%
-               10                4.3%              0.3 Hz            42.2%
-              100                3.2%              1.0 Hz            13.5%
-             1000                3.1%              3.2 Hz             4.3%
-
-        The failure rate floors out near 3% however large ``scale`` gets — it is
-        set by draws whose damping entry is ~0, which no rescaling removes — and
-        raising ``scale`` to chase it flattens the poles onto the real axis,
-        which is the wrong character for a resonant plant. So at small ``ts`` the
-        ``{scale}`` spec cannot be tuned into a usable init; it needs a different
-        parameterization.
-
-        Here the radius IS the draw, so ``rho(A) = max radius`` holds by
-        construction for every seed, and the frequency band is stated in Hz
-        rather than emerging from ``ts``. The result is still random (it varies
-        with the run's seed, so seed-variance studies still vary ``A``) — it is
-        bounded, not fixed.
-
-        Poles are drawn as ``nx // 2`` conjugate pairs plus one real pole when
-        ``nx`` is odd, and assembled through the characteristic polynomial into
-        the same companion layout the ``{scale}`` path produces (ones on the
-        superdiagonal, coefficients in the last row), so the two specs are
-        interchangeable as far as everything downstream is concerned.
-        """
-        device, dtype = self.A.device, self.A.dtype
-
-        def _range(key, default):
-            val = spec.get(key, default)
-            if isinstance(val, (int, float)):
-                lo = hi = float(val)
-            else:
-                seq = list(val)
-                if len(seq) != 2:
-                    raise ValueError(
-                        f"identity_init.A.{key} must be a scalar or a [lo, hi] "
-                        f"pair, got {val!r}"
-                    )
-                lo, hi = float(seq[0]), float(seq[1])
-            if hi < lo:
-                raise ValueError(f"identity_init.A.{key} has hi < lo: {val!r}")
-            return lo, hi
-
-        # Nyquist is the only frequency band that means anything at this ts; the
-        # default spans it so 'radius' alone is a complete spec.
-        r_lo, r_hi = _range("radius", 0.99)
-        f_lo, f_hi = _range("freq_hz", [0.0, 0.5 / self.ts])
-
-        if not 0.0 < r_lo <= r_hi < 1.0:
-            raise ValueError(
-                f"identity_init.A.radius must lie in (0, 1), got [{r_lo}, {r_hi}]. "
-                "The poles are discrete, so radius >= 1 is an unstable A."
-            )
-        # The whole point of the spec is to keep the draw under the contraction
-        # rate. Checking it here turns what would otherwise surface as an
-        # 'infeasible' bootstrap SDP naming D21 into a message about A.
-        alpha = float(1.0 / (1.0 + np.exp(-float(self.tau.detach()))))
-        if r_hi >= alpha:
-            raise ValueError(
-                f"identity_init.A.radius upper bound {r_hi} is at or above the "
-                f"contraction rate alpha = {alpha:.6g}. The stability LMI "
-                "A'PA - alpha^2 P < 0 has no solution for rho(A) >= alpha, so "
-                "initialization would fail in the bootstrap SDP. Lower the "
-                "radius or raise custom_params.alpha_0."
-            )
-        nyquist = 0.5 / self.ts
-        if f_hi > nyquist + 1e-9:
-            raise ValueError(
-                f"identity_init.A.freq_hz upper bound {f_hi} Hz exceeds the "
-                f"Nyquist frequency {nyquist:.4g} Hz at ts = {self.ts:.6g} s."
-            )
-
-        def _u(lo, hi):
-            """Uniform draw on torch's RNG, so the run's seed controls it."""
-            if hi == lo:
-                return lo
-            return lo + (hi - lo) * float(torch.rand((), device=device))
-
-        poles = []
-        for _ in range(self.nx // 2):
-            r = _u(r_lo, r_hi)
-            theta = 2.0 * np.pi * _u(f_lo, f_hi) * self.ts
-            poles.extend([r * np.exp(1j * theta), r * np.exp(-1j * theta)])
-        if self.nx % 2:
-            poles.append(_u(r_lo, r_hi))  # real pole, positive => no alternation
-
-        # np.poly returns [1, c_1, ..., c_nx] for lam^nx + c_1 lam^(nx-1) + ...
-        # The conjugate pairing makes the imaginary parts cancel exactly; .real
-        # only discards round-off.
-        coeffs = np.real(np.poly(np.array(poles)))
-        A_init = torch.zeros((self.nx, self.nx), device=device, dtype=dtype)
-        if self.nx > 1:
-            A_init[:-1, 1:] = torch.eye(self.nx - 1, device=device, dtype=dtype)
-        A_init[-1, :] = torch.tensor(
-            -coeffs[:0:-1], device=device, dtype=dtype
-        )  # [-c_nx, ..., -c_1]
-
-        achieved = torch.linalg.eigvals(A_init).abs()
-        logger.info(
-            f"  A: poles drawn, radius in [{r_lo:g}, {r_hi:g}], "
-            f"freq in [{f_lo:g}, {f_hi:g}] Hz, |eig|={achieved.tolist()}"
-        )
-        return A_init
-
     def _set_param_data(self, name: str, init_data: torch.Tensor):
         """Assign init_data to parameter `name`, respecting partial constraints."""
         if name in self.structural_constraints:
@@ -674,20 +554,9 @@ class LureInitializationMixin:
                 A_init = self._resolve_init_spec('A', (self.nx, self.nx), default_std=0.0)
             elif 'radius' in A_spec or 'freq_hz' in A_spec:
                 A_init = self._draw_companion_from_poles(A_spec)
-            elif 'radius' in A_spec or 'freq_hz' in A_spec:
-                A_init = self._draw_companion_from_poles(A_spec)
             else:
                 A_scale = float(A_spec.get('scale', 1.0))
                 device, dtype = self.A.device, self.A.dtype
-                # Companion (integrator-chain) form at the model's own nx: ones on
-                # the superdiagonal, last row = -scale * U(0,1). At nx = 2 this is
-                # exactly the [[0, 1], [0, 0]] template it replaces -- the shape was
-                # hard-coded there, so any nx != 2 silently built a 2x2 A and only
-                # failed later inside the LMI with a shape mismatch.
-                A_ct = torch.zeros((self.nx, self.nx), device=device, dtype=dtype)
-                if self.nx > 1:
-                    A_ct[:-1, 1:] = torch.eye(self.nx - 1, device=device, dtype=dtype)
-                A_ct[-1, :] = -A_scale * torch.rand((1, self.nx), device=device, dtype=dtype)
                 # Companion (integrator-chain) form at the model's own nx: ones on
                 # the superdiagonal, last row = -scale * U(0,1). At nx = 2 this is
                 # exactly the [[0, 1], [0, 0]] template it replaces -- the shape was
@@ -724,14 +593,7 @@ class LureInitializationMixin:
                 # at nx = 2, nd = 1 but conformable at any size.
                 B_init = torch.zeros(
                     (self.nx, self.nd), device=self.B.device, dtype=self.B.dtype
-                # Input enters the last state only -- the bottom of the
-                # integrator chain A_ct sets up above. Built at (nx, nd) rather
-                # than the hard-coded 2x1 it replaces, which is the same vector
-                # at nx = 2, nd = 1 but conformable at any size.
-                B_init = torch.zeros(
-                    (self.nx, self.nd), device=self.B.device, dtype=self.B.dtype
                 )
-                B_init[-1, :] = input_scale * self.ts
                 B_init[-1, :] = input_scale * self.ts
                 # B_init = 0.01*self.ts * torch.tensor(
                 #     [[0.0], [1.0]], device=self.B.device, dtype=self.B.dtype
