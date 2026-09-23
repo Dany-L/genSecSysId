@@ -26,6 +26,7 @@ from typing import Optional, Sequence
 import cvxpy as cp
 import numpy as np
 
+from .output_set import output_ellipsoid
 from .solutions import (
     BootstrapSolution,
     CertificateSolution,
@@ -38,6 +39,16 @@ from .solutions import (
 logger = logging.getLogger(__name__)
 
 EPS = 1e-6
+
+
+def _as_sigma(output_std, ne: int) -> np.ndarray:
+    """``output_std`` as a ``(ne,)`` vector; a scalar is broadcast across channels."""
+    sigma = np.asarray(output_std, dtype=float).reshape(-1)
+    if sigma.size == 1:
+        sigma = np.repeat(sigma, ne)
+    if sigma.size != ne:
+        raise ValueError(f"output_std has {sigma.size} entries but ne={ne}")
+    return sigma
 
 
 @dataclass
@@ -63,7 +74,9 @@ class LureCertificateSynthesizer:
     learn_L: bool
     L_fixed: Optional[np.ndarray]
     s_fixed: float
-    output_std: float
+    # Per OUTPUT CHANNEL (ne,), so the coverage SDP and every reported ȳ
+    # carry each channel's own physical scale. A scalar is broadcast.
+    output_std: np.ndarray
     P_current: np.ndarray
     eps: float = EPS
 
@@ -90,7 +103,7 @@ class LureCertificateSynthesizer:
             learn_L=bool(model.learn_L),
             L_fixed=None if model.learn_L else to_np(model.L),
             s_fixed=float(to_np(model.s)),
-            output_std=float(np.asarray(to_np(model.output_std)).reshape(-1)[0]),
+            output_std=_as_sigma(to_np(model.output_std), int(model.ne)),
             P_current=to_np(model.P),
         )
 
@@ -468,7 +481,12 @@ class LureCertificateSynthesizer:
         ``(σs)²·CPCᵀ ⪰ y_max²·I``. Returns ``None`` if infeasible / solver fails."""
         eps = self.eps
         s2 = float(s) ** 2
-        sigma = self.output_std
+        # S = diag(output_std): the per-channel map from normalized to physical
+        # output units. The coverage floor is on the PHYSICAL output set
+        # W = s^2 S (C P C^T) S, so S sits on both sides rather than a single
+        # scalar sigma^2 multiplying the whole matrix.
+        S = np.diag(_as_sigma(self.output_std, self.ne))
+        SC = S @ self.C
 
         P = cp.Variable((self.nx, self.nx), symmetric=True)
         L = cp.Variable((self.nz, self.nx)) if self.learn_L else self.L_fixed
@@ -488,12 +506,12 @@ class LureCertificateSynthesizer:
                 )
 
         constraints.append(
-            (sigma ** 2) * s2 * self.C @ P @ self.C.T - float(y_max) ** 2 * np.eye(self.ne)
+            s2 * SC @ P @ SC.T - float(y_max) ** 2 * np.eye(self.ne)
             >> eps * np.eye(self.ne)
         )
 
         problem = cp.Problem(
-            cp.Minimize(cp.trace((sigma ** 2) * s2 * self.C @ P @ self.C.T)), constraints
+            cp.Minimize(cp.trace(s2 * SC @ P @ SC.T)), constraints
         )
         try:
             problem.solve(solver=cp.MOSEK, verbose=False)
@@ -504,14 +522,17 @@ class LureCertificateSynthesizer:
             return None
 
         P_val = P.value
-        CPCt = self.C @ P_val @ self.C.T
-        y_bar = float(sigma * s * np.sqrt(CPCt.item())) if self.ne == 1 else None
+        # ȳ is the worst-direction half-width of the certified output set; the
+        # per-channel half-widths ride along. Defined at every ne.
+        ellipsoid = output_ellipsoid(self.C, P_val, s, self.output_std)
+        y_bar = ellipsoid.y_bar
         return CoverageSolution(
             P=P_val,
             L=L.value if self.learn_L else L,
             M=M.value,
             s=float(s),
             y_bar=y_bar,
+            y_bar_per_output=ellipsoid.y_bar_per_output,
         )
 
     def coverage_sweep(

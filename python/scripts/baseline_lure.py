@@ -530,7 +530,9 @@ def main() -> None:
     # ---- levels the certificate is measured against ----------------------
     # Both are taken exactly as the trainer takes them: y_max is the physical
     # peak of the training outputs, u_max the peak squared NORMALIZED input.
-    sigma_y = float(np.asarray(normalizer.output_std).reshape(-1)[0]) if normalizer else 1.0
+    # Per output channel; set_output_coverage_level broadcasts a scalar, so
+    # this is unchanged at ne == 1 and correct above it.
+    sigma_y = np.asarray(normalizer.output_std, dtype=float).reshape(-1) if normalizer else 1.0
     sigma_u = float(np.asarray(normalizer.input_std).reshape(-1)[0]) if normalizer else 1.0
     y_max = float(np.nanmax(np.abs(train_outputs)))
     model.set_output_coverage_level(y_max, sigma_y)
@@ -538,7 +540,10 @@ def main() -> None:
     u_n = np.asarray(normalizer.transform_inputs(train_inputs) if normalizer else train_inputs, dtype=float)
     u_max_sq = float(np.max(np.sum(u_n.reshape(-1, u_n.shape[-1]) ** 2, axis=-1)))
     model.set_input_bound(u_max_sq)
-    logger.info(f"  y_max  = {y_max:.6g} (physical)   sigma_y = {sigma_y:.6g}")
+    logger.info(
+        f"  y_max  = {y_max:.6g} (physical)   sigma_y = "
+        + np.array2string(np.atleast_1d(sigma_y), precision=6)
+    )
     logger.info(f"  u_max  = {u_max_sq:.6g} -> s >= {np.sqrt(u_max_sq):.6g}  "
                 f"[normalized u/sigma_u, sigma_u = {sigma_u:.6g}; "
                 f"physical max||u|| = {np.sqrt(u_max_sq) * sigma_u:.6g}]")

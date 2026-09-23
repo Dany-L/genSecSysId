@@ -8,6 +8,7 @@ model/dynamics. Every method uses ``self`` and relies on SimpleLure's attributes
 
 from typing import Dict, Literal, Tuple, Union, overload
 
+import numpy as np
 import torch
 
 EPS = 1e-6
@@ -165,15 +166,34 @@ class LureRegularizationMixin:
         normalized ``C/P/s`` to physical units).
 
         ``y_max`` has a physical meaning and is stored unnormalized; the coverage
-        machinery divides by ``output_std`` internally. ``None``/``nan`` y_max
-        disables the output-coverage penalty. ``output_std=None`` leaves the
-        stored scale unchanged. Kept on the model's device/dtype."""
+        machinery scales the certified set up to physical units internally.
+        ``None``/``nan`` y_max disables the output-coverage penalty.
+        ``output_std=None`` leaves the stored scale unchanged.
+
+        ``output_std`` is PER OUTPUT CHANNEL: pass the normalizer's vector
+        (any shape with ``ne`` entries, e.g. its ``(1, 1, ne)``) so each channel
+        is reported in its own units. A scalar is broadcast across channels, so
+        ``ne == 1`` and SISO callers are unaffected. ``y_max`` stays a single
+        level — the coverage requirement is ``W ⪰ y_max²·I``, i.e. the certified
+        output set reaches ``y_max`` in every direction at once.
+
+        Kept on the model's device/dtype."""
         device, dtype = self.P.device, self.P.dtype
         self.y_max = torch.tensor(
-            float(y_max) if y_max is not None else float("nan"), device=device, dtype=dtype
+            float(np.asarray(y_max).reshape(-1).max()) if y_max is not None
+            else float("nan"),
+            device=device, dtype=dtype,
         )
         if output_std is not None:
-            self.output_std = torch.tensor(float(output_std), device=device, dtype=dtype)
+            sigma = np.asarray(output_std, dtype=float).reshape(-1)
+            if sigma.size == 1:
+                sigma = np.repeat(sigma, self.ne)
+            if sigma.size != self.ne:
+                raise ValueError(
+                    f"output_std has {sigma.size} entries but the model has "
+                    f"ne={self.ne}; pass one scale per output channel."
+                )
+            self.output_std = torch.tensor(sigma, device=device, dtype=dtype)
 
     def get_regularization_activity(
         self,

@@ -33,6 +33,7 @@ from sysid.evaluation import (
     simulate_model,
 )
 from sysid.models import SimpleLure, load_model
+from sysid.optimization.output_set import output_ellipsoid
 from sysid.data import DataNormalizer
 from sysid.utils import max_abs_output
 
@@ -271,7 +272,9 @@ def main():
         # y_max is physical (has meaning); output_std relates the model's
         # normalized C/P/s to physical units for the coverage machinery.
         y_max_train = max_abs_output(train_outputs)
-        output_std = float(np.asarray(normalizer.output_std).reshape(-1)[0])
+        # PER OUTPUT CHANNEL. Collapsing this to channel 0 would report every
+        # channel in the first one's physical units.
+        output_std = np.asarray(normalizer.output_std, dtype=float).reshape(-1)
         model.set_output_coverage_level(y_max_train, output_std)
         logger.info(f"Maximum |output| in training data (physical y_max): {y_max_train:.4f}")
         L_orig = model.L.cpu().detach().numpy()
@@ -279,8 +282,22 @@ def main():
         H_orig = L_orig @ np.linalg.inv(P_orig)
         C_orig = model.C.cpu().detach().numpy()
         s_orig = float(model.s.cpu().detach().numpy())
-        y_bar_orig = float(output_std * s_orig * np.sqrt((C_orig @ P_orig @ C_orig.T).item()))
-        logger.info(f"original s: {s_orig:.4f}, original ||H||: {float(np.linalg.norm(H_orig)):.4f} original y_bar: {y_bar_orig:.4f}")
+        # The certified output set of the trained certificate. ȳ is its worst
+        # direction; at ne == 1 this is exactly the scalar
+        # sigma*s*sqrt(C P C^T) this line used to compute by hand -- which
+        # raised ValueError for ne > 1, because C P C^T is then (ne, ne) and
+        # .item() only works on a 1x1.
+        ellipsoid_orig = output_ellipsoid(C_orig, P_orig, s_orig, output_std)
+        y_bar_orig = ellipsoid_orig.y_bar
+        logger.info(
+            f"original s: {s_orig:.4f}, original ||H||: {float(np.linalg.norm(H_orig)):.4f} "
+            f"original y_bar: {y_bar_orig:.4f}"
+        )
+        if model.ne > 1:
+            logger.info(
+                "  original ȳ per output: "
+                + ", ".join(f"{v:.4f}" for v in ellipsoid_orig.y_bar_per_output)
+            )
         mlflow.log_metric("data/max_output_train", y_max_train)
 
         # --- Baseline: input condition under the ORIGINAL (trained) certificate

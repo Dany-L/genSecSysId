@@ -24,7 +24,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from sysid.optimization import CertificateSolution, LureCertificateSynthesizer
+from sysid.optimization import (
+    CertificateSolution,
+    LureCertificateSynthesizer,
+    OutputEllipsoid,
+    output_ellipsoid,
+)
 from sysid.utils import torch_bmat
 
 from .base import DznActivation, LureSystem, LureSystemClass, LureSystemSafe
@@ -95,13 +100,19 @@ class SimpleLure(
         # Safe output level y_max = max_{i,k} |y_k^(i)| in PHYSICAL units (it has
         # a physical meaning, so it is stored unnormalized). The model's C/P/s
         # live in normalized output units, so the output-coverage machinery
-        # scales the certified image up to physical by ``output_std`` (the
-        # coverage floor is (output_std·s)²·CPCᵀ ⪰ y_max²). y_max NaN = unset ->
-        # the output-coverage penalty is a no-op. Both are persistent=False: set
-        # from the data each run, never break loading old checkpoints that
-        # predate these buffers.
+        # scales the certified image up to physical by ``output_std`` — the
+        # coverage floor is W ⪰ y_max²·I with W = s²·S·CPCᵀ·S, S = diag(output_std)
+        # (see sysid.optimization.output_set). y_max NaN = unset -> the
+        # output-coverage penalty is a no-op.
+        #
+        # output_std is a PER-CHANNEL vector of length ne: each output has its
+        # own physical scale, and collapsing them to one number would report
+        # every channel at the first channel's units. A scalar is broadcast, so
+        # ne == 1 behaves exactly as before. Both buffers are persistent=False:
+        # set from the data each run, never break loading old checkpoints that
+        # predate them.
         self.register_buffer("y_max", torch.tensor(float("nan")), persistent=False)
-        self.register_buffer("output_std", torch.tensor(1.0), persistent=False)
+        self.register_buffer("output_std", torch.ones(self.ne), persistent=False)
 
         self.P = nn.Parameter(torch.eye(self.nx))  # Lyapunov matrix
         if custom_params is not None:
@@ -665,12 +676,31 @@ class SimpleLure(
                 "max_abs_z": float(z.abs().max()),
             }
 
+    def certified_output_set(self) -> OutputEllipsoid:
+        """The certified output set ``{y : yᵀ Y y ≤ 1}`` in PHYSICAL units.
+
+        The image of the invariant state ellipsoid ``{x : xᵀP⁻¹x ≤ s²}`` under
+        ``y = C x``, scaled per channel by ``output_std``. Carries the
+        per-channel half-widths ``ȳ_i`` (the tightest box around the set) as
+        well as the worst-direction scalar ``ȳ``; see
+        :mod:`sysid.optimization.output_set`. Defined for any ``ne``.
+        """
+        with torch.no_grad():
+            return output_ellipsoid(
+                self.C.detach().cpu().numpy(),
+                self.P.detach().cpu().numpy(),
+                float(self.s),
+                self.output_std.detach().cpu().numpy(),
+            )
+
     def coverage_ratio(self) -> Optional[float]:
         """The tightness ratio ``ρ = (ȳ/y_max)ⁿˣ`` of the **current** certificate.
 
-        ``ȳ = σ·s·√(λ_min(C P Cᵀ))`` is the certified physical output half-width in
-        the worst output direction, so ``ρ ≥ 1`` ⇔ the certified image covers the
-        data level and ``ρ`` is the volume ratio against the minimal covering set.
+        ``ȳ = √(λ_min(W))`` is the certified physical output half-width in the
+        worst output direction, so ``ρ ≥ 1`` ⇔ the certified image covers the
+        data level and ``ρ`` is the volume ratio against the minimal covering
+        set. Multi-output safe: the worst direction is a property of the whole
+        output ellipsoid, not of one channel.
 
         This is the **free drift monitor** of the re-synthesis scheme: a few small
         matrix products on parameters already in memory, no SDP. Returns ``None``
@@ -682,11 +712,7 @@ class SimpleLure(
         y_max = float(self.y_max)
         if y_max <= 0:
             return None
-        with torch.no_grad():
-            CPCt = self.C @ self.P @ self.C.T
-            lam_min = max(float(torch.linalg.eigvalsh(CPCt).min()), 0.0)
-            y_bar = float(self.output_std) * float(self.s) * float(np.sqrt(lam_min))
-        return float((y_bar / y_max) ** self.nx)
+        return float((self.certified_output_set().y_bar / y_max) ** self.nx)
 
     def analysis_problem_init(self, learn_B: bool = False, learn_D21: bool = False) -> bool:
         """Repair an infeasible identity draw by solving for the input maps too.

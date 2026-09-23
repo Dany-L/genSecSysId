@@ -131,6 +131,112 @@ def smoke_config(smoke_root):
     return path
 
 
+# ── multi-output (ne > 1) ─────────────────────────────────────────────────────
+# The SISO fixtures above cannot catch ne > 1 regressions, and the scalar
+# assumptions are easy to reintroduce: post_process.py computed
+# ybar = sigma * s * sqrt((C P C^T).item()), which is a ValueError the moment
+# C P C^T stops being 1x1.
+def _make_traj_3state(rng, n_steps):
+    """Stable 3rd-order surrogate: the 2-state oscillator plus a first-order lag.
+
+    THREE genuinely independent states are needed. Reading three channels off
+    the 2-state surrogate makes the third an exact combination of the first
+    two, so C P C^T is rank 2, the certified output set is degenerate and the
+    bootstrap SDP is ill-conditioned enough that MOSEK fails outright.
+    """
+    u, q, q_dot = _make_traj(rng, n_steps)
+    lag = np.zeros(n_steps, dtype=np.float64)
+    for k in range(n_steps - 1):
+        lag[k + 1] = 0.9 * lag[k] + 0.1 * u[k]
+    return u, q, q_dot, lag
+
+
+def _write_multi_output_csvs(folder: Path, n_files: int, n_steps: int, seed: int):
+    """The 3-state surrogate read out on THREE channels at different scales."""
+    folder.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    for i in range(n_files):
+        u, q, q_dot, lag = _make_traj_3state(rng, n_steps)
+        pd.DataFrame({
+            "u": u,
+            # Distinct scales, so a channel-0 collapse of output_std is wrong
+            # rather than merely redundant.
+            "y1": q,
+            "y2": 2.0 * q_dot,
+            "y3": 5.0 * lag,
+        }).to_csv(folder / f"traj_{i:03d}.csv", index=False)
+
+
+@pytest.fixture(scope="module")
+def multi_root(tmp_path_factory):
+    root = tmp_path_factory.mktemp("multi_root")
+    data_dir = root / "data" / "MultiData"
+    _write_multi_output_csvs(data_dir / "train", n_files=4, n_steps=200, seed=0)
+    _write_multi_output_csvs(data_dir / "validation", n_files=2, n_steps=200, seed=1)
+    _write_multi_output_csvs(data_dir / "test", n_files=2, n_steps=200, seed=2)
+    return root
+
+
+@pytest.fixture(scope="module")
+def multi_config(multi_root, smoke_config):
+    """The smoke config with three outputs and nx >= ne."""
+    cfg = yaml.safe_load(smoke_config.read_text())
+    cfg["data"]["train_path"] = str(multi_root / "data" / "MultiData")
+    cfg["data"]["output_col"] = ["y1", "y2", "y3"]
+    cfg["data"]["state_col"] = None
+    # nx >= ne, or the certified output set is flat and ybar is identically 0.
+    cfg["model"]["nx"] = 3
+    # Draw A by placing its discrete poles. The default {scale} spec draws
+    # continuous damping and Euler-discretizes it, so with three eigenvalues
+    # instead of two it lands above alpha_0 often enough that the fixture is
+    # flaky; {radius} makes rho(A) = max radius hold by construction.
+    cfg["model"]["custom_params"]["identity_init"] = {
+        "A": {"radius": [0.5, 0.9]},
+        "B2": {"std": 0.01},
+        "C2": {"std": 0.1},
+    }
+    cfg["mlflow"]["tracking_uri"] = f"file:{multi_root}/mlruns"
+    cfg["root_dir"] = str(multi_root)
+    path = multi_root / "multi_config.yaml"
+    with open(path, "w") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    return path
+
+
+@pytest.fixture(scope="module")
+def multi_trained_run_id(multi_root, multi_config, tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("multi_train")
+    run_id_out = tmp / "run_id.txt"
+    _run_script("train.py", "--config", multi_config,
+                "--run-id-out", run_id_out, cwd=multi_root)
+    run_id = run_id_out.read_text().strip()
+    assert run_id, "train.py did not write a run_id for the 3-output config"
+    return run_id
+
+
+def test_train_smoke_multi_output(multi_trained_run_id):
+    """train.py survives ne > 1 (identity init used to raise on the C scaling)."""
+    assert multi_trained_run_id
+
+
+def test_post_process_smoke_multi_output(multi_root, multi_trained_run_id):
+    """post_process.py survives ne > 1.
+
+    The regression: it computed the certified output half-width by hand as
+    ``sigma * s * sqrt((C P C^T).item())``, which raises ValueError for ne > 1
+    because C P C^T is (ne, ne). It now goes through
+    sysid.optimization.output_set.output_ellipsoid like the model does.
+    """
+    _run_script(
+        "post_process.py",
+        "--run-id", multi_trained_run_id,
+        "--data-root", multi_root,
+        "--rv-num-trajectories", "2",
+        "--rv-horizon", "50",
+        cwd=multi_root,
+    )
+
+
 def _run_script(name: str, *args, cwd: Path):
     """Invoke a script as a subprocess; raise on non-zero exit.
 

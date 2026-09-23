@@ -59,11 +59,15 @@ class BootstrapSolution(CertificateSolution):
 class CoverageSolution(CertificateSolution):
     """**Coverage** — a fixed-``s`` certificate binding the output requirement.
 
-    ``y_bar`` is the PHYSICAL certified output half-width ``σ·s·√(C P Cᵀ)``
-    (``ne == 1`` only, else ``None``).
+    ``y_bar`` is the PHYSICAL certified output half-width in the WORST output
+    direction, ``√(λ_min(W))`` with ``W = s²·S·(C P Cᵀ)·S`` — at ``ne == 1``
+    exactly the old ``σ·s·√(C P Cᵀ)``. ``y_bar_per_output`` carries the
+    per-channel half-widths ``√(W_ii)``, i.e. the tightest box around the
+    certified output set. See :mod:`sysid.optimization.output_set`.
     """
 
     y_bar: Optional[float] = None
+    y_bar_per_output: Optional[np.ndarray] = None
 
 
 @dataclass
