@@ -223,7 +223,9 @@ class BaseRNN(nn.Module, ABC):
         """
         return torch.tensor(0.0, device=next(self.parameters()).device)
 
-    def get_regularization_input(self, inputs: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
+    def get_regularization_input(
+        self, inputs: torch.Tensor, states: torch.Tensor, return_c: bool = False, **kwargs
+    ):
         """
         Compute input constraint regularization loss.
         This can be overridden by subclasses for specific constraints.
@@ -231,11 +233,14 @@ class BaseRNN(nn.Module, ABC):
         Args:
             inputs: Input tensor of shape (batch_size, seq_len, input_size)
             states: State tensor of shape (batch_size, seq_len, hidden_size)
+            return_c: Also return the constraint trajectory ``c``. A model
+                without a certificate has none, so it is ``None``.
 
         Returns:
-            Regularization loss tensor
+            Regularization loss tensor, or ``(loss, None)`` if ``return_c``.
         """
-        return torch.tensor(0.0, device=next(self.parameters()).device)
+        loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        return (loss, None) if return_c else loss
 
     def count_parameters(self) -> int:
         """Count the number of trainable parameters."""

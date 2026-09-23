@@ -29,6 +29,13 @@ def create_model(
     input_size = len(data_config.input_col) if data_config.input_col else 1
     output_size = len(data_config.output_col) if data_config.output_col else 1
 
+    if model_config.model_type in ("rnn", "lstm", "gru") and model_config.nw is None:
+        # nw is the width key for every model (it is what train.py logs as
+        # hidden_size), so the baselines read it too rather than hidden_size.
+        raise ValueError(
+            f"model_type '{model_config.model_type}' needs model.nw (hidden size) in the config."
+        )
+
     if model_config.model_type == "rnn":
         model = SimpleRNN(
             input_size=input_size,
