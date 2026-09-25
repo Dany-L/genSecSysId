@@ -323,7 +323,8 @@ class Trainer:
             ).tolist()
             sample_indices.extend(random_indices)
 
-        if self.model.nx == 2:
+        # The ellipse plot needs a certificate (P, L, s); baselines have none.
+        if isinstance(self.model, SimpleLure) and self.model.nx == 2:
             fig, ax, _, _ = plot_safe_set_trajectories(
                 P=self.model.P.cpu().detach().numpy(),
                 L=self.model.L.cpu().detach().numpy(),

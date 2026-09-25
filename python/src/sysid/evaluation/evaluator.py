@@ -81,7 +81,8 @@ class Evaluator:
                 e_hat, (x, w), _ = self.model(d, x0, warmup_steps=self.warmup_steps)
                 _, c = self.model.get_regularization_input(d, x, return_c=True)
 
-                all_c.append(c.cpu().numpy())
+                if c is not None:  # None for baselines without a certificate
+                    all_c.append(c.cpu().numpy())
                 all_predictions.append(e_hat.cpu().numpy())
                 all_targets.append(e.cpu().numpy())
                 all_inputs.append(d.cpu().numpy())
@@ -93,7 +94,7 @@ class Evaluator:
         e = np.concatenate(all_targets, axis=0)
         d = np.concatenate(all_inputs, axis=0)
         x = np.concatenate(all_states, axis=0) if len(all_states) > 0 else None
-        c = np.concatenate(all_c, axis=0)
+        c = np.concatenate(all_c, axis=0) if len(all_c) > 0 else None
 
         # Denormalize if normalizer provided
         if normalizer is not None:

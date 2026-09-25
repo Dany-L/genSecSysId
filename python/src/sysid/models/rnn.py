@@ -1,6 +1,12 @@
-"""Standard RNN architectures."""
+"""Standard RNN architectures, used as unconstrained baselines.
 
-from typing import Optional
+They follow the calling convention the trainer and evaluator use for every
+model, ``model(d, x0, warmup_steps=...) -> (e_hat, (x, w), d)``, so they train
+and evaluate through the same pipeline as the CRNN arms. They carry no
+certificate: ``w`` is ``None`` and every constraint check passes trivially.
+"""
+
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -8,7 +14,55 @@ import torch.nn as nn
 from .base import BaseRNN
 
 
-class SimpleRNN(BaseRNN):
+class _TorchRNNBaseline(BaseRNN):
+    """Shared forward for the ``torch.nn`` recurrent baselines.
+
+    Subclasses register the batch-first ``nn.RNN``/``nn.LSTM``/``nn.GRU`` under
+    the attribute named by ``_core_name`` and set ``self.fc`` (hidden -> output
+    readout). The attribute names are the historical ones (``rnn``/``lstm``/
+    ``gru``) so existing checkpoints keep their state_dict keys.
+    """
+
+    _core_name = "rnn"
+    fc: nn.Linear
+
+    def forward(
+        self,
+        d: torch.Tensor,
+        x0: Optional[torch.Tensor] = None,
+        warmup_steps: int = 0,
+        hidden_state=None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, None], torch.Tensor]:
+        """
+        Forward pass.
+
+        Args:
+            d: Input tensor (batch, seq_len, input_size)
+            x0: Physical initial state. Ignored: the hidden state of a black-box
+                RNN has no physical meaning, so it starts at zero (or at
+                ``hidden_state``) and the washout ``warmup_steps`` absorbs the
+                transient, as for the CRNN.
+            warmup_steps: Accepted for interface compatibility. The loss slicing
+                happens in the trainer/evaluator, not here.
+            hidden_state: Initial torch hidden state, ``(num_layers, batch,
+                hidden_size)`` (a ``(h, c)`` tuple for the LSTM).
+
+        Returns:
+            e_hat: Predicted output (batch, seq_len, output_size)
+            (x, w): Last layer's hidden-state sequence (batch, seq_len,
+                hidden_size) and ``None`` (there is no nonlinearity channel).
+            d: The input, unchanged (no safety filter).
+        """
+        x, _ = getattr(self, self._core_name)(d, hidden_state)
+        e_hat = self.fc(x)
+        return e_hat, (x, None), d
+
+    def check_constraints(self) -> bool:
+        """Unconstrained model: always feasible."""
+        return True
+
+
+class SimpleRNN(_TorchRNNBaseline):
     """Simple RNN model."""
 
     def __init__(
@@ -35,33 +89,11 @@ class SimpleRNN(BaseRNN):
 
         self.fc = nn.Linear(hidden_size, output_size)
 
-    def forward(
-        self,
-        d: torch.Tensor,  # input
-        hidden_state: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Forward pass.
 
-        Args:
-            d: Input tensor (batch, seq_len, input_size)
-            hidden_state: Hidden state (num_layers, batch, hidden_size)
-
-        Returns:
-            e_hat: Predicted output (batch, seq_len, output_size)
-        """
-        # d: (batch, seq_len, input_size)
-        x, hidden_state = self.rnn(d, hidden_state)  # x: hidden state
-        # x: (batch, seq_len, hidden_size)
-
-        e_hat = self.fc(x)  # e_hat: predicted output
-        # e_hat: (batch, seq_len, output_size)
-
-        return e_hat
-
-
-class LSTM(BaseRNN):
+class LSTM(_TorchRNNBaseline):
     """LSTM model."""
+
+    _core_name = "lstm"
 
     def __init__(
         self,
@@ -83,38 +115,11 @@ class LSTM(BaseRNN):
 
         self.fc = nn.Linear(hidden_size, output_size)
 
-    def forward(
-        self,
-        d: torch.Tensor,  # input
-        x0: Optional[tuple] = None,
-        hidden_state: Optional[tuple] = None,
-    ) -> torch.Tensor:
-        """
-        Forward pass.
 
-        Args:
-            d: Input tensor (batch, seq_len, input_size)
-            hidden_state: Hidden state tuple (h, c) where each is (num_layers, batch, hidden_size)
-
-        Returns:
-            e_hat: Predicted output (batch, seq_len, output_size)
-        """
-        # d: (batch, seq_len, input_size)
-        x, hidden_state = self.lstm(d, hidden_state)  # x: hidden state
-        # x: (batch, seq_len, hidden_size)
-
-        e_hat = self.fc(x)  # e_hat: predicted output
-        # e_hat: (batch, seq_len, output_size)
-
-        return e_hat
-
-    def check_constraints(self) -> bool:
-        """Check if the LSTM constraints are satisfied."""
-        return True  # No constraints for standard LSTM
-
-
-class GRU(BaseRNN):
+class GRU(_TorchRNNBaseline):
     """GRU model."""
+
+    _core_name = "gru"
 
     def __init__(
         self,
@@ -135,27 +140,3 @@ class GRU(BaseRNN):
         )
 
         self.fc = nn.Linear(hidden_size, output_size)
-
-    def forward(
-        self,
-        d: torch.Tensor,  # input
-        hidden_state: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Forward pass.
-
-        Args:
-            d: Input tensor (batch, seq_len, input_size)
-            hidden_state: Hidden state (num_layers, batch, hidden_size)
-
-        Returns:
-            e_hat: Predicted output (batch, seq_len, output_size)
-        """
-        # d: (batch, seq_len, input_size)
-        x, hidden_state = self.gru(d, hidden_state)  # x: hidden state
-        # x: (batch, seq_len, hidden_size)
-
-        e_hat = self.fc(x)  # e_hat: predicted output
-        # e_hat: (batch, seq_len, output_size)
-
-        return e_hat

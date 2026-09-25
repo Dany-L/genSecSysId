@@ -30,7 +30,6 @@ import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import pandas as pd
-import tikzplotlib
 import torch
 
 from sysid.config import resolve_run_artifacts, setup_mlflow_tracking
@@ -415,6 +414,8 @@ class RunComparator:
             plt.savefig(output_path, dpi=300, bbox_inches="tight")
             logger.info(f"Saved validation comparison to {output_path}")
             try:
+                import tikzplotlib
+
                 tikzplotlib.save(output_path.with_suffix(".tex"), figure=fig)
             except Exception as e:
                 logger.warning(f"Could not save TikZ plot: {e}")
@@ -559,6 +560,8 @@ class RunComparator:
             plt.savefig(output_path, dpi=300, bbox_inches="tight")
             logger.info(f"Saved trajectory comparison to {output_path}")
             try:
+                import tikzplotlib
+
                 tikzplotlib.save(output_path.with_suffix(".tex"), figure=fig)
             except Exception as e:
                 logger.warning(f"Could not save TikZ plot: {e}")
@@ -651,6 +654,8 @@ class RunComparator:
             plt.savefig(output_path, dpi=300, bbox_inches="tight")
             logger.info(f"Saved error comparison to {output_path}")
             try:
+                import tikzplotlib
+
                 tikzplotlib.save(output_path.with_suffix(".tex"), figure=fig)
             except Exception as e:
                 logger.warning(f"Could not save TikZ plot: {e}")

@@ -35,7 +35,7 @@ class TestModels:
     def test_simple_rnn(self, model_params, sample_input):
         """Test SimpleRNN forward pass."""
         model = SimpleRNN(**model_params)
-        output = model(sample_input)
+        output, _, _ = model(sample_input)
         
         assert output.shape == (sample_input.shape[0], sample_input.shape[1], model_params["output_size"])
         assert not torch.isnan(output).any()
@@ -43,7 +43,7 @@ class TestModels:
     def test_lstm(self, model_params, sample_input):
         """Test LSTM forward pass."""
         model = LSTM(**model_params)
-        output = model(sample_input)
+        output, _, _ = model(sample_input)
         
         assert output.shape == (sample_input.shape[0], sample_input.shape[1], model_params["output_size"])
         assert not torch.isnan(output).any()
@@ -51,7 +51,7 @@ class TestModels:
     def test_gru(self, model_params, sample_input):
         """Test GRU forward pass."""
         model = GRU(**model_params)
-        output = model(sample_input)
+        output, _, _ = model(sample_input)
         
         assert output.shape == (sample_input.shape[0], sample_input.shape[1], model_params["output_size"])
         assert not torch.isnan(output).any()
