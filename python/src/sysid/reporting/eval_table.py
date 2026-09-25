@@ -29,7 +29,7 @@ and a diverging test set exists, and the measured ones, where stability is
 unknown and the ``# div/total`` column has nothing to report.
 
 (LaTeX needs ``booktabs`` and ``multirow``; the row labels are the project's
-``\\MLtiRnn`` / ``\\MStdSec`` / ``\\MGenSec`` macros and ``\\nw``.)
+``\\MLtiRnn`` / ``\\MStdSec`` / ``\\MLstm`` / ``\\MGenSec`` macros.)
 """
 
 import math
@@ -40,32 +40,26 @@ import numpy as np
 import yaml
 
 # ── layout ────────────────────────────────────────────────────────────────────
-# Row order matches results/eval_table_template.tex (LtiRnn, StdSec, GenSec),
-# which is *not* the order the model classes appear in the YAML.
+# Row order matches results/eval_table_template.tex (LtiRnn, StdSec, LSTM,
+# GenSec), which is *not* the order the model classes appear in the YAML.
 MODEL_TO_LATEX: Dict[str, str] = {
     "NoSec": r"\MLtiRnn{}",
     "StdSec": r"\MStdSec{}",
+    "LSTM": r"\MLstm{}",
     "GenSec": r"\MGenSec{}",
 }
-ROW_ORDER: List[str] = ["NoSec", "StdSec", "GenSec"]
+ROW_ORDER: List[str] = ["NoSec", "StdSec", "LSTM", "GenSec"]
 
 # Per-experiment column group: the two metrics that matter, side by side.
 SUB_HEADER: List[str] = ["NRMSE", r"\# div/ total"]
 # Rows carried above the GenSec block (one metric pair per experiment).
-PLAIN_ROWS: List[str] = ["NoSec", "StdSec"]
+PLAIN_ROWS: List[str] = ["NoSec", "StdSec", "LSTM"]
 # Rows that only GenSec has: a certificate quantity spanning the whole column
 # group, because it is not one of the two per-model metrics.
 GENSEC_EXTRA_ROWS: List[Tuple[str, str]] = [
     (r"$\bar \sigma(\theta)$", "sigma_u"),
     (r"$\bar y$", "y_bar"),
 ]
-# A fixed label carried directly under each of the two reference arms, spelling
-# out the admissible input set they imply. Neither is a measured quantity -- the
-# row holds the label and no cells, exactly as the template writes it.
-MODEL_ANNOTATIONS: Dict[str, str] = {
-    "NoSec": r"$\bar \sigma(\theta) = \infty$",
-    "StdSec": r"$\bar \sigma(\theta) = 0$",
-}
 
 # ── stability classes ─────────────────────────────────────────────────────────
 # `stability:` in the YAML names which table an experiment belongs to. Only the
@@ -592,10 +586,9 @@ def build_eval_table(
     Each experiment owns a two-column group ``(NRMSE, # div/total)`` under a
     spanning header carrying its name and its ``y_max`` -- or a single NRMSE
     column with ``with_diverged`` false, for the benchmarks that have no
-    diverging trajectories to count, where the column is "--" throughout. ``\MLtiRnn`` and
-    ``\MStdSec`` take a metric row each, followed by the template's fixed
-    ``$\bar\sigma(\theta) = \infty$`` / ``$= 0$`` label row; ``\MGenSec`` takes a
-    row plus ``$\bar\sigma(\theta)$`` and ``$\bar y$``, which span the whole
+    diverging trajectories to count, where the column is "--" throughout.
+    ``\MLtiRnn``, ``\MStdSec`` and ``\MLstm`` take a metric row each;
+    ``\MGenSec`` takes a row plus ``$\bar\sigma(\theta)$`` and ``$\bar y$``, which span the whole
     group because they are certificate quantities rather than per-model metrics
     and only the regional arm has them.
 
@@ -611,7 +604,7 @@ def build_eval_table(
     count is shown.
 
     (LaTeX needs ``booktabs``; the labels are the project's ``\MLtiRnn`` /
-    ``\MStdSec`` / ``\MGenSec`` macros.)
+    ``\MStdSec`` / ``\MLstm`` / ``\MGenSec`` macros.)
     """
     # Experiments in first-seen order -> column groups.
     experiments: List[str] = []
@@ -703,13 +696,8 @@ def build_eval_table(
             f"{MODEL_TO_LATEX[model]} & " + " & ".join(cells) + r" \\ % " + ", ".join(traces)
         )
 
-    def annotation_row(model: str) -> str:
-        """The template's fixed label under a reference arm -- no numbers."""
-        return MODEL_ANNOTATIONS[model] + " &" * (span * len(experiments)) + r" \\"
-
     for model in PLAIN_ROWS:
         body.append(metric_row(model))
-        body.append(annotation_row(model))
     body.append(r"\midrule")
     body.append(metric_row("GenSec"))
 

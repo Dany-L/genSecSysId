@@ -139,8 +139,14 @@ def divergence_counts(run_id: str, divergence: Dict[str, Any]):
     return counts, None
 
 
-def build_rows(config: Dict[str, Any], with_divergence: bool, only: Optional[str]):
-    rows = []
+def iter_best_runs(config: Dict[str, Any], only: Optional[str] = None):
+    """Yield ``(experiment, model_name, best, note)`` for every configured row.
+
+    ``best`` is the ``search_runs`` row of the best run of that model class, or
+    ``None`` with ``note`` saying why. Shared with
+    scripts/generate_hyperparameter_table.py, so both tables describe exactly
+    the same runs.
+    """
     for experiment in config["experiments"]:
         if only and only not in (experiment["name"], experiment["mlflow_experiment_name"]):
             continue
@@ -159,68 +165,70 @@ def build_rows(config: Dict[str, Any], with_divergence: bool, only: Optional[str
         if runs_df is None or runs_df.empty:
             logger.warning("  no runs found")
             for run in experiment["runs"]:
-                rows.append(
-                    EvalRow(
-                        experiment=experiment["name"],
-                        model_name=run["model_name"],
-                        mlflow_experiment_name=name,
-                        stability=experiment["stability"],
-                        note=f"no runs in experiment {name}",
-                    )
-                )
+                yield experiment, run["model_name"], None, f"no runs in experiment {name}"
             continue
 
         loader = ConfigLoader()
         for run in experiment["runs"]:
-            model_name = run["model_name"]
             best = select_best_run(runs_df, run["selector"], criterion, config_loader=loader)
             if best is None:
-                logger.warning("  %-7s no run matches %s", model_name, run["selector"])
-                rows.append(
-                    EvalRow(
-                        experiment=experiment["name"],
-                        model_name=model_name,
-                        mlflow_experiment_name=name,
-                        stability=experiment["stability"],
-                        note=f"no run matching {run['selector']}",
-                    )
-                )
-                continue
+                logger.warning("  %-7s no run matches %s", run["model_name"], run["selector"])
+                yield experiment, run["model_name"], None, f"no run matching {run['selector']}"
+            else:
+                yield experiment, run["model_name"], best, None
 
-            run_id = best["run_id"]
-            nrmse = first_metric(best, [criterion])
-            logger.info(
-                "  %-7s %s  %s=%.4f  n_pars=%s nw=%s",
-                model_name, run_id, criterion, nrmse,
-                param_int(best, N_PARS_PARAM), param_int(best, NW_PARAM),
-            )
 
-            diverged, note = None, None
-            if with_divergence and is_regional(experiment["stability"]):
-                diverged, note = divergence_counts(run_id, experiment["divergence"])
-
+def build_rows(config: Dict[str, Any], with_divergence: bool, only: Optional[str]):
+    rows = []
+    for experiment, model_name, best, note in iter_best_runs(config, only):
+        name = experiment["mlflow_experiment_name"]
+        if best is None:
             rows.append(
                 EvalRow(
                     experiment=experiment["name"],
                     model_name=model_name,
-                    run_id=run_id,
                     mlflow_experiment_name=name,
                     stability=experiment["stability"],
-                    nrmse=nrmse,
-                    y_bar=first_metric(best, Y_BAR_KEYS),
-                    y_max=first_metric(best, [Y_MAX_KEY]),
-                    diverged=diverged,
-                    # Only the regional arm has an admissible input set to size;
-                    # the table leaves the row blank for the others anyway.
-                    sigma_u=(
-                        first_metric(best, [SIGMA_KEY])
-                        if model_name == "GenSec" else None
-                    ),
-                    n_pars=param_int(best, N_PARS_PARAM),
-                    nw=param_int(best, NW_PARAM),
                     note=note,
                 )
             )
+            continue
+
+        run_id = best["run_id"]
+        criterion = experiment["criterion"]
+        nrmse = first_metric(best, [criterion])
+        logger.info(
+            "  %-7s %s  %s=%.4f  n_pars=%s nw=%s",
+            model_name, run_id, criterion, nrmse,
+            param_int(best, N_PARS_PARAM), param_int(best, NW_PARAM),
+        )
+
+        diverged, note = None, None
+        if with_divergence and is_regional(experiment["stability"]):
+            diverged, note = divergence_counts(run_id, experiment["divergence"])
+
+        rows.append(
+            EvalRow(
+                experiment=experiment["name"],
+                model_name=model_name,
+                run_id=run_id,
+                mlflow_experiment_name=name,
+                stability=experiment["stability"],
+                nrmse=nrmse,
+                y_bar=first_metric(best, Y_BAR_KEYS),
+                y_max=first_metric(best, [Y_MAX_KEY]),
+                diverged=diverged,
+                # Only the regional arm has an admissible input set to size;
+                # the table leaves the row blank for the others anyway.
+                sigma_u=(
+                    first_metric(best, [SIGMA_KEY])
+                    if model_name == "GenSec" else None
+                ),
+                n_pars=param_int(best, N_PARS_PARAM),
+                nw=param_int(best, NW_PARAM),
+                note=note,
+            )
+        )
     return rows
 
 

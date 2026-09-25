@@ -317,11 +317,12 @@ def _rows(
     nrmse=(0.3, 0.2, 0.1),
     y_max=0.9,
     stability=eval_table.REGIONAL_STABILITY,
+    models=("NoSec", "StdSec", "GenSec"),
     **kw,
 ):
-    """One full column group: NoSec, StdSec, GenSec."""
+    """One column group, ``nrmse`` zipped with ``models`` (no LSTM by default)."""
     out = []
-    for model, value in zip(eval_table.ROW_ORDER, nrmse):
+    for model, value in zip(models, nrmse, strict=True):
         base = dict(
             experiment=experiment,
             model_name=model,
@@ -473,9 +474,8 @@ def test_structure_matches_the_shipped_template():
     # Every structural line of the template appears in the rendered table.
     for token in (r"\begin{tabular}{rll}", r"\toprule", r"\midrule", r"\bottomrule",
                   r"Model  & NRMSE & \# div/ total \\", r"$\bar \sigma(\theta)$",
-                  r"$\bar y$", r"\MLtiRnn{}", r"\MStdSec{}", r"\MGenSec{}",
-                  r"$\bar \sigma(\theta) = \infty$ & & \\",
-                  r"$\bar \sigma(\theta) = 0$ & & \\",
+                  r"$\bar y$", r"\MLtiRnn{}", r"\MStdSec{}", r"\MLstm{}",
+                  r"\MGenSec{}",
                   r"\multicolumn{2}{c}{"):
         assert token in wanted, f"{token} missing from the template itself"
         assert token in tex, f"{token} missing from the rendered table"
@@ -658,25 +658,41 @@ def test_a_missing_divergence_count_is_never_emphasized():
     assert r"\textbf{--}" not in tex
 
 
-# ── the reference arms' fixed label rows ──────────────────────────────────────
-def test_reference_arms_carry_the_templates_sigma_label_row():
-    tex = eval_table.build_eval_table(_rows())
+# ── the LSTM baseline ────────────────────────────────────────────────────────
+def test_lstm_row_sits_between_the_reference_arms_and_gensec():
+    rows = _rows(nrmse=(0.3, 0.2, 0.4, 0.1), models=eval_table.ROW_ORDER)
+    tex = eval_table.build_eval_table(rows)
     lines = tex.splitlines()
-    # Each label row follows its model's metric row and holds no numbers.
-    assert lines[lines.index(_line(tex, r"\MLtiRnn{}")) + 1] == (
-        r"$\bar \sigma(\theta) = \infty$ & & \\"
+    i_std, i_lstm, i_gen = (
+        lines.index(_line(tex, label)) for label in (r"\MStdSec{}", r"\MLstm{}", r"\MGenSec{}")
     )
-    assert lines[lines.index(_line(tex, r"\MStdSec{}")) + 1] == (
-        r"$\bar \sigma(\theta) = 0$ & & \\"
-    )
+    # Straight after StdSec, above the \midrule that opens the GenSec block.
+    assert i_lstm == i_std + 1
+    assert lines[i_lstm + 1] == r"\midrule" and i_gen == i_lstm + 2
+    assert _line(tex, r"\MLstm{}") == r"\MLstm{} & 0.40 & 12/15 \\ % exp-a=rid-LSTM"
 
 
-def test_label_rows_span_every_experiment_group():
-    tex = eval_table.build_eval_table(_rows() + _rows("Exp B", "exp-b", (0.9, 0.8, 0.7), 1.4))
-    # Two experiments -> four empty cells behind the label.
-    assert _line(tex, r"$\bar \sigma(\theta) = \infty$") == (
-        r"$\bar \sigma(\theta) = \infty$ & & & & \\"
+def test_lstm_takes_part_in_the_nrmse_and_divergence_ranking():
+    rows = _rows(
+        nrmse=(0.3, 0.2, 0.05, 0.1),
+        models=eval_table.ROW_ORDER,
+        LSTM={"diverged": (15, 15)},
     )
+    tex = eval_table.build_eval_table(rows, emphasize_diverged=True)
+    assert r"\textbf{0.050}" in _line(tex, r"\MLstm{}")          # best NRMSE
+    assert r"\textbf{\textit{0.100}}" in _line(tex, r"\MGenSec{}")  # second
+    assert r"\textbf{15/15}" in _line(tex, r"\MLstm{}")          # most diverged
+    assert r"\textbf{12/15}" not in tex
+
+
+def test_a_missing_lstm_run_renders_dashes():
+    tex = eval_table.build_eval_table(_rows())
+    assert _line(tex, r"\MLstm{}") == r"\MLstm{} & -- & -- \\ % Exp A=<no row>"
+
+
+def test_the_sigma_label_rows_are_gone():
+    tex = eval_table.build_eval_table(_rows())
+    assert r"\sigma(\theta) =" not in tex
 
 
 def test_table_closes_with_a_midrule_before_the_bottomrule():
@@ -703,8 +719,6 @@ def test_divergence_column_is_dropped_when_there_is_nothing_to_count():
     assert _line(tex, r"$\bar y$") == (
         r"$\bar y$ & \multicolumn{1}{c}{0.5} & \multicolumn{1}{c}{0.5} \\"
     )
-    # ... and the label rows shrink with it: one empty cell per experiment.
-    assert _line(tex, r"$\bar \sigma(\theta) = 0$") == r"$\bar \sigma(\theta) = 0$ & & \\"
 
 
 def test_dropping_the_column_keeps_the_nrmse_emphasis_and_the_traces():
