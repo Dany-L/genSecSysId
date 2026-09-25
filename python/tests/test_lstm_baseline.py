@@ -10,6 +10,8 @@ No MOSEK needed (no certificate), so unlike test_scripts_smoke.py this module
 also runs on CI.
 """
 
+import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -186,3 +188,11 @@ def test_compare_lstm(lstm_root, lstm_config, lstm_run_id, tmp_path_factory, tmp
         cwd=lstm_root,
     )
     assert (output_dir / "summary.csv").exists()
+
+
+def test_compare_imports_without_tikzplotlib(monkeypatch):
+    """CI has no tikzplotlib (the PyPI release breaks on current matplotlib);
+    compare.py must still load and only skip the .tex exports."""
+    monkeypatch.setitem(sys.modules, "tikzplotlib", None)  # makes `import` raise
+    spec = importlib.util.spec_from_file_location("compare", REPO_PY / "scripts" / "compare.py")
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))

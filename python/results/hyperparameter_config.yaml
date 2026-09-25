@@ -1,0 +1,70 @@
+# Columns of the hyperparameter table -- consumed by
+# scripts/generate_hyperparameter_table.py, rendered into
+# results/tables/hyperparameter-table.tex.
+#
+# The ROWS are not configured here: they are the runs of the NRMSE table,
+# selected from `results_config` exactly as scripts/generate_eval_table.py
+# selects them (best run per model class by the experiment's criterion), so the
+# two tables always describe the same runs.
+#
+# Per column:
+#   label      LaTeX column header
+#   source     param | metric | tag | config   (config = the run's logged
+#              outputs/config.yaml, dotted path)
+#   key        name to read, or a list of names -- the first one present wins
+#   format     int | sig (significant figures) | sci (a·10^b) | duration (s -> s/min/h)
+#   offset     optional, added to the value before formatting
+#   blank_for  optional, model classes for which the column is meaningless and
+#              renders "--" regardless of what the run logged
+
+results_config: results/results_confg.yaml
+
+columns:
+  - label: '$n_\theta$'
+    source: param
+    key: trainable_parameters
+    format: int
+
+  # final_epoch is the 0-based index of the last epoch run.
+  # - label: 'Epochs'
+  #   source: metric
+  #   key: final_epoch
+  #   format: int
+  #   offset: 1
+
+  - label: 'Time'
+    source: metric
+    key: total_train_time_sec
+    format: duration
+
+  # - label: 'lr'
+  #   source: param
+  #   key: learning_rate
+  #   format: sci
+
+  - label: 'Warmup'
+    source: param
+    key: warmup_steps
+    format: int
+
+  - label: 'Batch'
+    source: param
+    key: batch_size
+    format: int
+
+  # - label: '$T_s$'
+  #   source: config
+  #   key: data.sampling_time
+  #   format: sig
+
+  - label: '$n_w$'
+    source: param
+    key: hidden_size
+    format: int
+
+  # Without a certificate there is nothing to weight, whatever the run logged.
+  - label: '$\lambda$'
+    source: param
+    key: regularization_weight
+    format: sci
+    blank_for: [NoSec, LSTM]
