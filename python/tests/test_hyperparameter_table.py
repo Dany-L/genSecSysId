@@ -57,10 +57,11 @@ def test_shipped_config_loads():
     cfg = hp.load_hyperparameter_config(REPO_PY / "results" / "hyperparameter_config.yaml")
     labels = [c["label"] for c in cfg["columns"]]
     assert labels == [
-        r"$n_\theta$", "Epochs", "Time", "lr", "Warmup", "Batch", "$T_s$", "$n_w$",
-        r"$\lambda$",
+        r"$n_\theta$", "Time", "Warmup", "Batch", "$n_w$", r"$\lambda$",
     ]
-    assert hp.needs_logged_config(cfg["columns"])  # T_s comes from config.yaml
+    # T_s (the only config-sourced column) is commented out, so no run's
+    # outputs/config.yaml has to be downloaded
+    assert not hp.needs_logged_config(cfg["columns"])
 
 
 # ── values ────────────────────────────────────────────────────────────────────
