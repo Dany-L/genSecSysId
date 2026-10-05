@@ -428,7 +428,7 @@ def render_readme(system: str, stats: Dict, env: Dict, commit: str, verified: bo
 
 def markdown_to_html(md: str) -> str:
     """README body without the title, as HTML for the Dataverse description."""
-    import markdown  # only needed here; ships with tensorboard
+    import markdown  # only needed here; part of the "dev" extra in setup.py
 
     body = md.split("\n", 1)[1] if md.startswith("# ") else md
     return markdown.markdown(body, extensions=["tables", "fenced_code"])
