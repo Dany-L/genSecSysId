@@ -28,6 +28,7 @@ setup(
             "black>=22.0.0",
             "flake8>=5.0.0",
             "mypy>=0.990",
+            "markdown>=3.0",  # scripts/prepare_darus_dataset.py: README -> DaRUS description
         ],
     },
 )

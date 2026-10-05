@@ -484,6 +484,9 @@ def main():
                 "alpha_0": float(
                     (config.model.custom_params or {}).get("alpha_0", 0.9999)
                 ),
+                "fix_P_identity": str(
+                    (config.model.custom_params or {}).get("fix_P_identity", False)
+                ),
                 "activity_regularization_weight": getattr(config.training, "activity_regularization_weight", 0.0),
                 "activity_target": getattr(config.training, "activity_target", 0.0),
                 "h_regularization_weight": getattr(config.training, "h_regularization_weight", 0.0),

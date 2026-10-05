@@ -305,8 +305,10 @@ class LurePostProcessingMixin:
                 continue
             n_viol = None
             if inputs is not None:
-                self._apply_certificate_solution(sol)
-                n_viol = self._count_input_violations(inputs, x0, warmup_steps)
+                # Probe only: every sweep solution is in the snapshot's
+                # coordinates, so no fix_P_identity transform until the final apply.
+                self._apply_certificate_solution(sol, to_identity_P=False)
+                n_viol =self._count_input_violations(inputs, x0, warmup_steps)
             sweep.append({"s": sol.s, "y_bar": sol.y_bar, "n_violations": n_viol, "sol": sol})
 
         if not sweep:
