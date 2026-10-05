@@ -114,7 +114,27 @@ class SimpleLure(
         self.register_buffer("y_max", torch.tensor(float("nan")), persistent=False)
         self.register_buffer("output_std", torch.ones(self.ne), persistent=False)
 
-        self.P = nn.Parameter(torch.eye(self.nx))  # Lyapunov matrix
+        # ``fix_P_identity`` pins the Lyapunov matrix to P = I. This is without
+        # loss of generality: for any certificate P = T Tᵀ the state change
+        # x = T x̃ gives an input-output equivalent model with P̃ = I (congruence
+        # of both LMIs with diag(T⁻¹, I, I, T⁻¹)). So P gets no gradient, the
+        # certificate SDPs still solve over a free P, and every write-back
+        # (:meth:`_apply_certificate_solution`) moves θ into the coordinates
+        # where that P is the identity — see :meth:`_transform_to_identity_P`.
+        #
+        # ``fix_P_identity: strict`` instead holds P = I inside the SDPs as well
+        # (MaxS, feasibility, bootstrap, coverage solve over L, Λ, s only). That
+        # is NOT WLOG for the repair: a θ certifiable only by some P ≠ I is then
+        # reported infeasible. It isolates what P = I alone does to training.
+        raw = custom_params.get("fix_P_identity", False) if custom_params is not None else False
+        modes = {False: None, True: "transform", "transform": "transform", "strict": "strict"}
+        if raw not in modes:
+            raise ValueError(
+                f"fix_P_identity must be false, true/'transform' or 'strict', got {raw!r}."
+            )
+        self.fix_P_mode: Optional[str] = modes[raw]
+        self.fix_P_identity = self.fix_P_mode is not None
+        self.P = nn.Parameter(torch.eye(self.nx), requires_grad=not self.fix_P_identity)  # Lyapunov matrix
         if custom_params is not None:
             learn_L = custom_params.get("learn_L", True)
             self._identity_init_cfg = custom_params.get("identity_init", {}) or {}
@@ -126,6 +146,14 @@ class SimpleLure(
 
         # Parse structural constraints
         self.structural_constraints = self._parse_structural_constraints(custom_params)
+        if self.fix_P_mode == "transform":
+            pinned = sorted(set(self.structural_constraints) & set(self._STATE_COORDINATE_PARAMS))
+            if pinned:
+                raise ValueError(
+                    f"fix_P_identity requires {list(self._STATE_COORDINATE_PARAMS)} to be "
+                    f"free, but {pinned} carry structural constraints: the state "
+                    f"transformation to P = I would break them."
+                )
 
         # alpha = sigmoid(tau) is the contraction rate. It is NOT in the rollout, so
         # the prediction loss gives it no gradient; only the barrier does, and the
@@ -250,6 +278,10 @@ class SimpleLure(
     # freshly-constructed nan and reads as "no input floor recorded", rather than
     # failing outright on a missing key.
     _OPTIONAL_STATE_KEYS: Tuple[str, ...] = ("u_max",)
+
+    # The parameters a state transformation x = T x̃ acts on (D, D12, D21, D22
+    # do not touch the state). ``fix_P_identity`` needs all of them free.
+    _STATE_COORDINATE_PARAMS: Tuple[str, ...] = ("A", "B", "B2", "C", "C2")
 
     def load_state_dict(self, state_dict, *args, **kwargs):
         """Load a state dict, bridging both directions of buffer churn so
@@ -730,11 +762,13 @@ class SimpleLure(
             return False
 
         device, dtype = self.P.device, self.P.dtype
-        self._apply_certificate_solution(sol)
+        # θ first: the certificate was solved together with this B/D21, and the
+        # fix_P_identity transform in _apply_certificate_solution must act on it.
         if sol.B is not None:
             self.B.data = torch.tensor(sol.B, device=device, dtype=dtype)
         if sol.D21 is not None:
             self.D21.data = torch.tensor(sol.D21, device=device, dtype=dtype)
+        self._apply_certificate_solution(sol)
         logger.info(f"SDP analysis problem solved: s = {float(self.s):.4g}")
         return True
 
@@ -877,12 +911,19 @@ class SimpleLure(
         """Count the number of trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-    def _apply_certificate_solution(self, sol: CertificateSolution) -> None:
+    def _apply_certificate_solution(
+        self, sol: CertificateSolution, to_identity_P: bool = True
+    ) -> None:
         """Write a certificate solution back into the model (P, L, la, s).
 
         Accepts any :class:`~sysid.optimization.solutions.CertificateSolution`
         (MaxVol operative, MaxS, coverage, feasibility) — all share ``P``, ``L``,
         ``M``, ``s``.
+
+        Under ``fix_P_identity`` the state is then re-coordinatized so ``P = I``
+        again. The solution must have been solved against the model's *current*
+        θ; a caller that applies several solutions from one synthesizer snapshot
+        passes ``to_identity_P=False`` for all but the last.
         """
         device, dtype = self.P.device, self.P.dtype
         self.P.data = torch.tensor(sol.P, device=device, dtype=dtype)
@@ -890,6 +931,41 @@ class SimpleLure(
             self.L.data = torch.tensor(sol.L, device=device, dtype=dtype)
         self.la.data = torch.tensor(np.diag(sol.M), device=device, dtype=dtype)
         self.s.data = torch.tensor(sol.s, device=device, dtype=dtype)
+        # Under "strict" the SDPs held P = I, so there is nothing to transform.
+        if self.fix_P_mode == "transform" and to_identity_P:
+            self._transform_to_identity_P()
+
+    def _transform_to_identity_P(self) -> None:
+        """State change ``x = T x̃`` with ``T = P^{1/2}`` so that ``P̃ = I``.
+
+        ``Ã = T⁻¹AT, B̃ = T⁻¹B, B̃₂ = T⁻¹B₂, C̃ = CT, C̃₂ = C₂T, L̃ = LT⁻ᵀ``: the
+        input-output map is unchanged and both LMIs transform by congruence, so
+        feasibility (and every margin's sign) is preserved, as are ``s``, ``Λ``,
+        ``σ(U)`` and the certified output set (``CPCᵀ`` is invariant). The
+        symmetric root is the ``T`` closest to ``I``, which keeps the change as
+        small as possible for the optimizer state.
+
+        The state itself is rescaled, so an externally supplied ``x0`` is only
+        meaningful in these coordinates when it is zero (the washout default).
+        """
+        with torch.no_grad():
+            P = 0.5 * (self.P + self.P.T)
+            evals, V = torch.linalg.eigh(P)
+            if float(evals.min()) <= 0.0:
+                raise RuntimeError(
+                    f"fix_P_identity: cannot transform to P = I, P is not positive "
+                    f"definite (lambda_min = {float(evals.min()):.3e})."
+                )
+            root = evals.sqrt()
+            T = V @ torch.diag(root) @ V.T
+            T_inv = V @ torch.diag(1.0 / root) @ V.T
+            self.A.data = T_inv @ self.A @ T
+            self.B.data = T_inv @ self.B
+            self.B2.data = T_inv @ self.B2
+            self.C.data = self.C @ T
+            self.C2.data = self.C2 @ T
+            self.L.data = self.L @ T_inv  # T symmetric: T⁻ᵀ = T⁻¹
+            self.P.data = torch.eye(self.nx, device=P.device, dtype=P.dtype)
 
 
 class SimpleLureSafe(SimpleLure):

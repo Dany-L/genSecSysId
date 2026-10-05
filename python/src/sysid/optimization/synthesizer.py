@@ -79,6 +79,10 @@ class LureCertificateSynthesizer:
     output_std: np.ndarray
     P_current: np.ndarray
     eps: float = EPS
+    # When set, every SDP holds the Lyapunov matrix at this value instead of
+    # solving for it (``fix_P_identity: strict`` on the model: P = I). Only
+    # (L, M, s) and, in the bootstrap, the input maps then move.
+    P_fixed: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------ build
     @classmethod
@@ -105,7 +109,19 @@ class LureCertificateSynthesizer:
             s_fixed=float(to_np(model.s)),
             output_std=_as_sigma(to_np(model.output_std), int(model.ne)),
             P_current=to_np(model.P),
+            P_fixed=(
+                to_np(model.P)
+                if getattr(model, "fix_P_mode", None) == "strict" else None
+            ),
         )
+
+    def _P_var(self):
+        """The Lyapunov matrix as it enters an SDP: a symmetric variable, or the
+        constant ``P_fixed``. ``cp.Constant`` keeps ``.value``, so the solution
+        read-back is the same either way."""
+        if self.P_fixed is not None:
+            return cp.Constant(self.P_fixed)
+        return cp.Variable((self.nx, self.nx), symmetric=True)
 
     def _build_F(self, P, L, M, A=None, B=None, B2=None, C2=None, D21=None):
         """The shared stability LMI matrix ``F`` (same for every certificate SDP).
@@ -172,7 +188,7 @@ class LureCertificateSynthesizer:
 
         Returns ``None`` if the solver fails."""
         eps = self.eps
-        P = cp.Variable((self.nx, self.nx), symmetric=True)
+        P = self._P_var()
         m = cp.Variable((self.nz, 1))
         M = cp.diag(m)
         if self.learn_L:
@@ -285,7 +301,7 @@ class LureCertificateSynthesizer:
         established with that feasible set.
         """
         eps = self.eps
-        P = cp.Variable((self.nx, self.nx), symmetric=True)
+        P = self._P_var()
         la = cp.Variable((self.nz, 1))
         M = cp.diag(la)
         B = cp.Variable(self.B.shape) if learn_B else self.B
@@ -488,7 +504,7 @@ class LureCertificateSynthesizer:
         S = np.diag(_as_sigma(self.output_std, self.ne))
         SC = S @ self.C
 
-        P = cp.Variable((self.nx, self.nx), symmetric=True)
+        P = self._P_var()
         L = cp.Variable((self.nz, self.nx)) if self.learn_L else self.L_fixed
         m = cp.Variable((self.nz, 1))
         M = cp.diag(m)
@@ -576,7 +592,7 @@ class LureCertificateSynthesizer:
         infeasible, since a free ``s`` discards what the barrier had learned."""
         eps = self.eps
         free_s = s is None
-        P = cp.Variable((self.nx, self.nx), symmetric=True)
+        P = self._P_var()
         L = cp.Variable((self.nz, self.nx)) if self.learn_L else self.L_fixed
         m = cp.Variable((self.nz, 1))
         M = cp.diag(m)
