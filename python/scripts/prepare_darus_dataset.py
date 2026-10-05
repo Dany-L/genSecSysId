@@ -7,8 +7,11 @@ system this writes, under ``<out-dir>/<Name>/``::
                       code/ (generator + requirements.txt), SHA256SUMS
     README.md         the same README, for reading without unpacking
     description.html  the README as HTML, for the web form's Description field
-    dataset.json      Dataverse native-API JSON (citation + process metadata,
-                      CC BY 4.0), ready for ``POST /api/dataverses/<alias>/datasets``
+    dataset.json      Dataverse native-API JSON (citation, process, engineering
+                      and privacy metadata, CC BY 4.0), ready for
+                      ``POST /api/dataverses/<alias>/datasets``
+    edit_metadata.json  the same fields as one list, for filling an existing
+                      draft: ``PUT /api/datasets/:persistentId/editMetadata?replace=true``
 
 Only the trajectory CSVs and ``params.json`` are published; other files in the
 data folder (baseline fits, Lur'e approximations) are left out.
@@ -72,13 +75,16 @@ TOPICS = [
 ]
 
 # (name, symbol, unit, value) -- a float value goes to the FLOAT field, anything
-# else to the textual one.
-DUFFING_PARS = [
+# else to the textual one. *_SYSTEM_PARS describe the plant (EngMeta "System
+# Parameters"), *_PARS how the data was generated from it (process metadata);
+# the sampling time and horizon go to EngMeta "Temporal Resolution".
+DUFFING_SYSTEM_PARS = [
     ("Damping coefficient", "delta_d", "-", 0.3),
-    ("Sampling time", "T_s", "s", 0.05),
+    ("Equilibria for u = 0", "", "", "(0, 0) stable focus, (+-1, 0) saddles"),
+]
+DUFFING_PARS = [
     ("ODE solver", "", "", "scipy.integrate.solve_ivp, RK45, rtol=1e-5, atol=1e-7, "
                           "one call per sample, zero-order hold on u"),
-    ("Trajectory length", "T", "samples", 4000.0),
     ("Maximum input amplitude", "u_max", "-", 3.5),
     ("Low-pass cutoff frequency", "f_c", "Hz", 2.0),
     ("Low-pass filter order (Butterworth, zero phase)", "", "-", 4.0),
@@ -93,7 +99,7 @@ DUFFING_PARS = [
     ("Random seed, split", "", "-", 42.0),
     ("Split ratio train/validation/test", "", "%", "60/10/30, per group"),
 ]
-ONE_D_PARS = [
+ONE_D_SYSTEM_PARS = [
     ("State matrix", "A", "-", 0.9),
     ("Input matrix", "B", "-", 1.0),
     ("Nonlinearity input matrix", "B_2", "-", 1.1),
@@ -101,8 +107,11 @@ ONE_D_PARS = [
     ("Nonlinearity output matrix", "C_2", "-", 1.0),
     ("Feedthrough matrices", "D, D_12, D_21", "-", 0.0),
     ("Nonlinearity", "dzn", "", "dzn(z) = max(|z| - 1, 0) sign(z)"),
-    ("Sampling time", "T_s", "-", 1.0),
-    ("Trajectory length", "T", "samples", 500.0),
+    ("Basin of attraction of the origin for u = 0", "", "", "|x| < 1.1"),
+    ("Certified invariant set at contraction rate alpha = 0.99", "", "", "|x| <= 1.0"),
+    ("Admissible input amplitude at alpha = 0.99", "sigma*", "-", 0.0588),
+]
+ONE_D_PARS = [
     ("Maximum input amplitude, converging trajectories", "u_max", "-", 0.04),
     ("Maximum input amplitude, diverging trajectories", "u_max", "-", 0.6),
     ("Low-pass cutoff frequency", "f_c", "1/T_s", 0.1),
@@ -129,6 +138,17 @@ SYSTEMS = {
                  "with converging and diverging trajectories - synthetically generated",
         "keywords": [("Duffing equation", "http://www.wikidata.org/entity/Q675387")],
         "pars": DUFFING_PARS,
+        "system_pars": DUFFING_SYSTEM_PARS,
+        "component": ("Duffing oscillator",
+                      "Softening Duffing oscillator q'' = -delta_d q' - q + q^3 + u with state "
+                      "x = (q, q') and input u. Non-dimensional; time in seconds."),
+        # CSV column -> (name, symbol, unit); u is controlled, the rest measured
+        "variables": {"u": ("Input (external force)", "u", "-"),
+                      "q": ("Position", "q", "-"),
+                      "q_dot": ("Velocity", "q_dot", "-")},
+        "noise": "Additive white Gaussian noise, standard deviation std(x_i) / 10^(30/20) "
+                 "per trajectory and channel (SNR 30 dB)",
+        "temporal": (0.05, "s", 4000),  # sampling time, its unit, horizon in samples
         "method": (
             "Simulation of the softening Duffing oscillator",
             "q'' = -delta_d q' - q + q^3 + u, sampled at T_s = 0.05 s with a zero-order hold "
@@ -146,6 +166,13 @@ SYSTEMS = {
                  "trajectories - synthetically generated",
         "keywords": [("Lur'e system", None), ("Dead zone", None)],
         "pars": ONE_D_PARS,
+        "system_pars": ONE_D_SYSTEM_PARS,
+        "component": ("Scalar Lur'e system",
+                      "x_(k+1) = 0.9 x_k + u_k + 1.1 dzn(x_k), y_k = x_k, with the dead zone "
+                      "dzn(z) = max(|z| - 1, 0) sign(z). Discrete time, dimensionless."),
+        "variables": {"u": ("Input", "u", "-"), "x": ("State and output", "x", "-")},
+        "noise": "None, the data is noise free",
+        "temporal": (1.0, "-", 500),
         "method": (
             "Simulation of a scalar discrete-time Lur'e system",
             "x_{k+1} = 0.9 x_k + u_k + 1.1 dzn(x_k), y_k = x_k with the dead zone "
@@ -165,8 +192,8 @@ def _n_rows(path: Path) -> int:
         return sum(1 for _ in f) - 1  # minus the header
 
 
-def folder_stats(folder: Path) -> Dict:
-    lens = [_n_rows(f) for f in sorted(folder.glob("*.csv"))]
+def folder_stats(folder: Path, pattern: str = "*.csv") -> Dict:
+    lens = [_n_rows(f) for f in sorted(folder.glob(pattern))]
     if not lens:
         return {"n": 0, "min": 0, "median": 0, "max": 0, "samples": 0}
     return {"n": len(lens), "min": min(lens), "median": int(np.median(lens)),
@@ -181,8 +208,9 @@ def column_stats(raw_dir: Path, prefix: str) -> Dict[str, Dict[str, float]]:
 
 def collect_stats(data_dir: Path) -> Dict:
     folders = {name: folder_stats(data_dir / name) for name in ["raw"] + SPLIT_FOLDERS}
+    groups = {g: folder_stats(data_dir / "raw", f"{g}_*.csv") for g in GROUPS}
     columns = {g: column_stats(data_dir / "raw", g) for g in GROUPS}
-    return {"folders": folders, "columns": columns}
+    return {"folders": folders, "groups": groups, "columns": columns}
 
 
 # --- README -------------------------------------------------------------------
@@ -493,17 +521,24 @@ def citation_block(system: str, html: str, contact_email: Optional[str],
     return {"displayName": "Citation Metadata", "fields": fields}
 
 
+def _par_entries(prefix: str, pars) -> List[Dict[str, Dict]]:
+    """``<prefix>{Name,Symbol,Unit,Value|TextValue}`` entries, shared by the
+    process (``processMethodsPar``) and EngMeta (``engMetaSystemPar``) blocks."""
+    entries = []
+    for name, symbol, unit, value in pars:
+        entry = _sub(**{f"{prefix}Name": name, f"{prefix}Symbol": symbol or None,
+                        f"{prefix}Unit": unit or None})
+        if isinstance(value, float):
+            entry[f"{prefix}Value"] = _prim(f"{prefix}Value", repr(value))
+        else:
+            entry[f"{prefix}TextValue"] = _prim(f"{prefix}TextValue", str(value))
+        entries.append(entry)
+    return entries
+
+
 def process_block(system: str, env: Dict, commit: str, date: str) -> Dict:
     cfg = SYSTEMS[system]
-    pars = []
-    for name, symbol, unit, value in cfg["pars"]:
-        entry = _sub(processMethodsParName=name, processMethodsParSymbol=symbol or None,
-                     processMethodsParUnit=unit or None)
-        if isinstance(value, float):
-            entry["processMethodsParValue"] = _prim("processMethodsParValue", repr(value))
-        else:
-            entry["processMethodsParTextValue"] = _prim("processMethodsParTextValue", str(value))
-        pars.append(entry)
+    pars = _par_entries("processMethodsPar", cfg["pars"])
     method_name, method_descr = cfg["method"]
     methods = [
         _sub(processMethodsName=method_name, processMethodsDescription=method_descr,
@@ -539,15 +574,72 @@ def process_block(system: str, env: Dict, commit: str, date: str) -> Dict:
     return {"displayName": "Process Metadata", "fields": fields}
 
 
+def engmeta_block(system: str, stats: Dict) -> Dict:
+    """Engineering metadata: the plant, its variables and the time grid."""
+    cfg = SYSTEMS[system]
+    ts, t_unit, horizon = cfg["temporal"]
+    ranges = {}  # column -> (min, max) over both groups
+    for cols in stats["columns"].values():
+        for c, s in cols.items():
+            lo, hi = ranges.get(c, (np.inf, -np.inf))
+            ranges[c] = (min(lo, s["min"]), max(hi, s["max"]))
+
+    measured, controlled = [], []
+    for col, (name, symbol, unit) in cfg["variables"].items():
+        lo, hi = (repr(float(v)) for v in ranges[col])
+        if col == "u":
+            controlled.append(_sub(engMetaControlledVarName=name, engMetaControlledVarSymbol=symbol,
+                                   engMetaControlledVarUnit=unit, engMetaControlledVarValueFrom=lo,
+                                   engMetaControlledVarValueTo=hi))
+        else:
+            measured.append(_sub(engMetaMeasuredVarName=name, engMetaMeasuredVarSymbol=symbol,
+                                 engMetaMeasuredVarUnit=unit, engMetaMeasuredVarValueFrom=lo,
+                                 engMetaMeasuredVarValueTo=hi,
+                                 engMetaMeasuredVarErrorDesc=cfg["noise"]))
+    controlled.append(_sub(engMetaControlledVarName="Time", engMetaControlledVarSymbol="t",
+                           engMetaControlledVarUnit=t_unit, engMetaControlledVarValueFrom="0.0",
+                           engMetaControlledVarValueTo=repr(round((horizon - 1) * ts, 10))))
+
+    div = stats["groups"]["zero_div"]
+    temporal = _sub(engMetaTempCountPoints=str(horizon), engMetaTempInterval=repr(ts),
+                    engMetaTempUnit=t_unit,
+                    engMetaTempPoints=f"Equidistant. Converging trajectories have {horizon} "
+                    f"samples; diverging ones end before the threshold crossing and have "
+                    f"{div['min']} to {div['max']} samples (median {div['median']}).")
+    comp_name, comp_descr = cfg["component"]
+    fields = [
+        _cv("engMetaMode", ["Simulation"], multiple=True),
+        _compound("engMetaMeasuredVar", measured),
+        _compound("engMetaControlledVar", controlled),
+        _compound("engMetaComp", [_sub(engMetaCompName=comp_name,
+                                       engMetaCompDescription=comp_descr)]),
+        _compound("engMetaSystemPar", _par_entries("engMetaSystemPar", cfg["system_pars"])),
+        _compound("engMetaTemp", [temporal]),
+    ]
+    return {"displayName": "Engineering Metadata", "fields": fields}
+
+
+def privacy_block() -> Dict:
+    return {"displayName": "Privacy Metadata", "fields": [_cv("privData", "no")]}
+
+
 def dataset_json(system: str, html: str, contact_email: Optional[str], env: Dict,
-                 commit: str, date: str) -> Dict:
+                 commit: str, date: str, stats: Dict) -> Dict:
     return {"datasetVersion": {
         "license": {"name": "CC BY 4.0", "uri": "http://creativecommons.org/licenses/by/4.0"},
         "metadataBlocks": {
             "citation": citation_block(system, html, contact_email, date),
             "process": process_block(system, env, commit, date),
+            "EngMeta": engmeta_block(system, stats),
+            "privacy": privacy_block(),
         },
     }}
+
+
+def edit_metadata_json(dataset: Dict) -> Dict:
+    """Body for ``PUT .../editMetadata?replace=true``: every field of every block."""
+    blocks = dataset["datasetVersion"]["metadataBlocks"].values()
+    return {"fields": [f for block in blocks for f in block["fields"]]}
 
 
 # --- packaging ----------------------------------------------------------------
@@ -646,8 +738,11 @@ def build(system: str, data_dir: Path, out_dir: Path, contact_email: Optional[st
 
     (sys_dir / "README.md").write_text(readme)
     (sys_dir / "description.html").write_text(html)
+    dataset = dataset_json(system, html, contact_email, env, commit, date, stats)
     with open(sys_dir / "dataset.json", "w") as f:
-        json.dump(dataset_json(system, html, contact_email, env, commit, date), f, indent=2)
+        json.dump(dataset, f, indent=2)
+    with open(sys_dir / "edit_metadata.json", "w") as f:
+        json.dump(edit_metadata_json(dataset), f, indent=2)
 
     n_csv = sum(s["n"] for s in stats["folders"].values())
     print(f"  {zip_path} ({zip_path.stat().st_size / 1e6:.1f} MB, {n_csv} CSVs, "
@@ -679,7 +774,11 @@ def main(argv=None) -> int:
     print(f"\nCreate a draft in the '{DATAVERSE_ALIAS}' collection with\n"
           "  curl -H \"X-Dataverse-key: $API_TOKEN\" -X POST "
           f"https://darus.uni-stuttgart.de/api/dataverses/{DATAVERSE_ALIAS}/datasets "
-          "--upload-file <Name>/dataset.json")
+          "--upload-file <Name>/dataset.json\n"
+          "or fill an existing draft (overwrites the fields it sends) with\n"
+          "  curl -H \"X-Dataverse-key: $API_TOKEN\" -X PUT "
+          "\"https://darus.uni-stuttgart.de/api/datasets/:persistentId/editMetadata"
+          "?persistentId=<PID>&replace=true\" --upload-file <Name>/edit_metadata.json")
     return 0
 
 

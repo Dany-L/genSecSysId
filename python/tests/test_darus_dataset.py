@@ -158,9 +158,45 @@ def test_process_parameters_carry_a_value(one_d_package):
     for p in pars:
         assert ("processMethodsParValue" in p) != ("processMethodsParTextValue" in p)
     by_name = {p["processMethodsParName"]["value"]: p for p in pars}
-    assert float(by_name["State matrix"]["processMethodsParValue"]["value"]) == 0.9
+    amp = by_name["Maximum input amplitude, converging trajectories"]
+    assert float(amp["processMethodsParValue"]["value"]) == 0.04
     steps = [s["processStepType"]["value"] for s in process["processStep"]["value"]]
     assert steps == ["Generation", "Postprocessing"]
+
+
+def test_engmeta_describes_plant_variables_and_time_grid(one_d_package, one_d_data):
+    ds = json.loads((one_d_package / "dataset.json").read_text())["datasetVersion"]
+    eng = _fields(ds["metadataBlocks"]["EngMeta"])
+    assert eng["engMetaMode"]["value"] == ["Simulation"]
+
+    sys_pars = {p["engMetaSystemParName"]["value"]: p for p in eng["engMetaSystemPar"]["value"]}
+    assert float(sys_pars["State matrix"]["engMetaSystemParValue"]["value"]) == 0.9
+    assert sys_pars["Nonlinearity"]["engMetaSystemParTextValue"]["value"].startswith("dzn(z)")
+
+    # Ranges are those of the published CSVs, input u is controlled, x measured.
+    df = pd.concat([pd.read_csv(f) for f in (one_d_data / "raw").glob("*.csv")])
+    (x,) = eng["engMetaMeasuredVar"]["value"]
+    assert x["engMetaMeasuredVarSymbol"]["value"] == "x"
+    assert float(x["engMetaMeasuredVarValueFrom"]["value"]) == df["x"].min()
+    assert float(x["engMetaMeasuredVarValueTo"]["value"]) == df["x"].max()
+    controlled = {v["engMetaControlledVarSymbol"]["value"]: v
+                  for v in eng["engMetaControlledVar"]["value"]}
+    assert set(controlled) == {"u", "t"}
+    assert float(controlled["u"]["engMetaControlledVarValueTo"]["value"]) == df["u"].max()
+    assert float(controlled["t"]["engMetaControlledVarValueTo"]["value"]) == 499.0
+
+    (temp,) = eng["engMetaTemp"]["value"]
+    assert temp["engMetaTempCountPoints"]["value"] == "500"
+    assert float(temp["engMetaTempInterval"]["value"]) == 1.0
+    assert _fields(ds["metadataBlocks"]["privacy"])["privData"]["value"] == "no"
+
+
+def test_edit_metadata_carries_every_block_field(one_d_package):
+    ds = json.loads((one_d_package / "dataset.json").read_text())["datasetVersion"]
+    edit = json.loads((one_d_package / "edit_metadata.json").read_text())
+    expected = [f["typeName"] for b in ds["metadataBlocks"].values() for f in b["fields"]]
+    assert [f["typeName"] for f in edit["fields"]] == expected
+    assert {"title", "engMetaSystemPar", "processMethodsPar", "privData"} <= set(expected)
 
 
 def test_zip_is_self_contained_and_checksummed(one_d_package, one_d_data):
