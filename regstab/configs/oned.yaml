@@ -1,0 +1,49 @@
+# 1-D Lur'e system with a scalar dead zone (regionally, not globally stable).
+# The true system lies in the model class: A=0.9, B=1, B2=1.1, C=C2=1, D21=0.
+data:
+  path: ~/genSecSysId-Data/data/OneD/id
+  inputs: [u]
+  outputs: [x]
+  normalization: scale_only
+  sequence_length: 200
+  stride: 100
+  batch_size: 32
+  washout: 50
+  diverging: true
+  diverging_batch_size: 8
+  diverging_weight: 1.0
+  diverging_loss: relative     # relative (Σ‖ŷ-y‖²/Σ‖y‖² per trajectory) | mse
+
+model:
+  type: drn
+  certificate: regional
+  nx: 1
+  nz: 4
+  alpha: {init: 0.99, trainable: true}
+  s: {init: max_input, trainable: true}
+
+init:
+  method: esn
+  restarts: 20
+  ridge: 1.0e-8
+  scale: [0.01, 1.0]
+
+regularization:
+  form: inverse_square
+  input: {measure: s, weight: 0.0}
+  output: {measure: trace, weight: 0.0}
+
+train:
+  epochs: 1000
+  lr: 5.0e-3
+  grad_clip: 1.0
+  lr_patience: 50
+  lr_factor: 0.5
+  early_stopping_patience: 200
+
+mlflow:
+  enabled: true
+  experiment: regstab-oned
+
+seed: 0
+output_dir: ~/genSecSysId-Data/regstab-runs
