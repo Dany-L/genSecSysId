@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "regstab"
+version = "0.1.0"
+description = "Regionally certified dynamic recurrent networks via direct parametrization"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.0", "numpy", "pandas", "pyyaml", "mlflow"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

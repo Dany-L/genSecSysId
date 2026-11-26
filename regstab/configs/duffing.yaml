@@ -1,0 +1,48 @@
+# Softening Duffing oscillator, regional certificate, ESN initialization.
+data:
+  path: ~/genSecSysId-Data/data/Duffing/id
+  inputs: [u]
+  outputs: [q]
+  normalization: scale_only
+  sequence_length: 700
+  stride: 500
+  batch_size: 32
+  washout: 500
+  diverging: true
+  diverging_batch_size: 8
+  diverging_weight: 1.0
+  diverging_loss: relative     # relative (Σ‖ŷ-y‖²/Σ‖y‖² per trajectory) | mse
+
+model:
+  type: drn
+  certificate: regional        # regional | global | none
+  nx: 2
+  nz: 20
+  alpha: {init: 0.996, trainable: true}
+  s: {init: max_input, trainable: true}
+
+init:
+  method: esn
+  restarts: 20
+  ridge: 1.0e-8
+  scale: [0.01, 1.0]           # log-uniform per restart
+
+regularization:
+  form: inverse_square         # inverse_square | neg_log
+  input: {measure: s, weight: 0.0}         # s | sigma | mean_radius
+  output: {measure: trace, weight: 0.0}    # trace | min_eig | det
+
+train:
+  epochs: 500
+  lr: 1.0e-3
+  grad_clip: 1.0
+  lr_patience: 20
+  lr_factor: 0.5
+  early_stopping_patience: 100
+
+mlflow:
+  enabled: true
+  experiment: regstab-duffing
+
+seed: 0
+output_dir: ~/genSecSysId-Data/regstab-runs
